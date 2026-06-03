@@ -9,7 +9,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 
-use crate::app::{App, CARD_H, FOOTER_H, HEADER_H, InputKind, Mode, View};
+use crate::app::{App, ButtonId, CARD_H, FOOTER_H, HEADER_H, InputKind, Mode, TOOLBAR, View};
 use crate::fleet::{Agent, Lane, Status};
 
 // ---- color semantics (one meaning per color, used everywhere) -------------
@@ -252,9 +252,17 @@ fn card(f: &mut Frame, area: Rect, a: &Agent, selected: bool, filter: &str, spin
     let lines = vec![
         Line::from(vec![
             Span::styled(format!("{glyph} "), Style::new().fg(col).bold()),
-            Span::styled(trunc(&a.name, w.saturating_sub(10)), name_style),
+            Span::styled(trunc(&a.name, w.saturating_sub(12)), name_style),
             Span::raw(" "),
-            Span::styled(a.runtime.clone(), Style::new().fg(C_ACCENT)),
+            Span::styled(trunc(&a.runtime, 8), Style::new().fg(C_ACCENT)),
+            Span::styled(
+                if a.source.tag().is_empty() {
+                    String::new()
+                } else {
+                    format!(" ·{}", a.source.tag())
+                },
+                Style::new().fg(C_REVIEW),
+            ),
         ]),
         Line::from(vec![
             Span::styled("⎇ ", Style::new().fg(C_DIM)),
@@ -458,17 +466,36 @@ fn logs(f: &mut Frame, area: Rect, app: &App) {
 // ---- footer + overlays ----------------------------------------------------
 
 fn footer(f: &mut Frame, area: Rect, app: &App) {
+    let bg = Style::new().bg(Color::Indexed(235));
+    if app.mode == Mode::Normal {
+        // Clickable toolbar. Active view button is highlighted; every button is a
+        // real click target (see app::toolbar_hit).
+        let active = match app.view {
+            View::Kanban => ButtonId::Kanban,
+            View::Tree => ButtonId::Tree,
+            View::Logs => ButtonId::Logs,
+        };
+        let mut spans = Vec::new();
+        for (id, label) in TOOLBAR {
+            let style = if id == active {
+                Style::new().fg(Color::Black).bg(C_ACCENT).bold()
+            } else {
+                Style::new().fg(Color::Indexed(252)).bg(Color::Indexed(238))
+            };
+            spans.push(Span::styled(label, style));
+            spans.push(Span::styled(" ", bg));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)).style(bg), area);
+        return;
+    }
     let hint = match app.mode {
         Mode::Input => "Enter submit · Esc cancel",
         Mode::Help => "any key to close",
         Mode::Inspect => "Esc/q back · s send line",
-        Mode::Normal => {
-            "[1]kanban [2]tree [3]logs   🖱click/scroll · h/l lane · j/k card · ↵inspect   n)ew s)end K)ill /filter m)ouse ?help q)uit"
-        }
+        Mode::Normal => "",
     };
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(hint, Style::new().fg(C_DIM))))
-            .style(Style::new().bg(Color::Indexed(235))),
+        Paragraph::new(Line::from(Span::styled(hint, Style::new().fg(C_DIM)))).style(bg),
         area,
     );
 }
@@ -521,6 +548,8 @@ fn help(f: &mut Frame, area: Rect) {
         head("Act"),
         Line::from("  n   new agent   <runtime> [task]   e.g.  'shell'   or  'claude fix the bug'"),
         Line::from("  s   send a line to selected        K   kill selected         /   filter"),
+        Line::from("  d   discover + import running tmux panes as agents (steer them too)"),
+        Line::from("  🖱  footer is a clickable toolbar — every [button] is a click target"),
         Line::from(""),
         head("Lanes are agent state"),
         Line::from(

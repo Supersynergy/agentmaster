@@ -2,6 +2,30 @@
 
 All notable changes to agentmaster are documented here. Newest first.
 
+## [0.3.0] — 2026-06-03
+
+Multi-backend + a clickable toolbar. agentmaster now sees and steers agents that
+already run in tmux, not only the PTYs it spawns.
+
+### Added
+- **tmux backend adapter** (`backend.rs`): discover panes (`d`), import them as
+  `Source::Tmux` agents, derive their state from periodic `capture-pane`, and
+  steer them — `send` routes to `tmux send-keys`, `kill` to `tmux kill-pane`.
+  Cards show a `·tmux` source tag. Pure tmux CLI, no extra dependency.
+- **Backend abstraction**: `Agent.source` (`Native` | `Tmux`); send/kill/poll
+  dispatch on it, so more backends (rmux/cmux/kitty) slot in the same way.
+- **Clickable toolbar footer** (Normal mode): `[1 kanban] [2 tree] [3 logs]
+  [+ new] [* tmux] [m mouse] [? help] [q quit]` — every button is a real click
+  target, active view highlighted. One `TOOLBAR` source of truth shared by the
+  renderer and the hit-test.
+- `doctor` now reports tmux availability + discoverable pane count.
+- Unit tests for pane parsing and toolbar hit-mapping.
+
+### Notes
+- Verified end-to-end: a worker tmux session was discovered, imported, and its
+  state (REVIEW, from its own output) rendered live with the `·tmux` tag.
+- fmt clean, clippy `-D warnings` 0, 12/12 tests.
+
 ## [0.2.0] — 2026-06-03
 
 Mouse control + motion-as-feedback. Informed by Universal UI principles (effects

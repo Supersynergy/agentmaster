@@ -4,6 +4,7 @@
 //! not paid for in LLM tokens.
 
 mod app;
+mod backend;
 mod fleet;
 mod obs;
 mod pty;
@@ -93,6 +94,12 @@ fn doctor(dir: &Path) -> anyhow::Result<()> {
         })
         .is_ok();
     println!("  pty           : {}", if pty_ok { "ok" } else { "FAIL" });
+    if backend::tmux_available() {
+        let n = backend::list_panes().len();
+        println!("  tmux          : ok ({n} pane(s) discoverable)");
+    } else {
+        println!("  tmux          : absent (native PTY still works)");
+    }
     for bin in ["claude", "codex", "bash", "zsh"] {
         let found = std::process::Command::new("which")
             .arg(bin)

@@ -73,6 +73,23 @@ impl Lane {
     }
 }
 
+/// Where an agent runs: a PTY agentmaster owns, or a pane in another multiplexer
+/// that we drive via its CLI.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Source {
+    Native,
+    Tmux(String), // target = session:window.pane
+}
+
+impl Source {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Source::Native => "",
+            Source::Tmux(_) => "tmux",
+        }
+    }
+}
+
 /// A single agent = one spawned process behind a PTY, plus the observable state
 /// we derive from its output. No agent ever coordinates via tokens — all the
 /// coordination signal lives here, on disk and in this struct.
@@ -92,6 +109,7 @@ pub struct Agent {
     pub last_line: String,
     pub output: VecDeque<String>,
     pub pty: Option<PtyHandle>,
+    pub source: Source,
     pub lines_total: u64,
     /// Live per-process resource use, refreshed on the housekeeping tick.
     pub cpu: f32,
@@ -130,6 +148,7 @@ impl Agent {
             last_line: String::new(),
             output: VecDeque::with_capacity(512),
             pty: None,
+            source: Source::Native,
             lines_total: 0,
             cpu: 0.0,
             mem_bytes: 0,

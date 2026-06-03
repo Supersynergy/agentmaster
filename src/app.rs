@@ -14,16 +14,55 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::layout::Rect;
 
-use crate::fleet::{Agent, Fleet, Lane, Status};
+use crate::fleet::{Agent, Fleet, Lane, Source, Status};
 use crate::obs::Metrics;
 use crate::store::Store;
-use crate::{pty, runtime, state};
+use crate::{backend, pty, runtime, state};
 
 /// Shared layout geometry — single source of truth for both render (`ui.rs`) and
 /// mouse hit-testing here, so clicks always land where the cards are drawn.
 pub const HEADER_H: u16 = 4;
 pub const FOOTER_H: u16 = 1;
 pub const CARD_H: u16 = 6;
+
+/// Clickable toolbar buttons (the footer in Normal mode). One source of truth so
+/// the rendered labels and the click hit-test never drift. Labels are ASCII so
+/// display width == char count == hit-test width.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ButtonId {
+    Kanban,
+    Tree,
+    Logs,
+    New,
+    Discover,
+    Mouse,
+    Help,
+    Quit,
+}
+
+pub const TOOLBAR: [(ButtonId, &str); 8] = [
+    (ButtonId::Kanban, "[1 kanban]"),
+    (ButtonId::Tree, "[2 tree]"),
+    (ButtonId::Logs, "[3 logs]"),
+    (ButtonId::New, "[+ new]"),
+    (ButtonId::Discover, "[* tmux]"),
+    (ButtonId::Mouse, "[m mouse]"),
+    (ButtonId::Help, "[? help]"),
+    (ButtonId::Quit, "[q quit]"),
+];
+
+/// Which toolbar button is at column `col` (labels joined by one space).
+pub fn toolbar_hit(col: u16) -> Option<ButtonId> {
+    let mut x = 0u16;
+    for (id, label) in TOOLBAR {
+        let w = label.chars().count() as u16;
+        if col >= x && col < x + w {
+            return Some(id);
+        }
+        x += w + 1; // single-space separator between buttons
+    }
+    None
+}
 
 /// Events produced by PTY reader threads.
 pub enum AppEvent {
@@ -168,6 +207,23 @@ impl App {
                 a.cpu = cpu;
                 a.mem_bytes = mem;
             }
+            // tmux-backed agents: snapshot their pane and derive state from it.
+            if let Source::Tmux(target) = a.source.clone() {
+                match backend::capture(&target) {
+                    Some(screen) => {
+                        if let Some(last) = screen.lines().rev().find(|l| !l.trim().is_empty()) {
+                            let line = last.trim().to_string();
+                            if line != a.last_line {
+                                if let Some(ns) = state::detect(a, &line) {
+                                    a.status = ns;
+                                }
+                                a.push_line(line);
+                            }
+                        }
+                    }
+                    None => a.status = Status::Dead, // pane closed
+                }
+            }
             state::idle_sweep(a, 20);
             if let Some(h) = a.pty.as_mut() {
                 if a.pid.is_none() {
@@ -180,6 +236,53 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Import every tmux pane not already tracked, as a `Source::Tmux` agent.
+    fn discover_tmux(&mut self) {
+        if !backend::tmux_available() {
+            self.status_msg = "tmux not found".into();
+            return;
+        }
+        let mut added = 0;
+        for p in backend::list_panes() {
+            // Don't import our own pane, and don't double-import.
+            if p.command.contains("agentmaster") {
+                continue;
+            }
+            if self
+                .fleet
+                .agents
+                .iter()
+                .any(|a| a.source == Source::Tmux(p.target.clone()))
+            {
+                continue;
+            }
+            let id = self.fleet.next_id;
+            self.fleet.next_id += 1;
+            let name = if p.title.is_empty() || p.title == p.command {
+                p.target.clone()
+            } else {
+                format!("{} [{}]", p.title, p.target)
+            };
+            let mut a = Agent::new(
+                id,
+                name.clone(),
+                p.command.clone(),
+                p.command.clone(),
+                vec![],
+                p.path.clone(),
+            );
+            a.source = Source::Tmux(p.target.clone());
+            a.pid = p.pid;
+            a.status = Status::Idle;
+            self.fleet.agents.push(a);
+            self.store
+                .log(Some(id), &name, "import", &format!("tmux {}", p.target));
+            tracing::info!(agent = id, target = %p.target, "imported tmux pane");
+            added += 1;
+        }
+        self.status_msg = format!("discovered {added} new tmux pane(s)");
     }
 
     // ---- pty events -------------------------------------------------------
@@ -262,14 +365,22 @@ impl App {
         let mut name = String::new();
         if let Some(a) = self.fleet.get_mut(id) {
             name = a.name.clone();
-            if let Some(h) = a.pty.as_mut() {
-                let _ = h.writer.write_all(text.as_bytes());
-                let _ = h.writer.write_all(b"\n");
-                let _ = h.writer.flush();
-                ok = true;
-                if matches!(a.status, Status::Blocked | Status::Idle) {
-                    a.status = Status::Working;
+            match &a.source {
+                Source::Native => {
+                    if let Some(h) = a.pty.as_mut() {
+                        let _ = h.writer.write_all(text.as_bytes());
+                        let _ = h.writer.write_all(b"\n");
+                        let _ = h.writer.flush();
+                        ok = true;
+                    }
                 }
+                Source::Tmux(target) => {
+                    backend::send_keys(target, text);
+                    ok = true;
+                }
+            }
+            if ok && matches!(a.status, Status::Blocked | Status::Idle) {
+                a.status = Status::Working;
             }
         }
         if ok {
@@ -283,8 +394,13 @@ impl App {
         let mut name = String::new();
         if let Some(a) = self.fleet.get_mut(id) {
             name = a.name.clone();
-            if let Some(h) = a.pty.as_mut() {
-                let _ = h.child.kill();
+            match &a.source {
+                Source::Native => {
+                    if let Some(h) = a.pty.as_mut() {
+                        let _ = h.child.kill();
+                    }
+                }
+                Source::Tmux(target) => backend::kill_pane(target),
             }
             a.status = Status::Dead;
         }
@@ -416,10 +532,24 @@ impl App {
                     }
                 }
                 KeyCode::Char('m') => self.toggle_mouse(),
+                KeyCode::Char('d') => self.discover_tmux(),
                 _ => {}
             },
         }
         self.clamp_card();
+    }
+
+    fn dispatch_button(&mut self, b: ButtonId) {
+        match b {
+            ButtonId::Kanban => self.view = View::Kanban,
+            ButtonId::Tree => self.view = View::Tree,
+            ButtonId::Logs => self.view = View::Logs,
+            ButtonId::New => self.start_input(InputKind::NewAgent),
+            ButtonId::Discover => self.discover_tmux(),
+            ButtonId::Mouse => self.toggle_mouse(),
+            ButtonId::Help => self.mode = Mode::Help,
+            ButtonId::Quit => self.should_quit = true,
+        }
     }
 
     fn clamp_card(&mut self) {
@@ -450,8 +580,21 @@ impl App {
     // ---- mouse handling ---------------------------------------------------
 
     fn handle_mouse(&mut self, m: MouseEvent) {
-        // Mouse drives the board only; other modes/views stay keyboard-first.
-        if self.mode != Mode::Normal || self.view != View::Kanban {
+        if self.mode != Mode::Normal {
+            return;
+        }
+        // Footer toolbar is clickable from any view (e.g. click [1 kanban] to
+        // return). Handle it before the board, which is Kanban-only.
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            let footer_row = self.area.height.saturating_sub(FOOTER_H);
+            if m.row >= footer_row
+                && let Some(b) = toolbar_hit(m.column)
+            {
+                self.dispatch_button(b);
+                return;
+            }
+        }
+        if self.view != View::Kanban {
             return;
         }
         match m.kind {
@@ -530,6 +673,15 @@ mod tests {
         assert_eq!(hit_test_geom(area(), 0, 10).unwrap().0, 0);
         assert_eq!(hit_test_geom(area(), 25, 10).unwrap().0, 1);
         assert_eq!(hit_test_geom(area(), 99, 10).unwrap().0, 4);
+    }
+
+    #[test]
+    fn toolbar_first_and_gap() {
+        // "[1 kanban]" = 10 chars at cols 0..10, then a space at 10, next starts 11.
+        assert_eq!(toolbar_hit(0), Some(ButtonId::Kanban));
+        assert_eq!(toolbar_hit(9), Some(ButtonId::Kanban));
+        assert_eq!(toolbar_hit(10), None); // separator space
+        assert_eq!(toolbar_hit(11), Some(ButtonId::Tree));
     }
 
     #[test]
