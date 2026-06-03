@@ -151,6 +151,12 @@ fn doctor(dir: &Path) -> anyhow::Result<()> {
     } else {
         println!("  tmux          : absent (native PTY still works)");
     }
+    if backend::cmux_available() {
+        let n = backend::list_cmux().len();
+        println!("  cmux          : ok ({n} workspace(s) discoverable)");
+    } else {
+        println!("  cmux          : absent (run agentmaster inside cmux to steer it)");
+    }
     for bin in ["claude", "codex", "bash", "zsh"] {
         let found = std::process::Command::new("which")
             .arg(bin)

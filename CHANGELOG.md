@@ -2,6 +2,50 @@
 
 All notable changes to agentmaster are documented here. Newest first.
 
+## [0.4.0] — 2026-06-03
+
+Orchestrator parity + goals + dynamic indicators. agentmaster becomes the single
+control surface: discover, steer, and goal-track every agent — tmux panes, cmux
+workspaces, and native PTYs — from one session, with zero token tax (state is
+observed off output/transcripts, coordination stays on-disk).
+
+### Added
+- **cmux backend wired in** (`backend.rs` + `app.rs`): `d` / `[* find]` now
+  discovers BOTH tmux panes and cmux workspaces (`cmux top --all`). Imported as
+  `Source::Cmux`, status mapped from the agent tag, refreshed each tick, steered
+  via `cmux send`. `kill` untracks an external workspace (never destroys it).
+  Verified live: imported 17 real Claude/Codex cmux workspaces into the board.
+- **Orchestrate (`o talk`)** — the in-TUI port of `cmux-meta-orchestrator send`:
+  `#N <msg>` steers agent N, `#* <msg>` broadcasts to every live agent. Routed as
+  a plain transport write; logged to an orchestrator chat strip (Logs view).
+- **Goals** (`g`): pin `<goal> :: <definition-of-done>` on any agent. Persisted in
+  a SQLite `goals` table keyed by name, so a goal survives restart/re-import
+  (`rehydrate_goal`). Goal-aware state: a DoD match flips the agent to DONE.
+- **Dynamic progress indicators**: `infer_progress` ratchets a 0-100% bar from
+  output milestones (`step 3/7`, build/test signals) — monotonic, never asked
+  for. Shown as a `🎯 ▰▰▰▱▱ NN%` bar on goal cards + the inspect panel.
+- **Needs-you alert**: a blinking `⏸ N NEED YOU` badge in the header whenever any
+  agent is blocked — the one thing that wants the operator now.
+- **Zero-tax peek** (`p` / `peek <id>`): read a session's last user/assistant/next
+  action straight off its transcript JSONL (`peek.rs`), no LLM round-trip.
+- **Headless orchestrator parity** (`orch.rs`): `find <q>`, `dash [--all]`,
+  `start <id>` (passthrough to `session-restore`), and `batch <file>` fan-out
+  (spawn one seeded cmux workspace per task; `.json`/`.md` task files, dry-run by
+  default). No Python dependency.
+
+### Fixed
+- Finished the broken WIP from the prior session (8 compile errors): the
+  half-added cmux adapter + orchestrator chat were non-exhaustive and referenced
+  undefined `cmux_status`/`cmux_snapshot`. Collapsed an identical-branch bug in
+  the cmux `Needs input` parser.
+
+### Notes
+- Verified end-to-end this session: fmt clean, clippy `-D warnings` 0, **19/19
+  tests** (+6: dod-detect, progress-ratchet, 2× peek, 2× task-parse). Live:
+  `peek` digested a real session, `batch` dry-run parsed a Markdown task file,
+  PTY-driven TUI imported 17 cmux workspaces and persisted spawn(11)/send(6)/
+  goal(1) rows to SQLite — including a goal set on an imported cmux agent.
+
 ## [0.3.0] — 2026-06-03
 
 Multi-backend + a clickable toolbar. agentmaster now sees and steers agents that

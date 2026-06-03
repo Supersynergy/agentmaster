@@ -5,14 +5,17 @@ steer agents. Zero orchestration tax: state is **observed** from output, coordin
 is **on-disk** (SQLite), never paid in tokens.
 
 ## Layout
-- `src/main.rs` — CLI (`tui`/`doctor`/`events`)
+- `src/main.rs` — CLI (`tui`/`doctor`/`events`/`find`/`dash`/`start`/`peek`/`batch`)
 - `src/app.rs` — state + event loop + state machine (ALL mutation here)
 - `src/ui.rs` — ratatui rendering (PURE function of `App`, no mutation)
-- `src/fleet.rs` — Agent / Status / Lane / Fleet
+- `src/fleet.rs` — Agent / Status / Lane / Fleet (+ goal/progress/transcript)
+- `src/backend.rs` — tmux + cmux adapters (discover/capture/send/kill)
 - `src/pty.rs` — native PTY spawn + ANSI-stripping reader thread
-- `src/state.rs` — output → status heuristics
+- `src/state.rs` — output → status heuristics + goal progress inference
 - `src/runtime.rs` — runtime name → (program, args) adapter
-- `src/store.rs` — SQLite audit log + mail bus
+- `src/store.rs` — SQLite audit log + mail bus + goals table
+- `src/peek.rs` — zero-tax transcript digest (last user/assistant/next)
+- `src/orch.rs` — orchestrator bridge: sr passthrough + batch fan-out
 - `src/obs.rs` — JSONL tracing + host metrics
 
 ## Invariants (do not break)
