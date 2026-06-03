@@ -68,8 +68,28 @@ pub fn toolbar_hit(col: u16) -> Option<ButtonId> {
 
 /// Events produced by PTY reader threads.
 pub enum AppEvent {
-    Output { id: u64, line: String },
-    Exited { id: u64 },
+    Output {
+        id: u64,
+        line: String,
+    },
+    Exited {
+        id: u64,
+    },
+    /// Backend snapshots produced off the render thread (never block the UI).
+    CmuxSnapshot(Vec<backend::CmuxWorkspace>),
+    TmuxLine {
+        target: String,
+        line: String,
+    },
+    /// Result of a discovery scan (raw lists; the main thread dedups + adds).
+    Discovered {
+        panes: Vec<backend::ExternalPane>,
+        cmux: Vec<backend::CmuxWorkspace>,
+    },
+    /// Transcribed voice text, ready to drop into the orchestrator bar.
+    VoiceText(String),
+    /// A status-line notice from a worker thread.
+    Notice(String),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -117,6 +137,8 @@ pub struct App {
     pub mouse_on: bool,
     /// Active push-to-talk recorder (ffmpeg child + wav path) while the mic is hot.
     pub voice_rec: Option<(std::process::Child, std::path::PathBuf)>,
+    /// True while an async backend refresh (cmux/tmux) is running, to avoid pile-up.
+    refresh_inflight: bool,
     /// Last known terminal rect, refreshed each frame for mouse hit-testing.
     area: Rect,
     tick: u64,
@@ -164,6 +186,7 @@ impl App {
             should_quit: false,
             mouse_on: true,
             voice_rec: None,
+            refresh_inflight: false,
             area: Rect::new(0, 0, 0, 0),
             tick: 0,
         }
@@ -209,61 +232,20 @@ impl App {
     // ---- periodic upkeep --------------------------------------------------
 
     fn housekeep(&mut self) {
+        // Fast, in-process work only — this runs on the render thread.
         self.metrics.refresh();
-        // Targeted per-process resource refresh, snapshot-then-apply to keep the
-        // metrics borrow disjoint from the mutable fleet iteration.
         let pids: Vec<u32> = self.fleet.agents.iter().filter_map(|a| a.pid).collect();
         self.metrics.refresh_procs(&pids);
         let stats: Vec<(u32, f32, u64)> = pids
             .iter()
             .filter_map(|&p| self.metrics.proc_stats(p).map(|(c, m)| (p, c, m)))
             .collect();
-        // One cmux query per tick if we track any cmux agents; map by ws_ref below.
-        let has_cmux = self
-            .fleet
-            .agents
-            .iter()
-            .any(|a| matches!(a.source, Source::Cmux(_)));
-        let cmux_snapshot = if has_cmux {
-            backend::list_cmux()
-        } else {
-            Vec::new()
-        };
         for a in self.fleet.agents.iter_mut() {
             if let Some(pid) = a.pid
                 && let Some(&(_, cpu, mem)) = stats.iter().find(|(p, _, _)| *p == pid)
             {
                 a.cpu = cpu;
                 a.mem_bytes = mem;
-            }
-            // tmux-backed agents: snapshot their pane and derive state from it.
-            if let Source::Tmux(target) = a.source.clone() {
-                match backend::capture(&target) {
-                    Some(screen) => {
-                        if let Some(last) = screen.lines().rev().find(|l| !l.trim().is_empty()) {
-                            let line = last.trim().to_string();
-                            if line != a.last_line {
-                                if let Some(ns) = state::detect(a, &line) {
-                                    a.status = ns;
-                                }
-                                a.push_line(line);
-                            }
-                        }
-                    }
-                    None => a.status = Status::Dead, // pane closed
-                }
-            }
-            // cmux-backed agents: refresh status + title from `cmux top --all`.
-            if let Source::Cmux(ws) = a.source.clone()
-                && let Some(w) = cmux_snapshot.iter().find(|w| w.ws_ref == ws)
-            {
-                a.status = cmux_status(&w.status);
-                if !w.title.is_empty() && w.title != a.last_line {
-                    a.push_line(w.title.clone());
-                }
-                if a.pid.is_none() {
-                    a.pid = w.pid;
-                }
             }
             if matches!(a.source, Source::Native) {
                 state::idle_sweep(a, 20);
@@ -279,17 +261,91 @@ impl App {
                 }
             }
         }
+        // Blocking backend I/O (cmux top, tmux capture) is offloaded to a one-shot
+        // thread and applied later via AppEvent — the UI never waits on it.
+        self.spawn_backend_refresh();
     }
 
-    /// Import every tmux pane not already tracked, as a `Source::Tmux` agent.
-    fn discover_tmux(&mut self) {
-        if !backend::tmux_available() {
-            self.status_msg = "tmux not found".into();
+    /// Kick off an async refresh of external backends (cmux + tmux) if one isn't
+    /// already in flight. Results arrive as `CmuxSnapshot` / `TmuxLine` events.
+    fn spawn_backend_refresh(&mut self) {
+        if self.refresh_inflight {
             return;
         }
+        let has_cmux = self
+            .fleet
+            .agents
+            .iter()
+            .any(|a| matches!(a.source, Source::Cmux(_)));
+        let tmux_targets: Vec<String> = self
+            .fleet
+            .agents
+            .iter()
+            .filter_map(|a| match &a.source {
+                Source::Tmux(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        if !has_cmux && tmux_targets.is_empty() {
+            return;
+        }
+        self.refresh_inflight = true;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            // tmux captures first (fast, per-pane), then the heavier cmux scan.
+            for t in tmux_targets {
+                if let Some(screen) = backend::capture(&t)
+                    && let Some(last) = screen.lines().rev().find(|l| !l.trim().is_empty())
+                {
+                    let _ = tx.send(AppEvent::TmuxLine {
+                        target: t,
+                        line: last.trim().to_string(),
+                    });
+                }
+            }
+            if has_cmux {
+                let _ = tx.send(AppEvent::CmuxSnapshot(backend::list_cmux()));
+            } else {
+                // Clear the in-flight flag even when only tmux ran.
+                let _ = tx.send(AppEvent::CmuxSnapshot(Vec::new()));
+            }
+        });
+    }
+
+    /// Discover agents across every backend (tmux + cmux). The two scans run on
+    /// their own threads in parallel; the heavy `cmux top --all` never blocks the
+    /// UI. Results arrive as an `AppEvent::Discovered`. `[* find]` and `d`.
+    fn discover_all(&mut self) {
+        self.status_msg = "🔎 scanning tmux + cmux…".into();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            // Run both backends concurrently, then join.
+            let h = std::thread::spawn(|| {
+                if backend::tmux_available() {
+                    backend::list_panes()
+                } else {
+                    Vec::new()
+                }
+            });
+            let cmux = if backend::cmux_available() {
+                backend::list_cmux()
+            } else {
+                Vec::new()
+            };
+            let panes = h.join().unwrap_or_default();
+            let _ = tx.send(AppEvent::Discovered { panes, cmux });
+        });
+    }
+
+    /// Add newly-discovered tmux panes + cmux workspaces (dedup by source ref).
+    /// Runs on the main thread — the only place the fleet is mutated.
+    fn apply_discovered(
+        &mut self,
+        panes: Vec<backend::ExternalPane>,
+        cmux: Vec<backend::CmuxWorkspace>,
+    ) {
         let mut added = 0;
-        for p in backend::list_panes() {
-            // Don't import our own pane, and don't double-import.
+        for p in panes {
             if p.command.contains("agentmaster") {
                 continue;
             }
@@ -323,20 +379,9 @@ impl App {
             self.rehydrate_goal(id, &name);
             self.store
                 .log(Some(id), &name, "import", &format!("tmux {}", p.target));
-            tracing::info!(agent = id, target = %p.target, "imported tmux pane");
             added += 1;
         }
-        self.status_msg = format!("discovered {added} new tmux pane(s)");
-    }
-
-    /// Import every cmux workspace not already tracked, as a `Source::Cmux` agent.
-    /// Status is mapped from the workspace's agent tag (`cmux top --all`).
-    fn discover_cmux(&mut self) {
-        if !backend::cmux_available() {
-            return;
-        }
-        let mut added = 0;
-        for w in backend::list_cmux() {
+        for w in cmux {
             if w.ws_ref.is_empty() {
                 continue;
             }
@@ -371,18 +416,9 @@ impl App {
             self.rehydrate_goal(id, &name);
             self.store
                 .log(Some(id), &name, "import", &format!("cmux {}", w.ws_ref));
-            tracing::info!(agent = id, ws = %w.ws_ref, "imported cmux workspace");
             added += 1;
         }
-        self.status_msg = format!("{} +{added} cmux workspace(s)", self.status_msg);
-    }
-
-    /// One button to pull in agents from every backend (tmux panes + cmux
-    /// workspaces). The `[* find]` action and the `d` key both land here.
-    fn discover_all(&mut self) {
-        self.status_msg = "discovered".into();
-        self.discover_tmux();
-        self.discover_cmux();
+        self.status_msg = format!("discovered {added} new agent(s) across tmux + cmux");
     }
 
     /// Read the selected agent's transcript off disk and surface its last
@@ -453,6 +489,49 @@ impl App {
                     tracing::info!(agent = id, "process exited");
                 }
             }
+            // --- results from off-thread worker tasks (never block the UI) ---
+            AppEvent::CmuxSnapshot(snap) => {
+                self.refresh_inflight = false;
+                for a in self.fleet.agents.iter_mut() {
+                    if let Source::Cmux(ws) = a.source.clone()
+                        && let Some(w) = snap.iter().find(|w| w.ws_ref == ws)
+                    {
+                        a.status = cmux_status(&w.status);
+                        if !w.title.is_empty() && w.title != a.last_line {
+                            a.push_line(w.title.clone());
+                        }
+                        if a.pid.is_none() {
+                            a.pid = w.pid;
+                        }
+                    }
+                }
+            }
+            AppEvent::TmuxLine { target, line } => {
+                if let Some(a) = self
+                    .fleet
+                    .agents
+                    .iter_mut()
+                    .find(|a| a.source == Source::Tmux(target.clone()))
+                    && line != a.last_line
+                {
+                    if let Some(ns) = state::detect(a, &line) {
+                        a.status = ns;
+                    }
+                    a.push_line(line);
+                }
+            }
+            AppEvent::Discovered { panes, cmux } => {
+                self.apply_discovered(panes, cmux);
+            }
+            AppEvent::VoiceText(text) => {
+                self.store.log(None, "voice", "transcribe", &text);
+                self.input = text.clone();
+                self.input_kind = InputKind::Orchestrate;
+                self.mode = Mode::Input;
+                let preview: String = text.chars().take(40).collect();
+                self.status_msg = format!("🎙 “{preview}” — prefix #N, Enter to route");
+            }
+            AppEvent::Notice(msg) => self.status_msg = msg,
         }
     }
 
@@ -513,12 +592,16 @@ impl App {
                         ok = true;
                     }
                 }
+                // External backends shell out — do it on a thread so the UI
+                // (and rapid #N routing) never blocks on subprocess latency.
                 Source::Tmux(target) => {
-                    backend::send_keys(target, text);
+                    let (t, msg) = (target.clone(), text.to_string());
+                    std::thread::spawn(move || backend::send_keys(&t, &msg));
                     ok = true;
                 }
                 Source::Cmux(ws_ref) => {
-                    backend::cmux_send(ws_ref, text);
+                    let (w, msg) = (ws_ref.clone(), text.to_string());
+                    std::thread::spawn(move || backend::cmux_send(&w, &msg));
                     ok = true;
                 }
             }
@@ -814,18 +897,21 @@ impl App {
     /// and drops the text into the orchestrator bar to review + route (#N …).
     fn toggle_voice(&mut self) {
         if let Some((child, wav)) = self.voice_rec.take() {
-            voice::stop_recording(child);
-            match voice::transcribe(&wav) {
-                Some(text) => {
-                    self.store.log(None, "voice", "transcribe", &text);
-                    self.input = text.clone();
-                    self.input_kind = InputKind::Orchestrate;
-                    self.mode = Mode::Input;
-                    let preview: String = text.chars().take(40).collect();
-                    self.status_msg = format!("🎙 “{preview}” — prefix #N, Enter to route");
+            // Stop + transcribe (~1-2s) off-thread; the text returns as VoiceText
+            // so the UI stays responsive while whisper runs.
+            self.status_msg = "📝 transcribing…".into();
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                voice::stop_recording(child);
+                match voice::transcribe(&wav) {
+                    Some(text) => {
+                        let _ = tx.send(AppEvent::VoiceText(text));
+                    }
+                    None => {
+                        let _ = tx.send(AppEvent::Notice("voice: no speech recognized".into()));
+                    }
                 }
-                None => self.status_msg = "voice: no speech recognized".into(),
-            }
+            });
         } else if voice::available() {
             match voice::start_recording() {
                 Some(rec) => {
