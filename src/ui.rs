@@ -702,7 +702,10 @@ fn help(f: &mut Frame, area: Rect) {
             "  every state change + action -> SQLite audit log + JSONL trace in ~/.agentmaster/",
         ),
         Line::from(
-            "  events · doctor · find <q> · dash [--all] · start <id> · peek <id> · batch <file>",
+            "  read:  events · doctor · ls [--json] · goals · peek <id> · dash [--all] · find <q>",
+        ),
+        Line::from(
+            "  act:   send <ref> <msg> · broadcast <msg> [--tmux] · goal <name> .. :: dod · batch <f>",
         ),
         Line::from(""),
         Line::from(Span::styled(

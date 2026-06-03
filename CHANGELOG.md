@@ -2,6 +2,35 @@
 
 All notable changes to agentmaster are documented here. Newest first.
 
+## [0.5.0] — 2026-06-04
+
+CLI full-ready. Everything the TUI does to *external* agents is now also a
+headless subcommand, so agentmaster is a complete orchestrator from scripts and
+other agents — no TUI required, no Python. `--json` on every read command (the
+cli-anything contract) so other agents can consume it.
+
+### Added
+- **`ls [--json]`** — every discoverable live agent across backends (tmux panes +
+  cmux workspaces) with herdr-style glyphs (`⏸ ▶ ✓ ·`), status, pid, title.
+- **`send <ref> <msg…>`** — steer one agent. `workspace:NN` routes to cmux,
+  `session:win.pane` to tmux. Logged to the audit trail.
+- **`broadcast <msg…> [--tmux] [--needs-input]`** — line to every live agent;
+  `--needs-input` narrows to cmux agents waiting on a human; never hits our pane.
+- **`goal <name> <text…> [:: dod]`** — pin a goal headlessly (same `::` DoD split
+  as the TUI `g` key); persisted to the SQLite `goals` table, rehydrated on import.
+- **`goals [--json]`** — list every stored goal + progress.
+- New `cli.rs` module; the full surface is now: `tui · events · doctor · ls ·
+  send · broadcast · goal · goals · peek · find · dash · start · batch`.
+
+### Notes
+- Verified live: `ls` listed real cmux workspaces (incl. this session's own),
+  `ls --json` emitted valid JSON, `goal …:: dod` split correctly, `goals` showed
+  persisted progress. fmt clean, clippy `-D warnings` 0, **21/21 tests** (+2 cli:
+  glyph-map, json-escape).
+- grepgod (ghmax) survey found no established single-binary Rust TUI+CLI doing
+  tmux+cmux fleet orchestration — the niche is real; design mirrors the proven
+  `cmux-meta-orchestrator` subcommand set, now native + headless.
+
 ## [0.4.0] — 2026-06-03
 
 Orchestrator parity + goals + dynamic indicators. agentmaster becomes the single

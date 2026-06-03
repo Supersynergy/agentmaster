@@ -5,6 +5,7 @@
 
 mod app;
 mod backend;
+mod cli;
 mod fleet;
 mod obs;
 mod orch;
@@ -14,6 +15,7 @@ mod runtime;
 mod state;
 mod store;
 mod ui;
+mod voice;
 
 use std::path::{Path, PathBuf};
 
@@ -66,6 +68,41 @@ enum Cmd {
         yes: bool,
         #[arg(long)]
         model: Option<String>,
+    },
+    /// List every discoverable live agent (tmux panes + cmux workspaces)
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Steer one live agent: send a line to a `workspace:NN` or tmux `sess:win.pane`
+    Send {
+        /// agent ref: cmux `workspace:NN` or tmux `session:window.pane`
+        target: String,
+        /// the message (remaining words are joined)
+        #[arg(trailing_var_arg = true, required = true)]
+        message: Vec<String>,
+    },
+    /// Broadcast a line to every live agent (cmux always; tmux with --tmux)
+    Broadcast {
+        #[arg(trailing_var_arg = true, required = true)]
+        message: Vec<String>,
+        #[arg(long)]
+        tmux: bool,
+        /// only cmux agents currently waiting on input
+        #[arg(long)]
+        needs_input: bool,
+    },
+    /// Pin a goal on an agent name; the TUI rehydrates it. Use `::` to add a
+    /// definition-of-done:  goal <name> ship it :: all tests pass
+    Goal {
+        name: String,
+        #[arg(trailing_var_arg = true, required = true)]
+        goal: Vec<String>,
+    },
+    /// List every stored goal + its progress
+    Goals {
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -120,6 +157,22 @@ fn main() -> anyhow::Result<()> {
             let tasks = orch::load_tasks(&file)?;
             orch::batch(&tasks, model.as_deref(), yes)?;
         }
+        Cmd::Ls { json } => cli::list(json)?,
+        Cmd::Send { target, message } => cli::send(&target, &message.join(" "), &dir)?,
+        Cmd::Broadcast {
+            message,
+            tmux,
+            needs_input,
+        } => cli::broadcast(&message.join(" "), tmux, needs_input, &dir)?,
+        Cmd::Goal { name, goal } => {
+            let joined = goal.join(" ");
+            let (g, dod) = match joined.split_once("::") {
+                Some((g, d)) if !d.trim().is_empty() => (g.trim(), Some(d.trim())),
+                _ => (joined.trim(), None),
+            };
+            cli::goal_set(&name, g, dod, &dir)?
+        }
+        Cmd::Goals { json } => cli::goals_list(json, &dir)?,
     }
     Ok(())
 }

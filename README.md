@@ -35,11 +35,40 @@ coordinates. agentmaster removes that tax three ways:
 cargo build --release
 ./target/release/agentmaster        # launch the TUI (default)
 agentmaster doctor                  # health check (pty, sqlite, runtimes)
-agentmaster events -n 100           # headless: tail the audit log
 ```
 
 Requires Rust 1.95+. Works on any terminal or bare Linux/macOS — agentmaster owns
 the PTYs itself, so it needs no tmux/zellij/kitty cooperation.
+
+## CLI (headless orchestrator — no TUI required)
+
+Everything you can do to agents that live in tmux/cmux is also a subcommand, so
+agentmaster drives a whole fleet from scripts and other agents. `--json` on the
+read commands feeds agent-native pipelines.
+
+```bash
+# see
+agentmaster ls [--json]             # live agents: tmux panes + cmux workspaces (⏸▶✓·)
+agentmaster goals [--json]          # stored goals + progress
+agentmaster peek <session-id>       # last user/assistant/next off a transcript (zero token tax)
+agentmaster events -n 100           # tail the SQLite audit log
+
+# steer
+agentmaster send workspace:96 run the tests        # one cmux agent
+agentmaster send dev:1.0 cargo nextest run         # one tmux pane
+agentmaster broadcast "weiter bitte" --tmux        # every live agent
+agentmaster broadcast "status?" --needs-input      # only cmux agents waiting on you
+
+# goals (rehydrated by the TUI on import)
+agentmaster goal payments-api ship checkout :: all e2e tests green
+agentmaster goal payments-api                      # (set via TUI key `g` too)
+
+# sessions (passthrough to session-restore) + fan-out
+agentmaster find "auth bug"                         # search all distilled sessions
+agentmaster dash --all                              # grouped session dashboard
+agentmaster start <id> [--here] [--focus]           # cold-start a session
+agentmaster batch tasks.md [--yes] [--model opus]   # spawn one seeded cmux ws per task
+```
 
 ## Keys
 
