@@ -243,8 +243,9 @@ fn card(f: &mut Frame, area: Rect, a: &Agent, selected: bool, filter: &str) {
             ),
             Span::styled(
                 format!(
-                    "  pid {}",
-                    a.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
+                    "  pid {} · {}",
+                    a.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                    fmt_mem(a.mem_bytes)
                 ),
                 Style::new().fg(C_FAINT),
             ),
@@ -369,6 +370,10 @@ fn tree(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled(
                     format!("{:<8}", a.status.label()),
                     Style::new().fg(status_color(a.status)),
+                ),
+                Span::styled(
+                    format!("cpu {:>4.0}%  mem {:<6}  ", a.cpu, fmt_mem(a.mem_bytes)),
+                    Style::new().fg(C_DIM),
                 ),
                 Span::styled(
                     format!("⏱ {}", fmt_dur(a.age_secs())),
@@ -534,6 +539,18 @@ fn fmt_dur(s: i64) -> String {
         format!("{}m{}s", s / 60, s % 60)
     } else {
         format!("{}h{}m", s / 3600, (s % 3600) / 60)
+    }
+}
+
+fn fmt_mem(b: u64) -> String {
+    if b == 0 {
+        "-".into()
+    } else if b < 1 << 20 {
+        format!("{}K", b >> 10)
+    } else if b < 1 << 30 {
+        format!("{}M", b >> 20)
+    } else {
+        format!("{:.1}G", b as f64 / (1u64 << 30) as f64)
     }
 }
 

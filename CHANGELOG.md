@@ -22,6 +22,8 @@ native PTYs, with observability wired from the start.
 - **Actions**: new agent (`n`), send line (`s`), kill (`K`), filter (`/`).
 - **Observability (dual sink)**: SQLite `events` audit log + structured JSONL
   traces (`tracing` + `tracing-appender`, `AGENTMASTER_LOG` filter).
+- **Live per-process metrics**: targeted `sysinfo` refresh fills each agent's
+  CPU% and resident memory, shown on cards and in the tree view.
 - **CLI**: `tui` (default), `doctor` (pty/sqlite/runtime health), `events`
   (headless audit tail).
 - TUI best practices baked in (see `docs/adr/0002-tui-best-practices.md`):

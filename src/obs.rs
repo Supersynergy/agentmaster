@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use sysinfo::System;
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -54,5 +54,22 @@ impl Metrics {
 
     pub fn mem_total_gb(&self) -> f64 {
         self.sys.total_memory() as f64 / 1_073_741_824.0
+    }
+
+    /// Refresh only the given pids (targeted — cheaper than scanning all procs).
+    pub fn refresh_procs(&mut self, pids: &[u32]) {
+        if pids.is_empty() {
+            return;
+        }
+        let list: Vec<Pid> = pids.iter().map(|p| Pid::from_u32(*p)).collect();
+        self.sys
+            .refresh_processes(ProcessesToUpdate::Some(&list), true);
+    }
+
+    /// (cpu%, resident bytes) for a pid, if the process is known.
+    pub fn proc_stats(&self, pid: u32) -> Option<(f32, u64)> {
+        self.sys
+            .process(Pid::from_u32(pid))
+            .map(|p| (p.cpu_usage(), p.memory()))
     }
 }

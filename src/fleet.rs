@@ -93,6 +93,9 @@ pub struct Agent {
     pub output: VecDeque<String>,
     pub pty: Option<PtyHandle>,
     pub lines_total: u64,
+    /// Live per-process resource use, refreshed on the housekeeping tick.
+    pub cpu: f32,
+    pub mem_bytes: u64,
 }
 
 impl Agent {
@@ -128,6 +131,8 @@ impl Agent {
             output: VecDeque::with_capacity(512),
             pty: None,
             lines_total: 0,
+            cpu: 0.0,
+            mem_bytes: 0,
         }
     }
 

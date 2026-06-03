@@ -125,7 +125,21 @@ impl App {
 
     fn housekeep(&mut self) {
         self.metrics.refresh();
+        // Targeted per-process resource refresh, snapshot-then-apply to keep the
+        // metrics borrow disjoint from the mutable fleet iteration.
+        let pids: Vec<u32> = self.fleet.agents.iter().filter_map(|a| a.pid).collect();
+        self.metrics.refresh_procs(&pids);
+        let stats: Vec<(u32, f32, u64)> = pids
+            .iter()
+            .filter_map(|&p| self.metrics.proc_stats(p).map(|(c, m)| (p, c, m)))
+            .collect();
         for a in self.fleet.agents.iter_mut() {
+            if let Some(pid) = a.pid
+                && let Some(&(_, cpu, mem)) = stats.iter().find(|(p, _, _)| *p == pid)
+            {
+                a.cpu = cpu;
+                a.mem_bytes = mem;
+            }
             state::idle_sweep(a, 20);
             if let Some(h) = a.pty.as_mut() {
                 if a.pid.is_none() {
