@@ -9,7 +9,9 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 
-use crate::app::{App, ButtonId, CARD_H, FOOTER_H, HEADER_H, InputKind, Mode, TOOLBAR, View};
+use crate::app::{
+    App, ButtonId, CARD_H, CHAT_PANE_H, FOOTER_H, HEADER_H, InputKind, Mode, TOOLBAR, View,
+};
 use crate::fleet::{Agent, Lane, Status};
 
 // ---- color semantics (one meaning per color, used everywhere) -------------
@@ -100,9 +102,11 @@ fn kind_color(kind: &str) -> Color {
 
 pub fn render(f: &mut Frame, app: &App) {
     let area = f.area();
+    // header · board · permanent orchestrator chat pane · footer
     let rows = Layout::vertical([
         Constraint::Length(HEADER_H),
         Constraint::Min(3),
+        Constraint::Length(CHAT_PANE_H),
         Constraint::Length(FOOTER_H),
     ])
     .split(area);
@@ -119,11 +123,71 @@ pub fn render(f: &mut Frame, app: &App) {
         },
     }
 
-    footer(f, rows[2], app);
+    chat_pane(f, rows[2], app);
+    footer(f, rows[3], app);
 
-    if app.mode == Mode::Input {
+    // Modal input box only for the non-chat prompts (new/send/filter/goal);
+    // the orchestrator types straight into its pinned bottom pane.
+    if app.mode == Mode::Input && app.input_kind != InputKind::Orchestrate {
         input_overlay(f, area, app);
     }
+}
+
+/// The always-on orchestrator chat, pinned to the bottom. Shows the routed-message
+/// transcript + a live input line. Type into it with `o` (or click the pane);
+/// `#N <msg>` steers agent N, `#* <msg>` broadcasts, `v` dictates by voice.
+fn chat_pane(f: &mut Frame, area: Rect, app: &App) {
+    let focused = app.mode == Mode::Input && app.input_kind == InputKind::Orchestrate;
+    let border = if focused { C_ACCENT } else { C_FAINT };
+    let title = if focused {
+        " 💬 orchestrator — typing (Enter route · Esc back) ".to_string()
+    } else {
+        " 💬 orchestrator — o to talk · #N msg · #* all · v voice ".to_string()
+    };
+    let block = Block::bordered()
+        .title(title)
+        .border_style(Style::new().fg(border));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+    let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+
+    // transcript (last N routed messages)
+    let h = parts[0].height as usize;
+    let start = app.chat_log.len().saturating_sub(h);
+    let lines: Vec<Line> = if app.chat_log.is_empty() {
+        vec![Line::from(Span::styled(
+            "no messages yet — press o, then  #3 run the tests",
+            Style::new().fg(C_FAINT),
+        ))]
+    } else {
+        app.chat_log
+            .iter()
+            .skip(start)
+            .map(|m| Line::from(trunc(m, parts[0].width as usize)))
+            .collect()
+    };
+    f.render_widget(Paragraph::new(lines), parts[0]);
+
+    // input line
+    let input = if focused {
+        Line::from(vec![
+            Span::styled("› ", Style::new().fg(C_ACCENT).bold()),
+            Span::raw(app.input.clone()),
+            Span::styled("▏", Style::new().fg(C_ACCENT)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            "› press o to message your agents",
+            Style::new().fg(C_DIM),
+        ))
+    };
+    f.render_widget(
+        Paragraph::new(input).style(Style::new().bg(Color::Indexed(235))),
+        parts[1],
+    );
 }
 
 // ---- header ---------------------------------------------------------------

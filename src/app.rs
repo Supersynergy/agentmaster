@@ -24,6 +24,8 @@ use crate::{backend, peek, pty, runtime, state, voice};
 pub const HEADER_H: u16 = 4;
 pub const FOOTER_H: u16 = 1;
 pub const CARD_H: u16 = 6;
+/// Height of the always-on orchestrator chat pane pinned at the bottom.
+pub const CHAT_PANE_H: u16 = 7;
 
 /// Clickable toolbar buttons (the footer in Normal mode). One source of truth so
 /// the rendered labels and the click hit-test never drift. Labels are ASCII so
@@ -983,6 +985,12 @@ impl App {
                 self.dispatch_button(b);
                 return;
             }
+            // Click the pinned chat pane → focus the orchestrator input.
+            let chat_top = self.area.height.saturating_sub(FOOTER_H + CHAT_PANE_H);
+            if m.row >= chat_top && m.row < footer_row {
+                self.start_input(InputKind::Orchestrate);
+                return;
+            }
         }
         if self.view != View::Kanban {
             return;
@@ -1059,7 +1067,9 @@ fn cmux_status(raw: &str) -> Status {
 /// Pure geometry for hit-testing — shares `HEADER_H`/`FOOTER_H`/`CARD_H` with the
 /// renderer so clicks land where cards are drawn. Free fn so it is unit-testable.
 fn hit_test_geom(area: Rect, col: u16, row: u16) -> Option<(usize, Option<usize>)> {
-    if area.width == 0 || row < HEADER_H || row >= area.height.saturating_sub(FOOTER_H) {
+    // Board sits between the header and the pinned chat pane + footer.
+    let board_bottom = area.height.saturating_sub(FOOTER_H + CHAT_PANE_H);
+    if area.width == 0 || row < HEADER_H || row >= board_bottom {
         return None;
     }
     let lane = ((col as u32 * 5) / (area.width.max(1) as u32)).min(4) as usize;
