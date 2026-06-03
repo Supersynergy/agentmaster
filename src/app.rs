@@ -7,12 +7,23 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use anyhow::Result;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::crossterm::execute;
+use ratatui::layout::Rect;
 
 use crate::fleet::{Agent, Fleet, Lane, Status};
 use crate::obs::Metrics;
 use crate::store::Store;
 use crate::{pty, runtime, state};
+
+/// Shared layout geometry — single source of truth for both render (`ui.rs`) and
+/// mouse hit-testing here, so clicks always land where the cards are drawn.
+pub const HEADER_H: u16 = 4;
+pub const FOOTER_H: u16 = 1;
+pub const CARD_H: u16 = 6;
 
 /// Events produced by PTY reader threads.
 pub enum AppEvent {
@@ -58,6 +69,9 @@ pub struct App {
     pub filter: String,
     pub status_msg: String,
     pub should_quit: bool,
+    pub mouse_on: bool,
+    /// Last known terminal rect, refreshed each frame for mouse hit-testing.
+    area: Rect,
     tick: u64,
 }
 
@@ -71,7 +85,9 @@ pub fn run(dir: PathBuf) -> Result<()> {
     tracing::info!("agentmaster tui started");
 
     let mut terminal = ratatui::init();
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let res = app.main_loop(&mut terminal);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     app.store
         .log(None, "system", "stop", "agentmaster tui stopped");
@@ -93,10 +109,18 @@ impl App {
             input: String::new(),
             input_kind: InputKind::None,
             filter: String::new(),
-            status_msg: "ready — press n to spawn an agent, ? for help".into(),
+            status_msg: "ready — press n to spawn an agent, ? for help · mouse on".into(),
             should_quit: false,
+            mouse_on: true,
+            area: Rect::new(0, 0, 0, 0),
             tick: 0,
         }
+    }
+
+    /// Braille spinner frame — motion that means "this agent is actively working".
+    pub fn spin(&self) -> char {
+        const F: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        F[(self.tick / 2) as usize % F.len()]
     }
 
     fn main_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
@@ -108,11 +132,15 @@ impl App {
             if self.tick.is_multiple_of(10) {
                 self.housekeep();
             }
+            let sz = terminal.size()?;
+            self.area = Rect::new(0, 0, sz.width, sz.height);
             terminal.draw(|f| crate::ui::render(f, self))?;
-            if event::poll(Duration::from_millis(50))?
-                && let Event::Key(k) = event::read()?
-            {
-                self.handle_key(k);
+            if event::poll(Duration::from_millis(50))? {
+                match event::read()? {
+                    Event::Key(k) => self.handle_key(k),
+                    Event::Mouse(m) => self.handle_mouse(m),
+                    _ => {}
+                }
             }
             if self.should_quit {
                 break;
@@ -387,15 +415,129 @@ impl App {
                         self.kill(id);
                     }
                 }
+                KeyCode::Char('m') => self.toggle_mouse(),
                 _ => {}
             },
         }
-        // Clamp the card cursor to the (possibly changed) lane size.
+        self.clamp_card();
+    }
+
+    fn clamp_card(&mut self) {
         let n = self.fleet.in_lane(self.current_lane()).len();
         if n == 0 {
             self.card_idx = 0;
         } else if self.card_idx >= n {
             self.card_idx = n - 1;
         }
+    }
+
+    /// Toggle mouse capture. Off hands the mouse back to the terminal for native
+    /// text selection / copy (respecting the "selection wins by default" pref).
+    fn toggle_mouse(&mut self) {
+        self.mouse_on = !self.mouse_on;
+        let _ = if self.mouse_on {
+            execute!(std::io::stdout(), EnableMouseCapture)
+        } else {
+            execute!(std::io::stdout(), DisableMouseCapture)
+        };
+        self.status_msg = if self.mouse_on {
+            "mouse ON — click lanes/cards, scroll to navigate, click again to inspect".into()
+        } else {
+            "mouse OFF — native text selection enabled (press m to re-enable)".into()
+        };
+    }
+
+    // ---- mouse handling ---------------------------------------------------
+
+    fn handle_mouse(&mut self, m: MouseEvent) {
+        // Mouse drives the board only; other modes/views stay keyboard-first.
+        if self.mode != Mode::Normal || self.view != View::Kanban {
+            return;
+        }
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((lane, card)) = self.hit_test(m.column, m.row) {
+                    let same = self.lane_idx == lane && card == Some(self.card_idx);
+                    self.lane_idx = lane;
+                    match card {
+                        Some(ci) => {
+                            let n = self.fleet.in_lane(self.current_lane()).len();
+                            self.card_idx = if n > 0 { ci.min(n - 1) } else { 0 };
+                        }
+                        None => self.card_idx = 0,
+                    }
+                    // Click an already-selected card again → open it.
+                    if same && self.current_agent_id().is_some() {
+                        self.mode = Mode::Inspect;
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                let n = self.fleet.in_lane(self.current_lane()).len();
+                if n > 0 {
+                    self.card_idx = (self.card_idx + 1) % n;
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                let n = self.fleet.in_lane(self.current_lane()).len();
+                if n > 0 {
+                    self.card_idx = (self.card_idx + n - 1) % n;
+                }
+            }
+            _ => {}
+        }
+        self.clamp_card();
+    }
+
+    /// Map a click (col,row) to (lane, optional card index) against the current
+    /// terminal rect. Returns None for clicks in the header/footer chrome.
+    fn hit_test(&self, col: u16, row: u16) -> Option<(usize, Option<usize>)> {
+        hit_test_geom(self.area, col, row)
+    }
+}
+
+/// Pure geometry for hit-testing — shares `HEADER_H`/`FOOTER_H`/`CARD_H` with the
+/// renderer so clicks land where cards are drawn. Free fn so it is unit-testable.
+fn hit_test_geom(area: Rect, col: u16, row: u16) -> Option<(usize, Option<usize>)> {
+    if area.width == 0 || row < HEADER_H || row >= area.height.saturating_sub(FOOTER_H) {
+        return None;
+    }
+    let lane = ((col as u32 * 5) / (area.width.max(1) as u32)).min(4) as usize;
+    let inner_top = HEADER_H + 1; // lane block border + content start
+    if row < inner_top {
+        return Some((lane, None));
+    }
+    let card = ((row - inner_top) / CARD_H) as usize;
+    Some((lane, Some(card)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn area() -> Rect {
+        Rect::new(0, 0, 100, 44) // 5 lanes of 20 cols
+    }
+
+    #[test]
+    fn header_and_footer_are_not_hits() {
+        assert_eq!(hit_test_geom(area(), 10, 0), None); // header
+        assert_eq!(hit_test_geom(area(), 10, 43), None); // footer row
+    }
+
+    #[test]
+    fn columns_map_to_lanes() {
+        assert_eq!(hit_test_geom(area(), 0, 10).unwrap().0, 0);
+        assert_eq!(hit_test_geom(area(), 25, 10).unwrap().0, 1);
+        assert_eq!(hit_test_geom(area(), 99, 10).unwrap().0, 4);
+    }
+
+    #[test]
+    fn rows_map_to_cards() {
+        // inner_top = HEADER_H + 1 = 5; CARD_H = 6
+        assert_eq!(hit_test_geom(area(), 25, 5).unwrap().1, Some(0));
+        assert_eq!(hit_test_geom(area(), 25, 11).unwrap().1, Some(1));
+        // a click on the lane title/border (above inner_top) selects no card
+        assert_eq!(hit_test_geom(area(), 25, 4).unwrap().1, None);
     }
 }

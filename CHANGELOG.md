@@ -2,6 +2,29 @@
 
 All notable changes to agentmaster are documented here. Newest first.
 
+## [0.2.0] — 2026-06-03
+
+Mouse control + motion-as-feedback. Informed by Universal UI principles (effects
+must carry meaning — never decoration, never status-by-color-alone).
+
+### Added
+- **Mouse**: click a lane/card to focus + select, click the selected card again
+  to inspect, scroll wheel to move the card cursor. Enabled by default.
+- **`m` toggle**: drop mouse capture to hand the terminal back native text
+  selection / copy, then re-enable — respects "selection wins by default".
+- **Working spinner**: a braille spinner animates on working agents, so "this
+  agent is alive and running" reads at a glance (motion mapped to meaning).
+- **Status glyphs**: distinct shapes per state (`◔ ⠋ ◌ ▲ ◍ ✓ ✗`) so status never
+  depends on color alone (accessibility).
+- **Selected-card highlight**: subtle background on the focused card — clearer
+  focus feedback than a border change alone.
+- Shared layout geometry (`HEADER_H`/`FOOTER_H`/`CARD_H`) used by both the
+  renderer and mouse hit-testing, with unit tests for the click→lane/card map.
+
+### Notes
+- Verified: fmt clean, clippy `-D warnings` 0, 9/9 tests, tmux render confirms
+  spinner animation + glyphs + mouse footer.
+
 ## [0.1.0] — 2026-06-03
 
 First working cut: a single-binary Kanban TUI that sees and steers agents over

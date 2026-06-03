@@ -9,7 +9,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 
-use crate::app::{App, InputKind, Mode, View};
+use crate::app::{App, CARD_H, FOOTER_H, HEADER_H, InputKind, Mode, View};
 use crate::fleet::{Agent, Lane, Status};
 
 // ---- color semantics (one meaning per color, used everywhere) -------------
@@ -35,6 +35,20 @@ fn status_color(s: Status) -> Color {
     }
 }
 
+/// A glyph per status — shape conveys state without relying on color (a11y).
+/// Working spins so motion signals "actively running".
+fn status_glyph(s: Status, spin: char) -> char {
+    match s {
+        Status::Queued => '◔',
+        Status::Working => spin,
+        Status::Idle => '◌',
+        Status::Blocked => '▲',
+        Status::Review => '◍',
+        Status::Done => '✓',
+        Status::Dead => '✗',
+    }
+}
+
 fn kind_color(kind: &str) -> Color {
     match kind {
         "spawn" => C_WORKING,
@@ -49,9 +63,9 @@ fn kind_color(kind: &str) -> Color {
 pub fn render(f: &mut Frame, app: &App) {
     let area = f.area();
     let rows = Layout::vertical([
-        Constraint::Length(4),
+        Constraint::Length(HEADER_H),
         Constraint::Min(3),
-        Constraint::Length(1),
+        Constraint::Length(FOOTER_H),
     ])
     .split(area);
 
@@ -175,20 +189,20 @@ fn render_cards(f: &mut Frame, inner: Rect, agents: &[&Agent], focused: bool, ap
         f.render_widget(p, inner);
         return;
     }
-    let card_h: u16 = 6;
-    let max = (inner.height / card_h).max(1) as usize;
-    let constraints: Vec<Constraint> = (0..max).map(|_| Constraint::Length(card_h)).collect();
+    let max = (inner.height / CARD_H).max(1) as usize;
+    let constraints: Vec<Constraint> = (0..max).map(|_| Constraint::Length(CARD_H)).collect();
     let slots = Layout::vertical(constraints).split(inner);
+    let spin = app.spin();
     for (idx, agent) in agents.iter().take(max).enumerate() {
         let selected = focused && idx == app.card_idx;
-        card(f, slots[idx], agent, selected, &app.filter);
+        card(f, slots[idx], agent, selected, &app.filter, spin);
     }
     if agents.len() > max {
         // Honesty over silent truncation: say how many cards are hidden.
         let last = slots[max.saturating_sub(1)];
         let note = Rect {
             x: last.x,
-            y: last.y.saturating_add(card_h.saturating_sub(1)),
+            y: last.y.saturating_add(CARD_H.saturating_sub(1)),
             width: last.width,
             height: 1,
         };
@@ -202,7 +216,7 @@ fn render_cards(f: &mut Frame, inner: Rect, agents: &[&Agent], focused: bool, ap
     }
 }
 
-fn card(f: &mut Frame, area: Rect, a: &Agent, selected: bool, filter: &str) {
+fn card(f: &mut Frame, area: Rect, a: &Agent, selected: bool, filter: &str, spin: char) {
     let col = status_color(a.status);
     let dim = matches!(a.status, Status::Idle | Status::Dead);
     let matched = filter.is_empty()
@@ -216,9 +230,13 @@ fn card(f: &mut Frame, area: Rect, a: &Agent, selected: bool, filter: &str) {
     } else {
         Style::new().fg(Color::Indexed(239))
     };
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(bstyle);
+    // Selected card gets a subtle background — focus feedback, not color-only.
+    if selected {
+        block = block.style(Style::new().bg(Color::Indexed(236)));
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -228,9 +246,12 @@ fn card(f: &mut Frame, area: Rect, a: &Agent, selected: bool, filter: &str) {
     } else {
         Style::new().bold()
     };
+    // Glyph carries meaning beyond color: a spinner = actively working, distinct
+    // shapes for the rest. Working agents visibly move so "alive" is obvious.
+    let glyph = status_glyph(a.status, spin);
     let lines = vec![
         Line::from(vec![
-            Span::styled("● ", Style::new().fg(col)),
+            Span::styled(format!("{glyph} "), Style::new().fg(col).bold()),
             Span::styled(trunc(&a.name, w.saturating_sub(10)), name_style),
             Span::raw(" "),
             Span::styled(a.runtime.clone(), Style::new().fg(C_ACCENT)),
@@ -442,7 +463,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
         Mode::Help => "any key to close",
         Mode::Inspect => "Esc/q back · s send line",
         Mode::Normal => {
-            "[1]kanban [2]tree [3]logs   lane:h/l/Tab  card:j/k  ↵inspect   n)ew s)end K)ill /filter ?help q)uit"
+            "[1]kanban [2]tree [3]logs   🖱click/scroll · h/l lane · j/k card · ↵inspect   n)ew s)end K)ill /filter m)ouse ?help q)uit"
         }
     };
     f.render_widget(
@@ -493,6 +514,9 @@ fn help(f: &mut Frame, area: Rect) {
         Line::from(""),
         head("Navigate (kanban)"),
         Line::from("  h / l / Tab   switch lane        j / k   select card        ↵   inspect"),
+        Line::from(
+            "  🖱  click a card to select · click again to open · wheel scrolls · m toggles mouse",
+        ),
         Line::from(""),
         head("Act"),
         Line::from("  n   new agent   <runtime> [task]   e.g.  'shell'   or  'claude fix the bug'"),
