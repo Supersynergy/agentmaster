@@ -7,6 +7,8 @@ mod app;
 mod backend;
 mod fleet;
 mod obs;
+mod orch;
+mod peek;
 mod pty;
 mod runtime;
 mod state;
@@ -39,6 +41,32 @@ enum Cmd {
     },
     /// Health check: data dir, sqlite, pty, runtimes
     Doctor,
+    /// Search ALL sessions by content (passthrough to session-restore)
+    Find { query: String },
+    /// Grouped session dashboard (project → sessions, cost, topic)
+    Dash {
+        #[arg(long)]
+        all: bool,
+        query: Option<String>,
+    },
+    /// Cold-start a distilled session into a seeded cmux workspace (or --here)
+    Start {
+        id: String,
+        #[arg(long)]
+        here: bool,
+        #[arg(long)]
+        focus: bool,
+    },
+    /// Zero-tax peek: read a session's last user/assistant/next off its transcript
+    Peek { id_or_path: String },
+    /// Fan-out: spawn one seeded cmux workspace per task in a tasks file
+    Batch {
+        file: PathBuf,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 fn home() -> PathBuf {
@@ -69,6 +97,29 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Doctor => doctor(&dir)?,
+        Cmd::Find { query } => orch::find(&query)?,
+        Cmd::Dash { all, query } => orch::dash(all, query.as_deref())?,
+        Cmd::Start { id, here, focus } => orch::start(&id, here, focus)?,
+        Cmd::Peek { id_or_path } => match peek::resolve(&id_or_path) {
+            Some(path) => {
+                let d = peek::digest(&path, 220);
+                println!("transcript: {}", path.display());
+                if !d.last_user.is_empty() {
+                    println!("🧑 {}", d.last_user);
+                }
+                if !d.last_assistant.is_empty() {
+                    println!("🤖 {}", d.last_assistant);
+                }
+                if !d.next_action.is_empty() {
+                    println!("🎯 next: {}", d.next_action);
+                }
+            }
+            None => eprintln!("no transcript found for: {id_or_path}"),
+        },
+        Cmd::Batch { file, yes, model } => {
+            let tasks = orch::load_tasks(&file)?;
+            orch::batch(&tasks, model.as_deref(), yes)?;
+        }
     }
     Ok(())
 }

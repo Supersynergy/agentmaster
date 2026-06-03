@@ -49,6 +49,44 @@ fn status_glyph(s: Status, spin: char) -> char {
     }
 }
 
+/// Card status row: age · idle (highlighted once stale) · status label.
+fn status_line(a: &Agent, col: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("⏱ {} ", fmt_dur(a.age_secs())),
+            Style::new().fg(C_DIM),
+        ),
+        Span::styled(
+            format!("idle {} ", fmt_dur(a.idle_secs())),
+            Style::new().fg(if a.idle_secs() > 20 { C_IDLE } else { C_DIM }),
+        ),
+        Span::styled(a.status.label().to_string(), Style::new().fg(col)),
+    ])
+}
+
+/// A 10-cell unicode progress bar. Shape carries the value without color (a11y).
+fn progress_bar(p: u8) -> String {
+    let filled = (p as usize * 10 / 100).min(10);
+    let mut s = String::with_capacity(10);
+    for i in 0..10 {
+        s.push(if i < filled { '▰' } else { '▱' });
+    }
+    s
+}
+
+/// Progress color ramps blocked→working→done so a glance reads "how far along".
+fn progress_color(p: u8) -> Color {
+    if p >= 100 {
+        C_DONE
+    } else if p >= 60 {
+        C_WORKING
+    } else if p >= 25 {
+        C_BLOCKED
+    } else {
+        C_IDLE
+    }
+}
+
 fn kind_color(kind: &str) -> Color {
     match kind {
         "spawn" => C_WORKING,
@@ -98,7 +136,7 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
 
     let c = app.fleet.counts();
     let total: usize = c.iter().sum();
-    let l0 = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             " agentmaster ",
             Style::new().fg(Color::Black).bg(C_ACCENT).bold(),
@@ -115,8 +153,22 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(format!("◍ {} review", c[3]), Style::new().fg(C_REVIEW)),
         Span::raw("  "),
         Span::styled(format!("✓ {} done", c[4]), Style::new().fg(C_DONE)),
-    ]);
-    f.render_widget(Paragraph::new(l0), rows[0]);
+    ];
+    // Needs-you alert: blocked agents are the one thing that wants the operator
+    // right now. Make it loud (and blink on odd ticks) so it can't be missed.
+    if c[2] > 0 {
+        let style = Style::new().fg(Color::Black).bg(C_BLOCKED).bold();
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            format!(" ⏸ {} NEED YOU ", c[2]),
+            if app.tick().is_multiple_of(2) {
+                style
+            } else {
+                Style::new().fg(C_BLOCKED).bold()
+            },
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
 
     let view_name = match app.view {
         View::Kanban => "kanban",
@@ -279,24 +331,34 @@ fn card(f: &mut Frame, area: Rect, a: &Agent, selected: bool, filter: &str, spin
                 Style::new().fg(C_FAINT),
             ),
         ]),
-        Line::from(vec![
-            Span::styled(
-                format!("⏱ {} ", fmt_dur(a.age_secs())),
-                Style::new().fg(C_DIM),
-            ),
-            Span::styled(
-                format!("idle {} ", fmt_dur(a.idle_secs())),
-                Style::new().fg(if a.idle_secs() > 20 { C_IDLE } else { C_DIM }),
-            ),
-            Span::styled(a.status.label(), Style::new().fg(col)),
-        ]),
-        Line::from(vec![
-            Span::styled("▸ ", Style::new().fg(col)),
-            Span::styled(
-                trunc(a.last_line.trim(), w.saturating_sub(2)),
-                Style::new().fg(Color::Indexed(250)),
-            ),
-        ]),
+        status_line(a, col),
+        if a.has_goal() {
+            // Goal line wins the 4th row: progress bar + goal text, so the board
+            // shows movement toward the objective, not just the latest log line.
+            Line::from(vec![
+                Span::styled("🎯 ", Style::new().fg(C_REVIEW)),
+                Span::styled(
+                    format!("{} ", progress_bar(a.progress)),
+                    Style::new().fg(progress_color(a.progress)),
+                ),
+                Span::styled(
+                    format!("{:>3}% ", a.progress),
+                    Style::new().fg(progress_color(a.progress)).bold(),
+                ),
+                Span::styled(
+                    trunc(a.goal.as_deref().unwrap_or(""), w.saturating_sub(12)),
+                    Style::new().fg(Color::Indexed(250)),
+                ),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("▸ ", Style::new().fg(col)),
+                Span::styled(
+                    trunc(a.last_line.trim(), w.saturating_sub(2)),
+                    Style::new().fg(Color::Indexed(250)),
+                ),
+            ])
+        },
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -313,7 +375,7 @@ fn inspect(f: &mut Frame, area: Rect, app: &App) {
     };
     let Some(a) = app.fleet.get(id) else { return };
     let title = format!(
-        " inspect: {} [{}] pid {} — Esc back · s send line ",
+        " inspect: {} [{}] pid {} — Esc back · s send · g goal · p peek ",
         a.name,
         a.status.label(),
         a.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
@@ -323,7 +385,17 @@ fn inspect(f: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::new().fg(status_color(a.status)));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    // Reserve a goal row only when a goal is pinned, so non-goal agents are unchanged.
+    let parts = if a.has_goal() {
+        Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner)
+    } else {
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner)
+    };
 
     // Detail line: the exact command, cwd, and branch (if known).
     let branch = a
@@ -343,13 +415,40 @@ fn inspect(f: &mut Frame, area: Rect, app: &App) {
         parts[0],
     );
 
-    let h = parts[1].height as usize;
+    // Goal row (only present when pinned): progress bar + % + goal · DoD.
+    let out_slot = if a.has_goal() {
+        let dod = a
+            .done_def
+            .as_deref()
+            .map(|d| format!("   ✓dod: {d}"))
+            .unwrap_or_default();
+        let goal = Line::from(vec![
+            Span::styled(
+                format!("🎯 {} {:>3}%  ", progress_bar(a.progress), a.progress),
+                Style::new().fg(progress_color(a.progress)).bold(),
+            ),
+            Span::styled(
+                a.goal.as_deref().unwrap_or("").to_string(),
+                Style::new().fg(Color::Indexed(252)),
+            ),
+            Span::styled(dod, Style::new().fg(C_DIM)),
+        ]);
+        f.render_widget(
+            Paragraph::new(goal).style(Style::new().bg(Color::Indexed(234))),
+            parts[1],
+        );
+        parts[2]
+    } else {
+        parts[1]
+    };
+
+    let h = out_slot.height as usize;
     let start = a.output.len().saturating_sub(h);
     let lines: Vec<Line> = a
         .output
         .iter()
         .skip(start)
-        .map(|l| Line::from(trunc(l, parts[1].width as usize)))
+        .map(|l| Line::from(trunc(l, out_slot.width as usize)))
         .collect();
     let body = if lines.is_empty() {
         vec![Line::from(Span::styled(
@@ -359,7 +458,7 @@ fn inspect(f: &mut Frame, area: Rect, app: &App) {
     } else {
         lines
     };
-    f.render_widget(Paragraph::new(body), parts[1]);
+    f.render_widget(Paragraph::new(body), out_slot);
 }
 
 // ---- tree (process / project hierarchy) -----------------------------------
@@ -424,10 +523,40 @@ fn tree(f: &mut Frame, area: Rect, app: &App) {
 
 fn logs(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::bordered()
-        .title(" event log — every state change & action (SQLite + JSONL) ")
+        .title(" orchestrator chat ▸ event log (SQLite + JSONL) ")
         .border_style(Style::new().fg(C_ACCENT));
     let inner = block.inner(area);
     f.render_widget(block, area);
+
+    // Top: the orchestrator transcript — what you told which agent (newest last).
+    let chat_h = (inner.height / 3).clamp(2, 6) as usize;
+    let rows = Layout::vertical([
+        Constraint::Length(chat_h as u16),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .split(inner);
+    let chat_start = app.chat_log.len().saturating_sub(chat_h);
+    let chat_lines: Vec<Line> = app
+        .chat_log
+        .iter()
+        .skip(chat_start)
+        .map(|l| {
+            Line::from(Span::styled(
+                trunc(l, rows[0].width as usize),
+                Style::new().fg(C_ACCENT),
+            ))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(chat_lines), rows[0]);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─ events ─",
+            Style::new().fg(C_FAINT),
+        ))),
+        rows[1],
+    );
+    let inner = rows[2];
 
     let evs = app.store.recent(inner.height as i64 * 2);
     let flt = app.filter.to_lowercase();
@@ -505,6 +634,8 @@ fn input_overlay(f: &mut Frame, area: Rect, app: &App) {
         InputKind::NewAgent => "new agent",
         InputKind::Send => "send line",
         InputKind::Filter => "filter",
+        InputKind::Orchestrate => "orchestrate  ·  #N msg / #* msg",
+        InputKind::Goal => "goal  ·  text :: definition-of-done",
         InputKind::None => "",
     };
     let box_area = Rect {
@@ -547,20 +678,32 @@ fn help(f: &mut Frame, area: Rect) {
         Line::from(""),
         head("Act"),
         Line::from("  n   new agent   <runtime> [task]   e.g.  'shell'   or  'claude fix the bug'"),
-        Line::from("  s   send a line to selected        K   kill selected         /   filter"),
-        Line::from("  d   discover + import running tmux panes as agents (steer them too)"),
+        Line::from("  s   send a line to selected        K   kill/untrack          /   filter"),
+        Line::from("  d   discover + import tmux panes AND cmux workspaces (steer them all)"),
         Line::from("  🖱  footer is a clickable toolbar — every [button] is a click target"),
+        Line::from(""),
+        head("Orchestrate (one session steers all — zero token tax)"),
+        Line::from("  o   talk:  #N <msg> → steer agent N   ·   #* <msg> → broadcast to all live"),
+        Line::from("  g   set a goal on selected:  <goal>  ::  <definition of done>"),
+        Line::from("  p   peek: read a session's last user/assistant/next off its transcript"),
+        Line::from(""),
+        head("Goals & indicators"),
+        Line::from(
+            "  🎯 progress ratchets from output milestones · DoD match → done · ⏸ NEED YOU alert",
+        ),
         Line::from(""),
         head("Lanes are agent state"),
         Line::from(
             "  queued · working · blocked(needs you) · review · done — the board IS the truth",
         ),
         Line::from(""),
-        head("Observability"),
+        head("Observability + headless orchestrator parity"),
         Line::from(
             "  every state change + action -> SQLite audit log + JSONL trace in ~/.agentmaster/",
         ),
-        Line::from("  headless:  agentmaster events -n 100   ·   agentmaster doctor"),
+        Line::from(
+            "  events · doctor · find <q> · dash [--all] · start <id> · peek <id> · batch <file>",
+        ),
         Line::from(""),
         Line::from(Span::styled(
             "press any key to close",

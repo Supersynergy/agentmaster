@@ -84,6 +84,106 @@ pub fn kill_pane(target: &str) {
         .output();
 }
 
+// ---- cmux adapter ---------------------------------------------------------
+// cmux exposes a rich CLI over its socket: `cmux top --all` lists every
+// workspace with its title (the task), a status tag, and the agent pid; we can
+// steer with `cmux send` / `cmux send-key`. Read-only discovery here.
+
+/// A cmux workspace = one agent surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CmuxWorkspace {
+    pub ws_ref: String, // workspace:NN — stable handle for send
+    pub title: String,  // the task
+    pub status: String, // raw status from tags (working/done/Needs input/…)
+    pub pid: Option<u32>,
+}
+
+pub fn cmux_available() -> bool {
+    Command::new("cmux")
+        .arg("ping")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+pub fn list_cmux() -> Vec<CmuxWorkspace> {
+    match Command::new("cmux").args(["top", "--all"]).output() {
+        Ok(o) if o.status.success() => parse_cmux_top(&String::from_utf8_lossy(&o.stdout)),
+        _ => Vec::new(),
+    }
+}
+
+/// Send a line to a cmux workspace's agent (text, then Return to submit).
+pub fn cmux_send(ws_ref: &str, text: &str) {
+    let _ = Command::new("cmux")
+        .args(["send", "--workspace", ws_ref, text])
+        .output();
+    let _ = Command::new("cmux")
+        .args(["send-key", "--workspace", ws_ref, "Return"])
+        .output();
+}
+
+fn extract_quoted(s: &str) -> String {
+    match (s.find('"'), s.rfind('"')) {
+        (Some(a), Some(b)) if b > a => s[a + 1..b].to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Parse `cmux top --all` into one entry per workspace. Tolerant of the tree
+/// drawing characters; pulls title, status tag, and pid. Unit-testable.
+pub fn parse_cmux_top(s: &str) -> Vec<CmuxWorkspace> {
+    let mut out = Vec::new();
+    let mut cur: Option<CmuxWorkspace> = None;
+    for line in s.lines() {
+        if let Some(idx) = line.find("workspace workspace:") {
+            if let Some(w) = cur.take() {
+                out.push(w);
+            }
+            let rest = &line[idx + "workspace ".len()..];
+            let ws_ref = rest.split_whitespace().next().unwrap_or("").to_string();
+            cur = Some(CmuxWorkspace {
+                ws_ref,
+                title: extract_quoted(rest),
+                status: String::new(),
+                pid: None,
+            });
+        } else if let Some(w) = cur.as_mut() {
+            // Agent-type status tag, e.g. `tag claude "working"`.
+            if (line.contains("tag claude ")
+                || line.contains("tag codex ")
+                || line.contains("tag opencode ")
+                || line.contains("tag amp "))
+                && w.status.is_empty()
+            {
+                w.status = extract_quoted(line);
+            }
+            // `tag claude_code "Needs input" pid=37706` — strongest signal. Let it
+            // win outright; otherwise only fill an empty status.
+            if line.contains("_code \"") {
+                let v = extract_quoted(line);
+                if v.eq_ignore_ascii_case("needs input") || w.status.is_empty() {
+                    w.status = v;
+                }
+            }
+            if let Some(p) = line.find("pid=") {
+                let digits: String = line[p + 4..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(n) = digits.parse() {
+                    w.pid = Some(n);
+                }
+            }
+        }
+    }
+    if let Some(w) = cur.take() {
+        out.push(w);
+    }
+    out.retain(|w| !w.ws_ref.is_empty());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +209,26 @@ mod tests {
         assert_eq!(p[0].command, "bash");
         assert_eq!(p[0].pid, None);
         assert_eq!(p[0].path, "");
+    }
+
+    #[test]
+    fn parses_cmux_top() {
+        let s = r#"
+ 99.2%  557.5 MB  6  ├── workspace workspace:96 "🟣 Claude ▶ · kill dead code"
+  0.0%       0 B  0  │   ├── tag claude "working"
+ 99.2%  550.5 MB  5  │   ├── tag claude_code "Running" pid=96335
+  0.0%  513.7 MB  6  ├── workspace workspace:108 "🟣 Claude ✓ · answer me"
+  0.0%       0 B  0  │   ├── tag claude "done"
+  0.0%  507.6 MB  5  │   ├── tag claude_code "Needs input" pid=37706
+"#;
+        let w = parse_cmux_top(s);
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0].ws_ref, "workspace:96");
+        assert_eq!(w[0].title, "🟣 Claude ▶ · kill dead code");
+        assert_eq!(w[0].status, "working");
+        assert_eq!(w[0].pid, Some(96335));
+        // "Needs input" must win over the "done" agent tag.
+        assert_eq!(w[1].status.to_lowercase(), "needs input");
+        assert_eq!(w[1].pid, Some(37706));
     }
 }

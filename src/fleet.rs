@@ -79,6 +79,7 @@ impl Lane {
 pub enum Source {
     Native,
     Tmux(String), // target = session:window.pane
+    Cmux(String), // workspace ref, e.g. workspace:96
 }
 
 impl Source {
@@ -86,6 +87,7 @@ impl Source {
         match self {
             Source::Native => "",
             Source::Tmux(_) => "tmux",
+            Source::Cmux(_) => "cmux",
         }
     }
 }
@@ -114,6 +116,16 @@ pub struct Agent {
     /// Live per-process resource use, refreshed on the housekeeping tick.
     pub cpu: f32,
     pub mem_bytes: u64,
+    /// Operator-set goal for this agent + its definition-of-done. Both persist in
+    /// SQLite keyed by name, so re-imported/re-spawned agents keep their goal.
+    pub goal: Option<String>,
+    pub done_def: Option<String>,
+    /// Heuristic 0-100 goal progress, derived from output milestones — never a
+    /// token-costing self-report.
+    pub progress: u8,
+    /// Path to this agent's session transcript (cmux/sr/Claude Code JSONL), when
+    /// known. Enables zero-tax `peek` — read what it last said off disk.
+    pub transcript: Option<String>,
 }
 
 impl Agent {
@@ -152,7 +164,21 @@ impl Agent {
             lines_total: 0,
             cpu: 0.0,
             mem_bytes: 0,
+            goal: None,
+            done_def: None,
+            progress: 0,
+            transcript: None,
         }
+    }
+
+    /// True once this agent reached a terminal lane (done or dead).
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.status, Status::Done | Status::Dead)
+    }
+
+    /// Has the operator set a goal we can track progress against?
+    pub fn has_goal(&self) -> bool {
+        self.goal.is_some()
     }
 
     pub fn push_line(&mut self, line: String) {

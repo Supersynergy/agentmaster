@@ -36,9 +36,57 @@ impl Store {
               body    TEXT,
               read    INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS goals(
+              name     TEXT PRIMARY KEY,
+              goal     TEXT NOT NULL,
+              dod      TEXT,
+              progress INTEGER NOT NULL DEFAULT 0,
+              updated  TEXT NOT NULL
+            );
             "#,
         )?;
         Ok(Store { conn })
+    }
+
+    /// Persist an agent's goal + definition-of-done, keyed by name so it survives
+    /// restarts and re-imports. Progress resets to 0 on a (re)set.
+    pub fn set_goal(&self, name: &str, goal: &str, dod: Option<&str>) {
+        let ts = chrono::Local::now().to_rfc3339();
+        let _ = self.conn.execute(
+            "INSERT INTO goals(name, goal, dod, progress, updated) VALUES(?1,?2,?3,0,?4)
+             ON CONFLICT(name) DO UPDATE SET goal=?2, dod=?3, progress=0, updated=?4",
+            params![name, goal, dod, ts],
+        );
+    }
+
+    /// Update only the derived progress for a goal (cheap, called on milestones).
+    pub fn save_progress(&self, name: &str, progress: u8) {
+        let ts = chrono::Local::now().to_rfc3339();
+        let _ = self.conn.execute(
+            "UPDATE goals SET progress=?2, updated=?3 WHERE name=?1",
+            params![name, progress as i64, ts],
+        );
+    }
+
+    /// All stored goals: (name, goal, dod, progress). Used to rehydrate agents on
+    /// spawn/import so a goal set yesterday is still there today.
+    pub fn load_goals(&self) -> Vec<(String, String, Option<String>, u8)> {
+        let mut out = Vec::new();
+        if let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT name, goal, dod, progress FROM goals")
+            && let Ok(rows) = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, i64>(3)? as u8,
+                ))
+            })
+        {
+            out.extend(rows.flatten());
+        }
+        out
     }
 
     /// Append one event. Best-effort: a logging failure must never crash the UI.

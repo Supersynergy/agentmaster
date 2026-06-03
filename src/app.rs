@@ -17,7 +17,7 @@ use ratatui::layout::Rect;
 use crate::fleet::{Agent, Fleet, Lane, Source, Status};
 use crate::obs::Metrics;
 use crate::store::Store;
-use crate::{backend, pty, runtime, state};
+use crate::{backend, peek, pty, runtime, state};
 
 /// Shared layout geometry — single source of truth for both render (`ui.rs`) and
 /// mouse hit-testing here, so clicks always land where the cards are drawn.
@@ -28,11 +28,12 @@ pub const CARD_H: u16 = 6;
 /// Clickable toolbar buttons (the footer in Normal mode). One source of truth so
 /// the rendered labels and the click hit-test never drift. Labels are ASCII so
 /// display width == char count == hit-test width.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ButtonId {
     Kanban,
     Tree,
     Logs,
+    Orchestrate,
     New,
     Discover,
     Mouse,
@@ -40,12 +41,13 @@ pub enum ButtonId {
     Quit,
 }
 
-pub const TOOLBAR: [(ButtonId, &str); 8] = [
+pub const TOOLBAR: [(ButtonId, &str); 9] = [
     (ButtonId::Kanban, "[1 kanban]"),
     (ButtonId::Tree, "[2 tree]"),
     (ButtonId::Logs, "[3 logs]"),
+    (ButtonId::Orchestrate, "[o talk]"),
     (ButtonId::New, "[+ new]"),
-    (ButtonId::Discover, "[* tmux]"),
+    (ButtonId::Discover, "[* find]"),
     (ButtonId::Mouse, "[m mouse]"),
     (ButtonId::Help, "[? help]"),
     (ButtonId::Quit, "[q quit]"),
@@ -91,6 +93,8 @@ pub enum InputKind {
     NewAgent,
     Send,
     Filter,
+    Orchestrate,
+    Goal,
 }
 
 pub struct App {
@@ -107,6 +111,8 @@ pub struct App {
     pub input_kind: InputKind,
     pub filter: String,
     pub status_msg: String,
+    /// Orchestrator transcript (top strip) — what you told which agent.
+    pub chat_log: Vec<String>,
     pub should_quit: bool,
     pub mouse_on: bool,
     /// Last known terminal rect, refreshed each frame for mouse hit-testing.
@@ -148,12 +154,21 @@ impl App {
             input: String::new(),
             input_kind: InputKind::None,
             filter: String::new(),
-            status_msg: "ready — press n to spawn an agent, ? for help · mouse on".into(),
+            chat_log: vec![
+                "orchestrator ready — press [* find] to import tmux+cmux agents,".into(),
+                "then [o talk] and type  #N <message>  to steer agent #N.".into(),
+            ],
+            status_msg: "ready — o talk · * find agents · n new · ? help".into(),
             should_quit: false,
             mouse_on: true,
             area: Rect::new(0, 0, 0, 0),
             tick: 0,
         }
+    }
+
+    /// Current housekeeping tick — used by the renderer for blink/animation.
+    pub fn tick(&self) -> u64 {
+        self.tick
     }
 
     /// Braille spinner frame — motion that means "this agent is actively working".
@@ -200,6 +215,17 @@ impl App {
             .iter()
             .filter_map(|&p| self.metrics.proc_stats(p).map(|(c, m)| (p, c, m)))
             .collect();
+        // One cmux query per tick if we track any cmux agents; map by ws_ref below.
+        let has_cmux = self
+            .fleet
+            .agents
+            .iter()
+            .any(|a| matches!(a.source, Source::Cmux(_)));
+        let cmux_snapshot = if has_cmux {
+            backend::list_cmux()
+        } else {
+            Vec::new()
+        };
         for a in self.fleet.agents.iter_mut() {
             if let Some(pid) = a.pid
                 && let Some(&(_, cpu, mem)) = stats.iter().find(|(p, _, _)| *p == pid)
@@ -224,7 +250,21 @@ impl App {
                     None => a.status = Status::Dead, // pane closed
                 }
             }
-            state::idle_sweep(a, 20);
+            // cmux-backed agents: refresh status + title from `cmux top --all`.
+            if let Source::Cmux(ws) = a.source.clone()
+                && let Some(w) = cmux_snapshot.iter().find(|w| w.ws_ref == ws)
+            {
+                a.status = cmux_status(&w.status);
+                if !w.title.is_empty() && w.title != a.last_line {
+                    a.push_line(w.title.clone());
+                }
+                if a.pid.is_none() {
+                    a.pid = w.pid;
+                }
+            }
+            if matches!(a.source, Source::Native) {
+                state::idle_sweep(a, 20);
+            }
             if let Some(h) = a.pty.as_mut() {
                 if a.pid.is_none() {
                     a.pid = h.child.process_id();
@@ -277,6 +317,7 @@ impl App {
             a.pid = p.pid;
             a.status = Status::Idle;
             self.fleet.agents.push(a);
+            self.rehydrate_goal(id, &name);
             self.store
                 .log(Some(id), &name, "import", &format!("tmux {}", p.target));
             tracing::info!(agent = id, target = %p.target, "imported tmux pane");
@@ -285,12 +326,95 @@ impl App {
         self.status_msg = format!("discovered {added} new tmux pane(s)");
     }
 
+    /// Import every cmux workspace not already tracked, as a `Source::Cmux` agent.
+    /// Status is mapped from the workspace's agent tag (`cmux top --all`).
+    fn discover_cmux(&mut self) {
+        if !backend::cmux_available() {
+            return;
+        }
+        let mut added = 0;
+        for w in backend::list_cmux() {
+            if w.ws_ref.is_empty() {
+                continue;
+            }
+            if self
+                .fleet
+                .agents
+                .iter()
+                .any(|a| a.source == Source::Cmux(w.ws_ref.clone()))
+            {
+                continue;
+            }
+            let id = self.fleet.next_id;
+            self.fleet.next_id += 1;
+            let name = if w.title.is_empty() {
+                w.ws_ref.clone()
+            } else {
+                w.title.clone()
+            };
+            let mut a = Agent::new(
+                id,
+                name.clone(),
+                "cmux".into(),
+                "cmux".into(),
+                vec![],
+                String::new(),
+            );
+            a.source = Source::Cmux(w.ws_ref.clone());
+            a.pid = w.pid;
+            a.status = cmux_status(&w.status);
+            a.push_line(w.title.clone());
+            self.fleet.agents.push(a);
+            self.rehydrate_goal(id, &name);
+            self.store
+                .log(Some(id), &name, "import", &format!("cmux {}", w.ws_ref));
+            tracing::info!(agent = id, ws = %w.ws_ref, "imported cmux workspace");
+            added += 1;
+        }
+        self.status_msg = format!("{} +{added} cmux workspace(s)", self.status_msg);
+    }
+
+    /// One button to pull in agents from every backend (tmux panes + cmux
+    /// workspaces). The `[* find]` action and the `d` key both land here.
+    fn discover_all(&mut self) {
+        self.status_msg = "discovered".into();
+        self.discover_tmux();
+        self.discover_cmux();
+    }
+
+    /// Read the selected agent's transcript off disk and surface its last
+    /// user/assistant/next-action into the orchestrator chat — the zero-tax peek.
+    fn peek_selected(&mut self) {
+        let Some(id) = self.current_agent_id() else {
+            return;
+        };
+        let (name, transcript) = match self.fleet.get(id) {
+            Some(a) => (a.name.clone(), a.transcript.clone()),
+            None => return,
+        };
+        let Some(path) = transcript else {
+            self.status_msg = format!("{name}: no transcript to peek (native/tmux agent)");
+            return;
+        };
+        let d = peek::digest(std::path::Path::new(&path), 220);
+        if !d.last_user.is_empty() {
+            self.chat_log
+                .push(format!("peek {name} 🧑 {}", d.last_user));
+        }
+        if !d.next_action.is_empty() {
+            self.chat_log
+                .push(format!("peek {name} 🎯 {}", d.next_action));
+        }
+        self.status_msg = format!("peeked {name}");
+    }
+
     // ---- pty events -------------------------------------------------------
 
     fn handle_pty(&mut self, ev: AppEvent) {
         match ev {
             AppEvent::Output { id, line } => {
                 let mut transition = None;
+                let mut progressed = None;
                 if let Some(a) = self.fleet.get_mut(id) {
                     if let Some(ns) = state::detect(a, &line)
                         && ns != a.status
@@ -298,11 +422,22 @@ impl App {
                         transition = Some((a.name.clone(), ns));
                         a.status = ns;
                     }
+                    // Goal-aware: ratchet progress from milestones in the output.
+                    if a.has_goal() {
+                        let np = state::infer_progress(a.progress, &line);
+                        if np != a.progress {
+                            a.progress = np;
+                            progressed = Some((a.name.clone(), np));
+                        }
+                    }
                     a.push_line(line);
                 }
                 if let Some((name, ns)) = transition {
                     self.store.log(Some(id), &name, "state", ns.label());
                     tracing::info!(agent = id, status = ns.label(), "state change");
+                }
+                if let Some((name, np)) = progressed {
+                    self.store.save_progress(&name, np);
                 }
             }
             AppEvent::Exited { id } => {
@@ -357,6 +492,7 @@ impl App {
             }
         }
         self.fleet.agents.push(agent);
+        self.rehydrate_goal(id, &name);
     }
 
     fn send_line(&mut self, id: u64, text: &str) {
@@ -376,6 +512,10 @@ impl App {
                 }
                 Source::Tmux(target) => {
                     backend::send_keys(target, text);
+                    ok = true;
+                }
+                Source::Cmux(ws_ref) => {
+                    backend::cmux_send(ws_ref, text);
                     ok = true;
                 }
             }
@@ -401,12 +541,16 @@ impl App {
                     }
                 }
                 Source::Tmux(target) => backend::kill_pane(target),
+                // Never destroy an external cmux workspace from here — just stop
+                // tracking it. Killing someone else's session is not our call.
+                Source::Cmux(_) => {}
             }
             a.status = Status::Dead;
         }
-        self.store.log(Some(id), &name, "kill", "killed by user");
+        self.store
+            .log(Some(id), &name, "kill", "untracked / killed by user");
         tracing::warn!(agent = id, "killed by user");
-        self.status_msg = format!("killed {name}");
+        self.status_msg = format!("dropped {name}");
     }
 
     // ---- selection helpers ------------------------------------------------
@@ -434,6 +578,12 @@ impl App {
             }
             InputKind::Send => "send a line to the selected agent".into(),
             InputKind::Filter => "filter (substring of name / last line)".into(),
+            InputKind::Orchestrate => {
+                "orchestrate: #N <msg> → steer agent N · #* <msg> → broadcast to all live".into()
+            }
+            InputKind::Goal => {
+                "goal for selected agent:  <goal text>  ::  <definition of done>".into()
+            }
             InputKind::None => String::new(),
         };
     }
@@ -457,7 +607,117 @@ impl App {
                 }
             }
             InputKind::Filter => self.filter = buf.trim().to_string(),
+            InputKind::Orchestrate => self.orchestrate(&buf),
+            InputKind::Goal => self.set_goal_on_selected(&buf),
             InputKind::None => {}
+        }
+    }
+
+    /// Orchestrator send from the one master session: `#N <msg>` steers agent N,
+    /// `#* <msg>` (or `#all <msg>`) broadcasts to every live (non-terminal) agent.
+    /// This is the in-TUI port of `cmux-meta-orchestrator send` — zero token tax,
+    /// the routing is just a line write to each agent's transport.
+    fn orchestrate(&mut self, buf: &str) {
+        let buf = buf.trim();
+        let Some(rest) = buf.strip_prefix('#') else {
+            self.status_msg = "orchestrate: start with #N or #*  (e.g. #3 run the tests)".into();
+            return;
+        };
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let sel = parts.next().unwrap_or("").trim();
+        let msg = parts.next().unwrap_or("").trim();
+        if msg.is_empty() {
+            self.status_msg = "orchestrate: empty message".into();
+            return;
+        }
+        if sel == "*" || sel.eq_ignore_ascii_case("all") {
+            let ids: Vec<u64> = self
+                .fleet
+                .agents
+                .iter()
+                .filter(|a| !a.is_terminal())
+                .map(|a| a.id)
+                .collect();
+            let n = ids.len();
+            for id in ids {
+                self.send_line(id, msg);
+            }
+            self.chat_log.push(format!("#* ({n} agents) ◂ {msg}"));
+            self.store.log(
+                None,
+                "orchestrator",
+                "broadcast",
+                &format!("{n} agents: {msg}"),
+            );
+            self.status_msg = format!("broadcast to {n} live agent(s)");
+        } else if let Ok(id) = sel.parse::<u64>() {
+            if let Some(name) = self.fleet.get(id).map(|a| a.name.clone()) {
+                self.send_line(id, msg);
+                self.chat_log.push(format!("#{id} {name} ◂ {msg}"));
+            } else {
+                self.status_msg = format!("no agent #{id}");
+            }
+        } else {
+            self.status_msg = format!("orchestrate: '{sel}' is not an agent id or *");
+        }
+        while self.chat_log.len() > 200 {
+            self.chat_log.remove(0);
+        }
+    }
+
+    /// Pin a goal (+ optional definition-of-done after `::`) on the selected agent
+    /// and persist it. Progress then ratchets up from the agent's own output and a
+    /// DoD match flips it to DONE — all observed, never asked for.
+    fn set_goal_on_selected(&mut self, buf: &str) {
+        let Some(id) = self.current_agent_id() else {
+            self.status_msg = "no agent selected for goal".into();
+            return;
+        };
+        let (goal, dod) = match buf.split_once("::") {
+            Some((g, d)) => (g.trim().to_string(), {
+                let d = d.trim();
+                if d.is_empty() {
+                    None
+                } else {
+                    Some(d.to_string())
+                }
+            }),
+            None => (buf.trim().to_string(), None),
+        };
+        if goal.is_empty() {
+            self.status_msg = "goal cleared (empty)".into();
+            return;
+        }
+        let name = self
+            .fleet
+            .get(id)
+            .map(|a| a.name.clone())
+            .unwrap_or_default();
+        self.store.set_goal(&name, &goal, dod.as_deref());
+        if let Some(a) = self.fleet.get_mut(id) {
+            a.goal = Some(goal.clone());
+            a.done_def = dod.clone();
+            a.progress = 0;
+        }
+        self.store.log(Some(id), &name, "goal", &goal);
+        tracing::info!(agent = id, goal = %goal, "goal set");
+        self.status_msg = format!("🎯 goal set on {name}");
+    }
+
+    /// Apply any stored goal for `name` to a freshly spawned/imported agent, so a
+    /// goal set in a previous run is still tracked today.
+    fn rehydrate_goal(&mut self, id: u64, name: &str) {
+        let found = self
+            .store
+            .load_goals()
+            .into_iter()
+            .find(|(n, ..)| n == name);
+        if let Some((_, goal, dod, progress)) = found
+            && let Some(a) = self.fleet.get_mut(id)
+        {
+            a.goal = Some(goal);
+            a.done_def = dod;
+            a.progress = progress;
         }
     }
 
@@ -490,6 +750,8 @@ impl App {
             Mode::Inspect => match k.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
                 KeyCode::Char('i') | KeyCode::Char('s') => self.start_input(InputKind::Send),
+                KeyCode::Char('g') => self.start_input(InputKind::Goal),
+                KeyCode::Char('p') => self.peek_selected(),
                 _ => {}
             },
             Mode::Normal => match k.code {
@@ -522,6 +784,11 @@ impl App {
                     self.mode = Mode::Inspect;
                 }
                 KeyCode::Char('n') => self.start_input(InputKind::NewAgent),
+                KeyCode::Char('o') => self.start_input(InputKind::Orchestrate),
+                KeyCode::Char('g') if self.current_agent_id().is_some() => {
+                    self.start_input(InputKind::Goal);
+                }
+                KeyCode::Char('p') if self.current_agent_id().is_some() => self.peek_selected(),
                 KeyCode::Char('s') if self.current_agent_id().is_some() => {
                     self.start_input(InputKind::Send);
                 }
@@ -532,7 +799,7 @@ impl App {
                     }
                 }
                 KeyCode::Char('m') => self.toggle_mouse(),
-                KeyCode::Char('d') => self.discover_tmux(),
+                KeyCode::Char('d') => self.discover_all(),
                 _ => {}
             },
         }
@@ -544,8 +811,9 @@ impl App {
             ButtonId::Kanban => self.view = View::Kanban,
             ButtonId::Tree => self.view = View::Tree,
             ButtonId::Logs => self.view = View::Logs,
+            ButtonId::Orchestrate => self.start_input(InputKind::Orchestrate),
             ButtonId::New => self.start_input(InputKind::NewAgent),
-            ButtonId::Discover => self.discover_tmux(),
+            ButtonId::Discover => self.discover_all(),
             ButtonId::Mouse => self.toggle_mouse(),
             ButtonId::Help => self.mode = Mode::Help,
             ButtonId::Quit => self.should_quit = true,
@@ -636,6 +904,33 @@ impl App {
     /// terminal rect. Returns None for clicks in the header/footer chrome.
     fn hit_test(&self, col: u16, row: u16) -> Option<(usize, Option<usize>)> {
         hit_test_geom(self.area, col, row)
+    }
+}
+
+/// Map a cmux agent-tag status string to our `Status`. The tags come from
+/// `cmux top --all` (e.g. "Running", "Needs input", "done") — the same words a
+/// human reads off the cmux tree, so this is observation, not a token report.
+fn cmux_status(raw: &str) -> Status {
+    let s = raw.to_lowercase();
+    if s.is_empty() {
+        return Status::Idle;
+    }
+    if ["need", "input", "wait", "block", "ask", "confirm"]
+        .iter()
+        .any(|k| s.contains(k))
+    {
+        Status::Blocked
+    } else if ["review", "diff", "ready"].iter().any(|k| s.contains(k)) {
+        Status::Review
+    } else if ["done", "complet", "finish"].iter().any(|k| s.contains(k)) {
+        Status::Done
+    } else if ["work", "run", "busy", "think", "exec", "stream"]
+        .iter()
+        .any(|k| s.contains(k))
+    {
+        Status::Working
+    } else {
+        Status::Idle
     }
 }
 
