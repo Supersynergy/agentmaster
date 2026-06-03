@@ -17,7 +17,7 @@ use ratatui::layout::Rect;
 use crate::fleet::{Agent, Fleet, Lane, Source, Status};
 use crate::obs::Metrics;
 use crate::store::Store;
-use crate::{backend, peek, pty, runtime, state};
+use crate::{backend, peek, pty, runtime, state, voice};
 
 /// Shared layout geometry — single source of truth for both render (`ui.rs`) and
 /// mouse hit-testing here, so clicks always land where the cards are drawn.
@@ -115,6 +115,8 @@ pub struct App {
     pub chat_log: Vec<String>,
     pub should_quit: bool,
     pub mouse_on: bool,
+    /// Active push-to-talk recorder (ffmpeg child + wav path) while the mic is hot.
+    pub voice_rec: Option<(std::process::Child, std::path::PathBuf)>,
     /// Last known terminal rect, refreshed each frame for mouse hit-testing.
     area: Rect,
     tick: u64,
@@ -161,6 +163,7 @@ impl App {
             status_msg: "ready — o talk · * find agents · n new · ? help".into(),
             should_quit: false,
             mouse_on: true,
+            voice_rec: None,
             area: Rect::new(0, 0, 0, 0),
             tick: 0,
         }
@@ -800,10 +803,43 @@ impl App {
                 }
                 KeyCode::Char('m') => self.toggle_mouse(),
                 KeyCode::Char('d') => self.discover_all(),
+                KeyCode::Char('v') => self.toggle_voice(),
                 _ => {}
             },
         }
         self.clamp_card();
+    }
+
+    /// Push-to-talk. First `v` starts the mic; second `v` stops it, transcribes,
+    /// and drops the text into the orchestrator bar to review + route (#N …).
+    fn toggle_voice(&mut self) {
+        if let Some((child, wav)) = self.voice_rec.take() {
+            voice::stop_recording(child);
+            match voice::transcribe(&wav) {
+                Some(text) => {
+                    self.store.log(None, "voice", "transcribe", &text);
+                    self.input = text.clone();
+                    self.input_kind = InputKind::Orchestrate;
+                    self.mode = Mode::Input;
+                    let preview: String = text.chars().take(40).collect();
+                    self.status_msg = format!("🎙 “{preview}” — prefix #N, Enter to route");
+                }
+                None => self.status_msg = "voice: no speech recognized".into(),
+            }
+        } else if voice::available() {
+            match voice::start_recording() {
+                Some(rec) => {
+                    self.voice_rec = Some(rec);
+                    self.status_msg = "🎤 recording — press v to stop".into();
+                }
+                None => {
+                    self.status_msg =
+                        "voice: failed to start mic (set AGENTMASTER_AUDIO_DEV)".into()
+                }
+            }
+        } else {
+            self.status_msg = "voice: need whisper-cli + ffmpeg + a ggml model".into();
+        }
     }
 
     fn dispatch_button(&mut self, b: ButtonId) {
