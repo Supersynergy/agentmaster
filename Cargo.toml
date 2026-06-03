@@ -2,6 +2,9 @@
 name = "agentmaster"
 version = "0.3.0"
 edition = "2024"
+rust-version = "1.95"
+description = "See and steer every agent from one session — Kanban TUI, zero orchestration tax"
+license = "MIT"
 
 [dependencies]
 anyhow = "1.0.102"
