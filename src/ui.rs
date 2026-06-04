@@ -65,14 +65,45 @@ fn status_line(a: &Agent, col: Color) -> Line<'static> {
     ];
     // Blocked-too-long is the one thing that needs the operator now.
     if matches!(a.status, Status::Blocked) && held > 300 {
-        spans.push(Span::styled(
-            "  ⏰ stuck",
-            Style::new().fg(C_BLOCKED).bold(),
-        ));
+        spans.push(Span::styled("  ⏰", Style::new().fg(C_BLOCKED).bold()));
     } else if matches!(a.status, Status::Idle) && held > 600 {
         spans.push(Span::styled("  💤", Style::new().fg(C_IDLE)));
     }
+    // Claude/Codex 1h prompt-cache countdown, ticking down from the last
+    // generation. Hot (full) while working; turns red as it nears expiry, then
+    // "cold" once the next turn would pay full uncached input cost.
+    let kind = agent_kind(a);
+    if kind == "claude" || kind == "codex" {
+        let rem = a.cache_remaining_secs();
+        let (txt, col) = if rem == 0 {
+            ("🧊cold".to_string(), C_DEAD)
+        } else {
+            (format!("🧊{}", fmt_countdown(rem)), cache_color(rem))
+        };
+        spans.push(Span::styled(format!("  {txt}"), Style::new().fg(col)));
+    }
     Line::from(spans)
+}
+
+/// Cache countdown MM:SS (or H:MM:SS for the full hour-plus window).
+fn fmt_countdown(s: i64) -> String {
+    let s = s.max(0);
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// Cache freshness color: green with plenty left, amber under 15m, red under 5m.
+fn cache_color(rem: i64) -> Color {
+    if rem <= 300 {
+        Color::Red
+    } else if rem <= 900 {
+        C_BLOCKED
+    } else {
+        C_WORKING
+    }
 }
 
 /// Strip cmux's own title decoration (`🟣 Claude ✓ · <task>`) down to the task.
@@ -927,5 +958,13 @@ mod tests {
         assert_eq!(progress_bar(0), "▱▱▱▱▱▱▱▱▱▱");
         assert_eq!(progress_bar(100), "▰▰▰▰▰▰▰▰▰▰");
         assert_eq!(progress_bar(50).chars().filter(|c| *c == '▰').count(), 5);
+    }
+
+    #[test]
+    fn countdown_formats_mmss_and_hms() {
+        assert_eq!(fmt_countdown(0), "0:00");
+        assert_eq!(fmt_countdown(65), "1:05");
+        assert_eq!(fmt_countdown(3600), "1:00:00");
+        assert_eq!(fmt_countdown(-5), "0:00");
     }
 }

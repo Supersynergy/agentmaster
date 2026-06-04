@@ -154,6 +154,9 @@ pub fn run(dir: PathBuf) -> Result<()> {
     app.store
         .log(None, "system", "start", "agentmaster tui started");
     tracing::info!("agentmaster tui started");
+    // Auto-discover on boot: tmux panes + cmux workspaces appear immediately,
+    // no need to press `d` first. The scan is off-thread, so startup never blocks.
+    app.discover_all();
 
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
@@ -181,10 +184,10 @@ impl App {
             input_kind: InputKind::None,
             filter: String::new(),
             chat_log: vec![
-                "orchestrator ready — press [* find] to import tmux+cmux agents,".into(),
-                "then [o talk] and type  #N <message>  to steer agent #N.".into(),
+                "orchestrator ready — agents auto-discovered on boot.".into(),
+                "press [o talk], type  #N <message>  to steer agent N  ·  #* to broadcast.".into(),
             ],
-            status_msg: "ready — o talk · * find agents · n new · ? help".into(),
+            status_msg: "🔎 discovering agents… · o talk · n new · ? help".into(),
             should_quit: false,
             mouse_on: true,
             voice_rec: None,

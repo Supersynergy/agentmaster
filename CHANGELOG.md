@@ -2,6 +2,31 @@
 
 All notable changes to agentmaster are documented here. Newest first.
 
+## [0.7.0] — 2026-06-04
+
+Open it and your fleet is just *there* — plus a live prompt-cache countdown so you
+can see which Claude/Codex sessions are still cheap to resume.
+
+### Added
+- **Auto-discovery on boot**: the TUI scans tmux panes + cmux workspaces the moment
+  it starts (off-thread, non-blocking) — no need to press `d`/`[* find]` first.
+  Your agents are on the board immediately.
+- **1h prompt-cache countdown** (`fleet::cache_remaining_secs`): every Claude/Codex
+  card shows a `🧊` timer counting **down from the last generation** toward the 1h
+  cache TTL — full/hot while the agent is working, ticking down once it goes
+  idle/blocked, green → amber (<15m) → red (<5m) → `🧊cold` at expiry. At a glance
+  you see which sessions still have a warm cache (cheap to continue) vs cold (the
+  next turn pays full, uncached input cost — ping them now).
+
+### Verified (tmux capture)
+- Booted in tmux, **auto-discovered** a `Claude · build the parser` pane with no
+  keypress; card rendered `claude build the parser` (cmux decoration stripped),
+  `working for 3s`, and `🧊1:00:00` (hot). fmt clean, clippy `-D warnings` 0,
+  **28/28 tests** (+2: cache_remaining, fmt_countdown). Release reinstalled.
+- Note: cmux discovery needs the cmux env (`CMUX_SOCKET_PATH`) the app injects into
+  its workspaces — present when agentmaster runs inside a cmux tab (its normal home),
+  absent in a bare tmux session.
+
 ## [0.6.0] — 2026-06-04
 
 Observability you can act on, plus a faster, quieter board. Built by two parallel

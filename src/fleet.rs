@@ -184,6 +184,18 @@ impl Agent {
         (Local::now() - self.last_change).num_seconds().max(0)
     }
 
+    /// Seconds left on this agent's Claude/Codex prompt cache (1h TTL), counting
+    /// down from the last generation. A WORKING agent is actively generating, so
+    /// its cache is hot (full window); otherwise it decays from the last activity.
+    /// At 0 the next turn pays full, uncached input cost — the reason to ping it.
+    pub fn cache_remaining_secs(&self) -> i64 {
+        if matches!(self.status, Status::Working) {
+            3600
+        } else {
+            (3600 - self.idle_secs()).max(0)
+        }
+    }
+
     /// Record an observed status. Returns true iff it changed — and on change
     /// stamps the transition + activity time. Same-status observations leave the
     /// clock running so `in_status_secs` reflects real time-in-state.
@@ -289,5 +301,14 @@ mod tests {
     fn in_status_secs_non_negative() {
         let a = agent();
         assert!(a.in_status_secs() >= 0);
+    }
+
+    #[test]
+    fn cache_full_while_working_decays_otherwise() {
+        let mut a = agent();
+        a.note_status(Status::Working);
+        assert_eq!(a.cache_remaining_secs(), 3600); // hot while generating
+        a.note_status(Status::Blocked);
+        assert!(a.cache_remaining_secs() <= 3600 && a.cache_remaining_secs() > 3500);
     }
 }
