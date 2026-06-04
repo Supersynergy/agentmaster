@@ -135,9 +135,10 @@ fn parse_ratio(l: &str) -> Option<u8> {
 }
 
 /// Demote a WORKING agent to IDLE once it has been quiet past the threshold.
+/// Routed through `note_status` so the in-state clock resets on the transition.
 pub fn idle_sweep(agent: &mut Agent, idle_threshold: i64) {
     if matches!(agent.status, Status::Working) && agent.idle_secs() > idle_threshold {
-        agent.status = Status::Idle;
+        agent.note_status(Status::Idle);
     }
 }
 

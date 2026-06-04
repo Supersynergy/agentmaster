@@ -263,9 +263,13 @@ impl App {
                 }
             }
         }
-        // Blocking backend I/O (cmux top, tmux capture) is offloaded to a one-shot
-        // thread and applied later via AppEvent — the UI never waits on it.
-        self.spawn_backend_refresh();
+        // Blocking backend I/O (cmux top ~0.2s on 100+ ws, tmux capture) is
+        // offloaded to a one-shot thread AND throttled to ~1.5s — external agent
+        // status doesn't change faster than that, and native agents update
+        // instantly via PTY events regardless.
+        if self.tick.is_multiple_of(30) {
+            self.spawn_backend_refresh();
+        }
     }
 
     /// Kick off an async refresh of external backends (cmux + tmux) if one isn't
@@ -458,10 +462,9 @@ impl App {
                 let mut progressed = None;
                 if let Some(a) = self.fleet.get_mut(id) {
                     if let Some(ns) = state::detect(a, &line)
-                        && ns != a.status
+                        && a.note_status(ns)
                     {
                         transition = Some((a.name.clone(), ns));
-                        a.status = ns;
                     }
                     // Goal-aware: ratchet progress from milestones in the output.
                     if a.has_goal() {
@@ -494,11 +497,16 @@ impl App {
             // --- results from off-thread worker tasks (never block the UI) ---
             AppEvent::CmuxSnapshot(snap) => {
                 self.refresh_inflight = false;
+                let mut changes: Vec<(u64, String, &'static str)> = Vec::new();
                 for a in self.fleet.agents.iter_mut() {
                     if let Source::Cmux(ws) = a.source.clone()
                         && let Some(w) = snap.iter().find(|w| w.ws_ref == ws)
                     {
-                        a.status = cmux_status(&w.status);
+                        // note_status resets the in-state clock only on a real
+                        // transition, so "blocked 18m" is meaningful.
+                        if a.note_status(cmux_status(&w.status)) {
+                            changes.push((a.id, a.name.clone(), a.status.label()));
+                        }
                         if !w.title.is_empty() && w.title != a.last_line {
                             a.push_line(w.title.clone());
                         }
@@ -506,6 +514,9 @@ impl App {
                             a.pid = w.pid;
                         }
                     }
+                }
+                for (id, name, label) in changes {
+                    self.store.log(Some(id), &name, "state", label);
                 }
             }
             AppEvent::TmuxLine { target, line } => {
@@ -517,7 +528,7 @@ impl App {
                     && line != a.last_line
                 {
                     if let Some(ns) = state::detect(a, &line) {
-                        a.status = ns;
+                        a.note_status(ns);
                     }
                     a.push_line(line);
                 }

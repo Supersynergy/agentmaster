@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use crate::app::{
     App, ButtonId, CARD_H, CHAT_PANE_H, FOOTER_H, HEADER_H, InputKind, Mode, TOOLBAR, View,
 };
-use crate::fleet::{Agent, Lane, Status};
+use crate::fleet::{Agent, Lane, Source, Status};
 
 // ---- color semantics (one meaning per color, used everywhere) -------------
 const C_ACCENT: Color = Color::Cyan;
@@ -51,19 +51,66 @@ fn status_glyph(s: Status, spin: char) -> char {
     }
 }
 
-/// Card status row: age · idle (highlighted once stale) · status label.
+/// Card status row: **how long in the current state** — the honest observability
+/// metric (works for imported agents whose true start we never owned). A
+/// long-blocked agent gets a loud "stuck" marker so it surfaces at a glance.
 fn status_line(a: &Agent, col: Color) -> Line<'static> {
-    Line::from(vec![
+    let held = a.in_status_secs();
+    let mut spans = vec![
         Span::styled(
-            format!("⏱ {} ", fmt_dur(a.age_secs())),
-            Style::new().fg(C_DIM),
+            format!("{} ", a.status.label()),
+            Style::new().fg(col).bold(),
         ),
-        Span::styled(
-            format!("idle {} ", fmt_dur(a.idle_secs())),
-            Style::new().fg(if a.idle_secs() > 20 { C_IDLE } else { C_DIM }),
-        ),
-        Span::styled(a.status.label().to_string(), Style::new().fg(col)),
-    ])
+        Span::styled(format!("for {}", fmt_dur(held)), Style::new().fg(C_DIM)),
+    ];
+    // Blocked-too-long is the one thing that needs the operator now.
+    if matches!(a.status, Status::Blocked) && held > 300 {
+        spans.push(Span::styled(
+            "  ⏰ stuck",
+            Style::new().fg(C_BLOCKED).bold(),
+        ));
+    } else if matches!(a.status, Status::Idle) && held > 600 {
+        spans.push(Span::styled("  💤", Style::new().fg(C_IDLE)));
+    }
+    Line::from(spans)
+}
+
+/// Strip cmux's own title decoration (`🟣 Claude ✓ · <task>`) down to the task.
+/// Our own glyph + color already convey agent + state, so the prefix is noise.
+fn clean_title(s: &str) -> &str {
+    match s.split_once(" · ") {
+        Some((_, task)) if !task.trim().is_empty() => task.trim(),
+        _ => s.trim(),
+    }
+}
+
+/// Agent kind (claude / codex / …) parsed from a cmux-style title prefix, for a
+/// compact badge that replaces the redundant `cmux` runtime label.
+fn agent_kind(a: &Agent) -> &str {
+    let head = a.name.split(" · ").next().unwrap_or("").to_lowercase();
+    if head.contains("codex") {
+        "codex"
+    } else if head.contains("claude") {
+        "claude"
+    } else {
+        a.runtime.as_str()
+    }
+}
+
+/// Where the agent lives — repo dir for native, the stable backend ref for
+/// imported agents (so line 2 isn't blank for cmux/tmux agents).
+fn source_label(a: &Agent) -> String {
+    match &a.source {
+        Source::Native => {
+            if a.project.is_empty() {
+                a.cwd.clone()
+            } else {
+                a.project.clone()
+            }
+        }
+        Source::Cmux(r) => r.clone(),
+        Source::Tmux(t) => t.clone(),
+    }
 }
 
 /// A 10-cell unicode progress bar. Shape carries the value without color (a11y).
@@ -231,6 +278,20 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
                 Style::new().fg(C_BLOCKED).bold()
             },
         ));
+        // Of those, how many have been blocked long enough to be truly stuck —
+        // the subset worth interrupting first.
+        let stuck = app
+            .fleet
+            .agents
+            .iter()
+            .filter(|a| matches!(a.status, Status::Blocked) && a.in_status_secs() > 300)
+            .count();
+        if stuck > 0 {
+            spans.push(Span::styled(
+                format!(" ⏰ {stuck} stuck>5m"),
+                Style::new().fg(C_BLOCKED).bold(),
+            ));
+        }
     }
     f.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
 
@@ -272,7 +333,12 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
 fn kanban(f: &mut Frame, area: Rect, app: &App) {
     let cols = Layout::horizontal([Constraint::Ratio(1, 5); 5]).split(area);
     for (i, lane) in Lane::ALL.iter().enumerate() {
-        let agents = app.fleet.in_lane(*lane);
+        let mut agents = app.fleet.in_lane(*lane);
+        // Surface urgency: in BLOCKED + REVIEW, the longest-waiting agent is the
+        // one to act on first, so sort by time-in-state (descending) → top card.
+        if matches!(lane, Lane::Blocked | Lane::Review) {
+            agents.sort_by_key(|b| std::cmp::Reverse(b.in_status_secs()));
+        }
         let focused = i == app.lane_idx;
         let title = format!(" {} {} ", lane.title(), agents.len());
         let bstyle = if focused {
@@ -365,32 +431,33 @@ fn card(f: &mut Frame, area: Rect, a: &Agent, selected: bool, filter: &str, spin
     // Glyph carries meaning beyond color: a spinner = actively working, distinct
     // shapes for the rest. Working agents visibly move so "alive" is obvious.
     let glyph = status_glyph(a.status, spin);
+    // Kind badge (claude/codex/runtime) replaces the noisy duplicate `cmux cmux`;
+    // the title is stripped of cmux's own glyph decoration.
+    let kind = agent_kind(a);
     let lines = vec![
         Line::from(vec![
             Span::styled(format!("{glyph} "), Style::new().fg(col).bold()),
-            Span::styled(trunc(&a.name, w.saturating_sub(12)), name_style),
-            Span::raw(" "),
-            Span::styled(trunc(&a.runtime, 8), Style::new().fg(C_ACCENT)),
+            Span::styled(format!("{} ", trunc(kind, 7)), Style::new().fg(C_ACCENT)),
             Span::styled(
-                if a.source.tag().is_empty() {
-                    String::new()
-                } else {
-                    format!(" ·{}", a.source.tag())
-                },
-                Style::new().fg(C_REVIEW),
+                trunc(clean_title(&a.name), w.saturating_sub(kind.len() + 5)),
+                name_style,
             ),
         ]),
         Line::from(vec![
-            Span::styled("⎇ ", Style::new().fg(C_DIM)),
+            Span::styled("⌂ ", Style::new().fg(C_DIM)),
             Span::styled(
-                trunc(&a.project, w.saturating_sub(14)),
+                trunc(&source_label(a), w.saturating_sub(14)),
                 Style::new().fg(C_DIM),
             ),
             Span::styled(
                 format!(
-                    "  pid {} · {}",
+                    "  pid {}{}",
                     a.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
-                    fmt_mem(a.mem_bytes)
+                    if a.mem_bytes > 0 {
+                        format!(" · {}", fmt_mem(a.mem_bytes))
+                    } else {
+                        String::new()
+                    }
                 ),
                 Style::new().fg(C_FAINT),
             ),
@@ -822,4 +889,43 @@ fn short_ts(ts: &str) -> String {
         .nth(1)
         .map(|t| t.split(['.', '+', 'Z']).next().unwrap_or(t).to_string())
         .unwrap_or_else(|| ts.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_title_strips_cmux_decoration() {
+        assert_eq!(
+            clean_title("🟣 Claude ✓ · kill dead code"),
+            "kill dead code"
+        );
+        assert_eq!(clean_title("plain native name"), "plain native name");
+    }
+
+    #[test]
+    fn agent_kind_parses_from_title() {
+        let mut a = Agent::new(
+            1,
+            "🟣 Claude ▶ · do x".into(),
+            "cmux".into(),
+            "cmux".into(),
+            vec![],
+            String::new(),
+        );
+        assert_eq!(agent_kind(&a), "claude");
+        a.name = "🧠 Codex ✓ · y".into();
+        assert_eq!(agent_kind(&a), "codex");
+        a.name = "shell-3".into();
+        a.runtime = "shell".into();
+        assert_eq!(agent_kind(&a), "shell");
+    }
+
+    #[test]
+    fn progress_bar_fills_proportionally() {
+        assert_eq!(progress_bar(0), "▱▱▱▱▱▱▱▱▱▱");
+        assert_eq!(progress_bar(100), "▰▰▰▰▰▰▰▰▰▰");
+        assert_eq!(progress_bar(50).chars().filter(|c| *c == '▰').count(), 5);
+    }
 }

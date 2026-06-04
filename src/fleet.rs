@@ -82,16 +82,6 @@ pub enum Source {
     Cmux(String), // workspace ref, e.g. workspace:96
 }
 
-impl Source {
-    pub fn tag(&self) -> &'static str {
-        match self {
-            Source::Native => "",
-            Source::Tmux(_) => "tmux",
-            Source::Cmux(_) => "cmux",
-        }
-    }
-}
-
 /// A single agent = one spawned process behind a PTY, plus the observable state
 /// we derive from its output. No agent ever coordinates via tokens — all the
 /// coordination signal lives here, on disk and in this struct.
@@ -126,6 +116,10 @@ pub struct Agent {
     /// Path to this agent's session transcript (cmux/sr/Claude Code JSONL), when
     /// known. Enables zero-tax `peek` — read what it last said off disk.
     pub transcript: Option<String>,
+    /// Timestamp of the last observed status TRANSITION. Drives "how long in this
+    /// state" — the operator's real signal (blocked 20s vs blocked 20m), which is
+    /// meaningful even for imported agents whose start time we never owned.
+    pub last_change: DateTime<Local>,
 }
 
 impl Agent {
@@ -168,6 +162,7 @@ impl Agent {
             done_def: None,
             progress: 0,
             transcript: None,
+            last_change: now,
         }
     }
 
@@ -179,6 +174,29 @@ impl Agent {
     /// Has the operator set a goal we can track progress against?
     pub fn has_goal(&self) -> bool {
         self.goal.is_some()
+    }
+
+    /// Seconds spent in the current status, since the last transition. This is
+    /// the honest observability metric for imported agents: we cannot know when
+    /// a cmux/tmux agent truly started, but we can time how long it has held a
+    /// state — and "blocked 18m" is exactly what tells you where to look.
+    pub fn in_status_secs(&self) -> i64 {
+        (Local::now() - self.last_change).num_seconds().max(0)
+    }
+
+    /// Record an observed status. Returns true iff it changed — and on change
+    /// stamps the transition + activity time. Same-status observations leave the
+    /// clock running so `in_status_secs` reflects real time-in-state.
+    pub fn note_status(&mut self, new: Status) -> bool {
+        if new != self.status {
+            self.status = new;
+            let now = Local::now();
+            self.last_change = now;
+            self.last_activity = now;
+            true
+        } else {
+            false
+        }
     }
 
     pub fn push_line(&mut self, line: String) {
@@ -240,5 +258,36 @@ impl Fleet {
             .iter()
             .filter(|a| a.status.lane() == lane)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent() -> Agent {
+        Agent::new(
+            1,
+            "t".into(),
+            "shell".into(),
+            "bash".into(),
+            vec![],
+            "/tmp".into(),
+        )
+    }
+
+    #[test]
+    fn note_status_only_resets_clock_on_change() {
+        let mut a = agent();
+        assert!(a.note_status(Status::Working)); // Queued -> Working = change
+        assert!(!a.note_status(Status::Working)); // same -> no change
+        assert!(a.note_status(Status::Blocked)); // change
+        assert_eq!(a.status, Status::Blocked);
+    }
+
+    #[test]
+    fn in_status_secs_non_negative() {
+        let a = agent();
+        assert!(a.in_status_secs() >= 0);
     }
 }
