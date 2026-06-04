@@ -4,6 +4,10 @@
 
 Vector logo for agentmaster. Created in-repo as deterministic SVG.
 
+## `logo.png`
+
+512x512 raster export of `logo.svg`. Used as the Gitea repository avatar.
+
 ## `hero-art.png`
 
 Purpose: repository hero/social artwork background.
