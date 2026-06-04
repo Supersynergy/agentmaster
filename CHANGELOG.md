@@ -2,6 +2,44 @@
 
 All notable changes to agentmaster are documented here. Newest first.
 
+## [0.6.0] — 2026-06-04
+
+Observability you can act on, plus a faster, quieter board. Built by two parallel
+sessions that converged (voice + chat pane + async I/O from one, the observability
+model + card polish from the other) — integrated, not clobbered.
+
+### Added
+- **Time-in-state observability** (`fleet::last_change` / `in_status_secs` /
+  `note_status`): cards now show **how long an agent has held its current state**
+  ("blocked for 18m"), the honest signal for *imported* agents whose true start we
+  never owned. Fixes the old "everything shows the same idle time" problem (all
+  cmux agents imported together read identical age/idle — useless).
+- **Stuck surfacing**: a blocked agent past 5 min gets a loud `⏰ stuck` marker;
+  the header shows `⏰ N stuck>5m` next to NEED YOU; BLOCKED + REVIEW lanes sort by
+  time-in-state so the longest-waiting agent is the top card.
+- **Cleaner cards**: cmux's own title decoration (`🟣 Claude ✓ ·`) is stripped to
+  the task; a `claude`/`codex` kind badge replaces the redundant `cmux cmux`
+  labels; line 2 shows the backend ref (`workspace:96`) instead of a blank dir;
+  memory is hidden when unknown.
+- **Voice push-to-talk** (`v`): mic → whisper.cpp → the orchestrator bar (parallel
+  session).
+- **Permanent orchestrator chat pane**, pinned bottom, always-on (parallel session).
+
+### Performance
+- All blocking backend I/O (`cmux top`, tmux `capture-pane`) moved **off the render
+  thread** to one-shot workers; results flow back over the event channel — the UI
+  never stalls on a 107-workspace scan.
+- Off-thread refresh **throttled to ~1.5s** (cmux top is ~0.2s on 107 ws and
+  external status doesn't change faster); native agents still update instantly via
+  PTY events. `note_status` only restamps on real transitions, so the in-state
+  clock is cheap and correct.
+
+### Notes
+- debugmaster `hunt`: production code clean (the 6 findings are idiomatic
+  `unwrap()` in test modules). fmt clean, clippy `-D warnings` 0, **26/26 tests**
+  (+5: note_status, in_status_secs, clean_title, agent_kind, progress_bar). Release
+  PTY smoke booted, imported 107 cmux workspaces, navigated, quit 0.
+
 ## [0.5.0] — 2026-06-04
 
 CLI full-ready. Everything the TUI does to *external* agents is now also a
