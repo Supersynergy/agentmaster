@@ -88,12 +88,12 @@ pub enum AppEvent {
         line: String,
     },
     /// Result of a discovery scan (raw lists; the main thread dedups + adds).
-    /// `transcripts` maps a normalized cmux title → its Claude transcript path,
-    /// so imported agents get a real "last response" clock.
+    /// `transcripts` maps an agent PID → its transcript path (from `ps … --resume
+    /// <id>`), so imported agents get a real "last response" clock.
     Discovered {
         panes: Vec<backend::ExternalPane>,
         cmux: Vec<backend::CmuxWorkspace>,
-        transcripts: std::collections::HashMap<String, String>,
+        transcripts: std::collections::HashMap<u32, String>,
     },
     /// Transcribed voice text, ready to drop into the orchestrator bar.
     VoiceText(String),
@@ -394,16 +394,16 @@ impl App {
                     Vec::new()
                 }
             });
-            let (cmux, transcripts) = if backend::cmux_available() {
-                // Resolve each workspace's transcript (refreshes the snapshot once),
-                // so the list can show a real last-response time per agent.
-                let t = peek::cmux_transcripts()
-                    .into_iter()
-                    .map(|(k, p)| (k, p.to_string_lossy().into_owned()))
-                    .collect();
-                (backend::list_cmux(), t)
+            // Resolve every running agent's transcript by pid (one `ps` scan), so
+            // the list can show a real last-response time. Covers cmux + tmux.
+            let transcripts: std::collections::HashMap<u32, String> = peek::pid_transcripts()
+                .into_iter()
+                .map(|(pid, p)| (pid, p.to_string_lossy().into_owned()))
+                .collect();
+            let cmux = if backend::cmux_available() {
+                backend::list_cmux()
             } else {
-                (Vec::new(), std::collections::HashMap::new())
+                Vec::new()
             };
             let panes = h.join().unwrap_or_default();
             let _ = tx.send(AppEvent::Discovered {
@@ -420,7 +420,7 @@ impl App {
         &mut self,
         panes: Vec<backend::ExternalPane>,
         cmux: Vec<backend::CmuxWorkspace>,
-        transcripts: std::collections::HashMap<String, String>,
+        transcripts: std::collections::HashMap<u32, String>,
     ) {
         let mut added = 0;
         for p in panes {
@@ -453,6 +453,7 @@ impl App {
             a.source = Source::Tmux(p.target.clone());
             a.pid = p.pid;
             a.status = Status::Idle;
+            a.transcript = p.pid.and_then(|pid| transcripts.get(&pid)).cloned();
             self.fleet.agents.push(a);
             self.rehydrate_goal(id, &name);
             self.store
@@ -489,7 +490,7 @@ impl App {
             a.source = Source::Cmux(w.ws_ref.clone());
             a.pid = w.pid;
             a.status = cmux_status(&w.status);
-            a.transcript = transcripts.get(&peek::norm_title(&w.title)).cloned();
+            a.transcript = w.pid.and_then(|pid| transcripts.get(&pid)).cloned();
             a.push_line(w.title.clone());
             self.fleet.agents.push(a);
             self.rehydrate_goal(id, &name);

@@ -69,76 +69,142 @@ pub fn digest(path: &Path, n: usize) -> Digest {
     d
 }
 
-/// Normalize a cmux workspace title to a stable match key: drop the leading
-/// glyph/agent/status decoration (everything up to the last ` · `) and any
-/// trailing ` [ref]`, lowercased. Robust to the status glyph drifting between a
-/// snapshot read and a `cmux top` read.
-pub fn norm_title(s: &str) -> String {
-    let t = s.rsplit_once(" · ").map(|(_, b)| b).unwrap_or(s).trim();
-    let t = match (t.rfind(" ["), t.ends_with(']')) {
-        (Some(i), true) => &t[..i],
-        _ => t,
-    };
-    t.trim().to_lowercase()
-}
-
-/// Map each live cmux workspace (by normalized title) to its Claude transcript.
-/// Refreshes the cmux snapshot first (≈90ms) so just-spawned sessions are seen,
-/// then reads `name → session_id` from it and resolves the transcript path.
-pub fn cmux_transcripts() -> std::collections::HashMap<String, PathBuf> {
+/// Map every running agent PID → its transcript, by scanning `ps` for
+/// `… --resume <session-id> …` (Claude) and `… --session <id> …`-style args and
+/// resolving the id to a transcript. This is the LIVE, exact, universal link:
+/// a cmux/tmux workspace reports the agent's pid, and the agent process carries
+/// its own session id on its command line — no snapshot, no fuzzy title match,
+/// covers every running agent including just-spawned ones.
+pub fn pid_transcripts() -> std::collections::HashMap<u32, PathBuf> {
     use std::collections::HashMap;
     let mut map = HashMap::new();
-    // Best-effort fresh snapshot; ignore failure (we then read whatever exists).
-    let _ = std::process::Command::new("cmux-snapshot").output();
-    let Ok(home) = std::env::var("HOME") else {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-ax", "-o", "pid=,command="])
+        .output()
+    else {
         return map;
     };
-    let dir = PathBuf::from(&home).join(".cmux-snapshots");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return map;
-    };
-    let latest = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
-        .max_by_key(|p| {
-            std::fs::metadata(p)
-                .and_then(|m| m.modified())
-                .ok()
-                .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default())
-        });
-    let Some(latest) = latest else { return map };
-    let Ok(text) = std::fs::read_to_string(&latest) else {
-        return map;
-    };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else {
-        return map;
-    };
-    for ws in v
-        .get("workspaces")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let Some(name) = ws.get("name").and_then(Value::as_str) else {
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut codex_pids: Vec<u32> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        let Some((pid_s, rest)) = line.split_once(char::is_whitespace) else {
             continue;
         };
-        let key = norm_title(name);
-        let surfaces = ws
-            .pointer("/layout/surfaces")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        for s in surfaces {
-            if let Some(sid) = s.get("session_id").and_then(Value::as_str)
-                && let Some(p) = resolve(sid)
+        let Ok(pid) = pid_s.trim().parse::<u32>() else {
+            continue;
+        };
+        // Find a session id following a --resume / --session / -r flag (Claude).
+        let toks: Vec<&str> = rest.split_whitespace().collect();
+        let mut sid = None;
+        for w in toks.windows(2) {
+            if matches!(w[0], "--resume" | "--session" | "--session-id" | "-r")
+                && looks_like_session_id(w[1])
             {
-                map.insert(key.clone(), p);
+                sid = Some(w[1]);
                 break;
+            }
+        }
+        if let Some(sid) = sid {
+            if let Some(p) = resolve(sid) {
+                map.insert(pid, p);
+            }
+        } else if rest.contains("/codex") && !rest.contains(".app") && !rest.contains("Framework") {
+            // Codex CLI carries no session id on argv; resolve it by cwd below.
+            codex_pids.push(pid);
+        }
+    }
+    // Codex: build a cwd → newest-rollout index once, then map each codex pid via
+    // its working directory (lsof). Covers the codex half of the fleet.
+    if !codex_pids.is_empty() {
+        let idx = codex_rollouts_by_cwd();
+        if !idx.is_empty() {
+            for pid in codex_pids {
+                if let Some(cwd) = pid_cwd(pid)
+                    && let Some(p) = idx.get(&cwd)
+                {
+                    map.insert(pid, p.clone());
+                }
             }
         }
     }
     map
+}
+
+/// Working directory of a process via `lsof` (the portable way on macOS).
+fn pid_cwd(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix('n').map(str::to_string))
+}
+
+/// Index `~/.codex/sessions/**` rollouts (recent only) by their recorded `cwd`,
+/// keeping the most-recently-modified rollout per cwd. Codex writes a
+/// `session_meta` first line with `payload.cwd`.
+fn codex_rollouts_by_cwd() -> std::collections::HashMap<String, PathBuf> {
+    use std::collections::HashMap;
+    let mut idx: HashMap<String, (PathBuf, std::time::SystemTime)> = HashMap::new();
+    let Ok(home) = std::env::var("HOME") else {
+        return HashMap::new();
+    };
+    let root = PathBuf::from(home).join(".codex/sessions");
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(72 * 3600);
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(mtime) = std::fs::metadata(&p).and_then(|m| m.modified()) else {
+                continue;
+            };
+            if mtime < cutoff {
+                continue;
+            }
+            if let Some(cwd) = codex_rollout_cwd(&p) {
+                match idx.get(&cwd) {
+                    Some((_, t)) if *t >= mtime => {}
+                    _ => {
+                        idx.insert(cwd, (p, mtime));
+                    }
+                }
+            }
+        }
+    }
+    idx.into_iter().map(|(k, (p, _))| (k, p)).collect()
+}
+
+/// Pull `payload.cwd` out of a codex rollout's first `session_meta` line.
+fn codex_rollout_cwd(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    for line in text.lines().take(5) {
+        if let Ok(v) = serde_json::from_str::<Value>(line)
+            && v.get("type").and_then(Value::as_str) == Some("session_meta")
+            && let Some(cwd) = v.pointer("/payload/cwd").and_then(Value::as_str)
+        {
+            return Some(cwd.to_string());
+        }
+    }
+    None
+}
+
+/// A session id is a uuid-ish token (hex + dashes, length ≥ 16) — cheap guard so
+/// we don't try to resolve arbitrary flag values.
+fn looks_like_session_id(s: &str) -> bool {
+    s.len() >= 16 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-') && s.contains('-')
 }
 
 /// Heuristic "what's the next move": pull an explicit next-step/TODO/checkbox/
@@ -224,16 +290,12 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn norm_title_matches_across_glyph_drift() {
-        // snapshot read and `cmux top` read may show a different status glyph —
-        // both must normalize to the same key.
-        assert_eq!(norm_title("🟣 Claude ▶ · kill dead code"), "kill dead code");
-        assert_eq!(norm_title("🟣 Claude ✓ · kill dead code"), "kill dead code");
-        assert_eq!(
-            norm_title("🧠 Codex 🧪 · score projects [ws:5]"),
-            "score projects"
-        );
-        assert_eq!(norm_title("plain"), "plain");
+    fn session_id_guard() {
+        assert!(looks_like_session_id(
+            "f002d084-d11a-4493-b72f-ab8572d16204"
+        ));
+        assert!(!looks_like_session_id("--dangerously-skip-permissions"));
+        assert!(!looks_like_session_id("short"));
     }
 
     #[test]

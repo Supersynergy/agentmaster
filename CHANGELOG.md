@@ -2,6 +2,29 @@
 
 All notable changes to agentmaster are documented here. Newest first.
 
+## [0.11.0] — 2026-06-04
+
+Real response times for the whole *live* fleet — found the exact, universal link
+between a workspace and its transcript, replacing the partial snapshot guess.
+
+### Changed
+- **Transcript resolution is now PID-based** (`peek::pid_transcripts`): one `ps`
+  scan finds every running agent's own session id on its command line —
+  `claude … --resume <id>` → `~/.claude/projects/**.jsonl`. The cmux/tmux workspace
+  reports the agent's pid; the pid carries the id. Exact, live, no snapshot, covers
+  just-spawned agents. Verified: the cmux-reported pid *is* the `--resume` process.
+- **Codex too**: codex CLI carries no id on argv, so its pid is resolved via its
+  working directory (`lsof` cwd) → the newest matching rollout in
+  `~/.codex/sessions/**` (whose `session_meta` records the cwd).
+- Result: ~87% of **live** agents now show a ground-truth `↩ last response` time
+  (up from ~35% via the partial cmux snapshot). Dead/hibernated cmux tabs (no live
+  process) honestly fall back to time-in-state.
+
+### Notes
+- Dropped the snapshot/title fuzzy match (`cmux_transcripts`/`norm_title`) — the
+  pid path is exact where the old one was a guess.
+- fmt clean, clippy `-D warnings` 0, **29/29 tests** (+session-id guard).
+
 ## [0.10.0] — 2026-06-04
 
 Honest times + full mouse. The board now knows *when each agent last actually
