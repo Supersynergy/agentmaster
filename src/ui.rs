@@ -121,6 +121,8 @@ fn clean_title(s: &str) -> &str {
         Some((_, task)) if !task.trim().is_empty() => task.trim(),
         _ => s.trim(),
     };
+    // Drop cmux's leading ⏱ shell-tab marker so non-agent tabs read cleanly.
+    let s = s.trim_start_matches('⏱').trim_start();
     // strip a trailing " [..]" address suffix
     if let Some(idx) = s.rfind(" [")
         && s.ends_with(']')
@@ -128,6 +130,20 @@ fn clean_title(s: &str) -> &str {
         return s[..idx].trim_end();
     }
     s
+}
+
+/// The title a human should read: the cleaned multiplexer title, unless that's a
+/// system fragment (`</task-notification>`, `## ▸ …`) — then the real task pulled
+/// from the transcript (`task_label`). This is what makes the list legible instead
+/// of a column of `</task-notification>`.
+fn display_title(a: &Agent) -> String {
+    if crate::peek::is_fragment_title(&a.name)
+        && let Some(t) = a.task_label.as_deref()
+        && !t.is_empty()
+    {
+        return t.to_string();
+    }
+    clean_title(&a.name).to_string()
 }
 
 /// Agent kind (claude / codex / …) parsed from a cmux-style title prefix, for a
@@ -352,6 +368,23 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
     } else {
         C_WORKING
     };
+    // Time-coverage: how many agents show a ground-truth `↩` last-response time
+    // (resolved transcript) vs fall back to time-in-state. The operator's at-a-
+    // glance trust signal for the clock — high % means the times are real.
+    let timed = app
+        .fleet
+        .agents
+        .iter()
+        .filter(|a| a.last_response_secs().is_some())
+        .count();
+    let cov = (timed * 100).checked_div(total).unwrap_or(0);
+    let cov_col = if cov >= 90 {
+        C_WORKING
+    } else if cov >= 60 {
+        C_BLOCKED
+    } else {
+        C_DIM
+    };
     let l1 = Line::from(vec![
         Span::styled(format!(" cpu {cpu:>4.0}% "), Style::new().fg(cpu_col)),
         Span::styled(
@@ -361,6 +394,14 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
                 app.metrics.mem_total_gb()
             ),
             Style::new().fg(C_DIM),
+        ),
+        Span::styled(
+            format!("↩ {timed}/{total} timed {cov}%  "),
+            Style::new().fg(cov_col),
+        ),
+        Span::styled(
+            if app.notify_on { "🔔 " } else { "🔕 " },
+            Style::new().fg(if app.notify_on { C_WORKING } else { C_FAINT }),
         ),
         Span::styled(format!("view:{view_name}"), Style::new().fg(C_ACCENT)),
         Span::raw("  │  "),
@@ -384,14 +425,32 @@ fn list(f: &mut Frame, area: Rect, app: &App) {
         Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(area);
 
     // ---- left: the agent table ----
+    let noise = if app.hide_noise { "noise" } else { "all" };
     let title = format!(
-        " agents {}  ·  sort:{} (S)  ·  / filter ",
+        " agents {}  ·  sort:{} (S)  ·  H hide:{}  ·  / filter ",
         agents.len(),
-        app.sort.label()
+        app.sort.label(),
+        noise
     );
-    let lblock = Block::bordered()
+    // Scroll geometry up front so the position can live in the block's bottom
+    // border instead of overlapping a data row. Borders take 2 rows, header 1.
+    let vis = (cols[0].height as usize).saturating_sub(3).max(1);
+    let scroll = if app.sel >= vis { app.sel + 1 - vis } else { 0 };
+    let mut lblock = Block::bordered()
         .title(title)
         .border_style(Style::new().fg(C_ACCENT));
+    if agents.len() > vis {
+        let shown_end = (scroll + vis).min(agents.len());
+        lblock = lblock.title_bottom(
+            Line::from(format!(
+                " {}–{} of {}  j/k scroll ",
+                scroll + 1,
+                shown_end,
+                agents.len()
+            ))
+            .right_aligned(),
+        );
+    }
     let linner = lblock.inner(cols[0]);
     f.render_widget(lblock, cols[0]);
     if agents.is_empty() {
@@ -421,9 +480,8 @@ fn list(f: &mut Frame, area: Rect, app: &App) {
             parts[0],
         );
         let w = parts[1].width as usize;
-        let vis = parts[1].height as usize;
-        // keep the selection on screen
-        let scroll = if app.sel >= vis { app.sel + 1 - vis } else { 0 };
+        // Use the same `scroll`/`vis` computed for the bottom-border position, so
+        // the rows and the "N–M of K" indicator never disagree.
         let spin = app.spin();
         let end = (scroll + vis).min(agents.len());
         let rows: Vec<Line> = agents[scroll..end]
@@ -432,30 +490,12 @@ fn list(f: &mut Frame, area: Rect, app: &App) {
             .map(|(i, a)| agent_row(a, scroll + i == app.sel, spin, w))
             .collect();
         f.render_widget(Paragraph::new(rows), parts[1]);
-        // scroll bar hint along the right edge
-        if agents.len() > vis {
-            let above = scroll;
-            let below = agents.len() - end;
-            let bar = Rect {
-                x: parts[1].x,
-                y: parts[1].y,
-                width: parts[1].width,
-                height: 1,
-            };
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!("↑{above}"),
-                    Style::new().fg(C_DIM),
-                )))
-                .alignment(Alignment::Right),
-                bar,
-            );
-            let _ = below; // shown in the footer hint of the detail panel
-        }
     }
 
-    // ---- right: detail of the selected agent ----
-    detail_panel(f, cols[1], agents.get(app.sel).copied());
+    // ---- right: detail of the selected agent (+ its auto-peek digest) ----
+    let sel = agents.get(app.sel).copied();
+    let digest = sel.and_then(|a| app.peek_for(a.id));
+    detail_panel(f, cols[1], sel, digest);
 }
 
 /// One dense row in the list. Fixed-width columns then the title fills the rest.
@@ -492,7 +532,7 @@ fn agent_row(a: &Agent, selected: bool, spin: char, width: usize) -> Line<'stati
         Span::styled(
             format!(
                 "{:<width$} ",
-                trunc(clean_title(&a.name), title_w),
+                trunc(&display_title(a), title_w),
                 width = title_w
             ),
             if selected {
@@ -530,7 +570,12 @@ fn agent_row(a: &Agent, selected: bool, spin: char, width: usize) -> Line<'stati
 }
 
 /// Right pane: everything about the selected agent + the actions you can take.
-fn detail_panel(f: &mut Frame, area: Rect, a: Option<&Agent>) {
+fn detail_panel(
+    f: &mut Frame,
+    area: Rect,
+    a: Option<&Agent>,
+    digest: Option<&crate::peek::Digest>,
+) {
     let block = Block::bordered()
         .title(" detail — ↵ inspect · f tab · s send · g goal ")
         .border_style(Style::new().fg(C_FAINT));
@@ -547,7 +592,7 @@ fn detail_panel(f: &mut Frame, area: Rect, a: Option<&Agent>) {
     let w = inner.width as usize;
     let mut lines = vec![
         Line::from(Span::styled(
-            trunc(clean_title(&a.name), w),
+            trunc(&display_title(a), w),
             Style::new().fg(Color::White).bold(),
         )),
         Line::from(vec![
@@ -587,6 +632,26 @@ fn detail_panel(f: &mut Frame, area: Rect, a: Option<&Agent>) {
             ),
         }),
     ];
+    // Rich cmux tags: repo state + workflow phase, when reported. "dirty/ahead"
+    // means there's uncommitted/unpushed work waiting — flag it amber.
+    if a.git.is_some() || a.phase.is_some() {
+        let mut tag_spans = Vec::new();
+        if let Some(g) = a.git.as_deref() {
+            let col = match g {
+                "dirty" | "ahead" => C_BLOCKED,
+                "clean" => C_WORKING,
+                _ => C_DIM,
+            };
+            tag_spans.push(Span::styled(format!("⎇ {g}"), Style::new().fg(col)));
+        }
+        if let Some(p) = a.phase.as_deref() {
+            if !tag_spans.is_empty() {
+                tag_spans.push(Span::styled("  ·  ", Style::new().fg(C_FAINT)));
+            }
+            tag_spans.push(Span::styled(format!("◇ {p}"), Style::new().fg(C_ACCENT)));
+        }
+        lines.push(Line::from(tag_spans));
+    }
     if a.has_goal() {
         lines.push(Line::from(vec![
             Span::styled(
@@ -598,6 +663,35 @@ fn detail_panel(f: &mut Frame, area: Rect, a: Option<&Agent>) {
                 Style::new().fg(Color::Indexed(250)),
             ),
         ]));
+    }
+    // Auto-peek: what the agent last said + its inferred next move, read straight
+    // off the transcript (zero token cost). Far more useful than the raw screen
+    // tail, so it leads; the raw output fills whatever rows remain below.
+    let has_peek =
+        digest.is_some_and(|d| !d.last_assistant.is_empty() || !d.next_action.is_empty());
+    if let Some(d) = digest.filter(|_| has_peek) {
+        lines.push(Line::from(Span::styled(
+            "─ last said ─",
+            Style::new().fg(C_FAINT),
+        )));
+        if !d.last_user.is_empty() {
+            lines.push(wrapped("🧑", &d.last_user, w, Color::Indexed(110)));
+        }
+        if !d.last_assistant.is_empty() {
+            for (i, seg) in wrap_text(&d.last_assistant, w.saturating_sub(2), 3)
+                .into_iter()
+                .enumerate()
+            {
+                let pre = if i == 0 { "🤖 " } else { "   " };
+                lines.push(Line::from(Span::styled(
+                    format!("{pre}{seg}"),
+                    Style::new().fg(Color::Indexed(252)),
+                )));
+            }
+        }
+        if !d.next_action.is_empty() {
+            lines.push(wrapped("🎯 next:", &d.next_action, w, C_REVIEW));
+        }
     }
     lines.push(Line::from(Span::styled(
         "─ recent ─",
@@ -759,7 +853,7 @@ fn card(f: &mut Frame, area: Rect, a: &Agent, selected: bool, filter: &str, spin
             Span::styled(format!("{glyph} "), Style::new().fg(col).bold()),
             Span::styled(format!("{} ", trunc(kind, 7)), Style::new().fg(C_ACCENT)),
             Span::styled(
-                trunc(clean_title(&a.name), w.saturating_sub(kind.len() + 5)),
+                trunc(&display_title(a), w.saturating_sub(kind.len() + 5)),
                 name_style,
             ),
         ]),
@@ -1137,7 +1231,9 @@ fn help(f: &mut Frame, area: Rect) {
         Line::from(""),
         head("Act"),
         Line::from("  n   new agent   <runtime> [task]   e.g.  'shell'   or  'claude fix the bug'"),
-        Line::from("  s   send a line to selected        K   kill/untrack          /   filter"),
+        Line::from(
+            "  s   send a line to selected        K   kill/untrack          /   filter    H hide noise",
+        ),
         Line::from("  d   discover + import tmux panes AND cmux workspaces (steer them all)"),
         Line::from("  🖱  footer is a clickable toolbar — every [button] is a click target"),
         Line::from(""),
@@ -1176,6 +1272,56 @@ fn help(f: &mut Frame, area: Rect) {
 }
 
 // ---- small helpers --------------------------------------------------------
+
+/// One labelled, single-line detail row: `prefix text…`, clipped to the panel.
+fn wrapped(prefix: &str, text: &str, w: usize, color: Color) -> Line<'static> {
+    let one = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    Line::from(vec![
+        Span::styled(format!("{prefix} "), Style::new().fg(C_FAINT)),
+        Span::styled(
+            trunc(&one, w.saturating_sub(prefix.chars().count() + 1)),
+            Style::new().fg(color),
+        ),
+    ])
+}
+
+/// Word-wrap `s` into at most `max_lines` lines of `width` cols, collapsing
+/// whitespace; the final line gets an ellipsis if text remains. Cheap, no deps.
+fn wrap_text(s: &str, width: usize, max_lines: usize) -> Vec<String> {
+    let width = width.max(8);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut truncated = false;
+    for word in s.split_whitespace() {
+        let next = if cur.is_empty() {
+            word.chars().count()
+        } else {
+            cur.chars().count() + 1 + word.chars().count()
+        };
+        if next > width && !cur.is_empty() {
+            if lines.len() + 1 == max_lines {
+                // Last allowed line is full and more text remains → truncate.
+                truncated = true;
+                break;
+            }
+            lines.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if truncated && let Some(last) = lines.last_mut() {
+        *last = trunc(last, width);
+        if !last.ends_with('…') {
+            last.push('…');
+        }
+    }
+    lines
+}
 
 fn trunc(s: &str, max: usize) -> String {
     let max = max.max(1);
@@ -1230,6 +1376,17 @@ mod tests {
             "kill dead code"
         );
         assert_eq!(clean_title("plain native name"), "plain native name");
+    }
+
+    #[test]
+    fn wrap_text_respects_width_and_line_cap() {
+        let w = wrap_text("the quick brown fox jumps over the lazy dog", 12, 2);
+        assert!(w.len() <= 2);
+        assert!(w.iter().all(|l| l.chars().count() <= 12));
+        // text exceeds 2×12, so the final line is ellipsised
+        assert!(w.last().unwrap().ends_with('…'));
+        // short text fits on one line, untouched
+        assert_eq!(wrap_text("all done", 40, 3), vec!["all done".to_string()]);
     }
 
     #[test]

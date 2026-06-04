@@ -2,6 +2,170 @@
 
 All notable changes to agentmaster are documented here. Newest first.
 
+## [0.17.0] — 2026-06-04
+
+Signal filter pass — the list can now collapse stale/non-agent noise without
+changing discovery or status truth.
+
+### Added
+- **Hide-noise list mode** (`H`). Hides obvious imported shell tabs (`⏱ Last
+  login…`, URL tabs, starter-tip tabs without a real task label) and `Idle` rows
+  whose last real response is older than 24h. Blocked, review, working, queued,
+  and labelled real agents remain visible.
+- The List title shows the current mode (`H hide:all` / `H hide:noise`) so the
+  operator can tell whether the fleet is raw or signal-filtered.
+
+### Fixed
+- `/` filter now searches the visible transcript-derived `task_label`, not only
+  the raw multiplexer title. This keeps v0.16's human task titles searchable.
+
+### Notes
+- `h` remains List page-up; `H` is the noise toggle to preserve `h/j/k/l`
+  navigation muscle memory.
+- fmt clean, clippy `-D warnings` 0, 38/38 tests.
+
+## [0.16.0] — 2026-06-04
+
+Usability pass — "what a human actually wants to see". The list was technically
+rich but read like noise: a column of `</task-notification>` and `## ▸ Last user
+request` where the task should be, plus a `↑0` artifact on the selected row.
+
+### Fixed
+- **Real task titles.** When a multiplexer title is a system fragment
+  (`</task-notification>`, `## ▸ …`, a bare URL, `Last login…`, a `⏱` shell tab),
+  the row now shows the agent's actual task — pulled from the transcript's first
+  user prompt (`peek::first_prompt`, a cheap head-only read) and cached on the
+  agent (`task_label`). The list went from a wall of `</task-notification>` to
+  legible asks like "suche bitte alles über Human Design…". `peek::is_fragment_title`
+  decides; `ui::display_title` applies it.
+- **Scroll position moved to the block's bottom border** (`12–34 of 83  j/k
+  scroll`) instead of a right-edge overlay that printed a dead `↑0` on top of the
+  first row's cpu column. No more data overlap; the indicator only shows when the
+  list overflows.
+- `clean_title` strips a leading `⏱` so non-agent shell tabs read cleanly.
+
+### Notes
+- `task_label` is set only when the title is a fragment AND a transcript is
+  linked, so native/tmux agents and already-meaningful titles are untouched.
+- fmt clean, clippy `-D warnings` 0, 36/36 tests. Verified live: the
+  `</task-notification>` rows now render real tasks; `↑0` gone; `1–15 of 83`
+  scroll position in the border.
+
+## [0.15.0] — 2026-06-04
+
+Real-time + notifications. Backed by a research pass (cmux 0.64.x changelog,
+plus what people ask for on HN/Reddit and what the field ships — ccboard,
+hive, tmux-agent-sidebar): the two highest-value, zero-token features were a
+live status stream and desktop alerts. Both land here. See
+`docs/COMPETITIVE-AUDIT.md`.
+
+### Added
+- **Live status via `cmux events`** (`peek::parse_set_status` +
+  `App::apply_live_status`). A long-lived, self-reconnecting thread tails cmux's
+  sidebar event stream; each `set_status` push updates the agent's lane the
+  instant cmux knows, instead of waiting for the ~1.5s poll. Agents resolve by
+  workspace UUID (exact, stable; the UUID→ref map comes free from the checkpoint
+  pass) or pid. The poll path stays as a backstop — `note_status` dedupes so a
+  transition seen by both never double-fires. The `--reconnect` child is tracked
+  by pid and killed on exit, so it never outlives the TUI.
+- **Desktop notifications** on the transitions that want you — an agent now
+  **needs you** (blocked) or just **finished** (done) — via `osascript` (no new
+  dependency), off-thread, globally throttled so a burst can't spam. Toggle with
+  `N`; a `🔔`/`🔕` badge in the header shows the state. Fires from every status
+  path (live event, poll, native PTY).
+
+### Notes
+- The event stream is opt-out at the source: it only runs when cmux is present,
+  carries `--no-ack` (read-only), and filters to `set_status` payloads, so volume
+  is just real status changes — not heartbeat noise.
+- Research deliverable: `docs/COMPETITIVE-AUDIT.md` maps cmux 0.64.x primitives,
+  agentmaster's feature set, and the competitive gap (cost tracking, subagent
+  trees, worktree isolation) into a prioritised backlog.
+- fmt clean, clippy `-D warnings` 0, 34/34 tests. Verified live: event child
+  spawns + dies with the TUI (0 orphans), `🔔` renders, coverage badge intact.
+
+## [0.14.0] — 2026-06-04
+
+Rides the newest cmux (0.64.x) primitives: the resume_binding behind Agent
+Hibernation, and the richer workspace tags. Ground-truth `↩` time coverage jumps
+**59% → 86%** and is now exact + drift-proof.
+
+### Added
+- **Exact session link via cmux `resume_binding` checkpoints**
+  (`peek::cmux_checkpoints`). For every workspace — live, idle, OR hibernated —
+  read `workspace.list` then `surface.list {workspace_id}` and pull
+  `resume_binding.checkpoint_id` (the session id cmux persists to resume the
+  agent), resolve it to a transcript, and key it by the **stable `workspace:NN`
+  ref**. This is the link the old snapshot title-match couldn't make: it covers
+  hibernated tabs (no live pid) and can't mis-date an agent when its title drifts.
+  Verified live: 69/80 timed (86%), up from 48/82 (59%); the rest are non-agent
+  shell tabs with no transcript.
+- **Rich workspace tags** (`backend::CmuxWorkspace.{git,phase}`): cmux now emits
+  `git` (dirty / ahead / clean / none) and `phase` (e.g. tests-pass / commit)
+  tags in `cmux top`. The detail panel surfaces them as `⎇ <git> · ◇ <phase>` —
+  amber when there's uncommitted/unpushed work — and they refresh on every poll.
+
+### Changed
+- cmux transcript resolution ladder is now: stable-ref checkpoint → live pid
+  (`--resume`) → snapshot title match. Re-discovery still backfills a missing link
+  on already-imported agents and re-anchors their clock.
+
+### Notes
+- The checkpoint scan is two `cmux rpc` calls per workspace (~18ms each), run on
+  the discovery thread (boot + `d`), never the UI. Codex workspaces carry no
+  checkpoint binding and resolve via the existing pid/cwd rollout path.
+- fmt clean, clippy `-D warnings` 0, 33/33 tests. Verified live under a PTY on the
+  80-agent fleet: 86% coverage badge + `⎇ ahead · ◇ tests-pass` render.
+
+## [0.13.0] — 2026-06-04
+
+Times that stay true across restarts + a detail panel that shows what each agent
+last said. The headline complaint — "the times don't match" — was two bugs: a
+~45s blank window after import, and the time-in-state clock resetting to 0 on
+every (re)discover/restart. Both fixed; coverage of ground-truth `↩` times also
+broadened.
+
+### Fixed
+- **Time-in-state no longer resets.** Imported agents stamped their clocks at
+  import time, so a tab blocked for 2h showed "blocked 2s" right after discovery
+  and reset again on the next restart. Now, on import, the clock is anchored to
+  the transcript mtime (ground truth) when linked, and otherwise restored from a
+  persisted `since` (new `seen` table) — so "blocked 2h46m" survives a restart.
+- **Immediate last-response stamp.** `Agent::anchor_time` stats the transcript
+  the moment it's linked instead of waiting up to ~45s for a housekeeping tick;
+  no more blank `↩` window right after discovery.
+
+### Added
+- **Auto-peek detail panel.** Selecting an agent now shows its last user prompt,
+  last assistant message (wrapped), and inferred next action read straight off
+  the transcript — no `p` keypress, no tokens. Cached per-agent, refreshed on
+  selection change and on a ~1.5s throttle.
+- **Time-coverage badge** in the header (`↩ N/M timed X%`): the at-a-glance trust
+  signal for the clock — how many agents show a ground-truth time vs fall back to
+  observed time-in-state.
+- **`quiet` sort** (S cycles to it): longest-silent agents first, untimed sink to
+  the bottom — fleet triage for "who's gone dark".
+- **Cross-restart state persistence** (`store::{save_seen,load_seen}`), keyed by
+  the stable source ref (`cmux:workspace:NN` / `tmux:target` / `native:name`), not
+  the drifting title.
+
+### Changed
+- **Broader transcript resolution** (`peek::snapshot_transcripts`): use the cmux
+  snapshot's exact `full_path` first, then `session_id`, then a `dir` fallback
+  (newest transcript in the surface cwd — Claude project dir or newest Codex
+  rollout). Re-discovery now also backfills a still-missing transcript on already-
+  imported agents and re-anchors their clock.
+
+### Notes
+- Coverage ceiling is real and honest: dead/hibernated cmux tabs whose title has
+  drifted since their last snapshot can't be exactly transcript-linked (cmux
+  exposes no stable workspace-id↔session map for them, and 75/81 tabs share a
+  cwd so cwd-newest would mis-date them). Those keep an honest time-in-state
+  clock — now durable across restarts — rather than a guessed `↩`.
+- fmt clean, clippy `-D warnings` 0, 35/35 tests. Verified live under a PTY on the
+  real 82-agent fleet: real times (`↩2h46m`, `blocked for 31m23s`), auto-peek, and
+  the coverage badge all render.
+
 ## [0.12.0] — 2026-06-04
 
 Maximised honest time coverage: live + recovered dead tabs.

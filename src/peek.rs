@@ -33,6 +33,58 @@ fn extract_text(content: &Value) -> String {
     }
 }
 
+/// True if a multiplexer-provided title is a system fragment rather than a real
+/// task a human would recognise (`</task-notification>`, `## ▸ Last user request`,
+/// a bare shell line, a URL, "Last login…"). Strips the cmux `glyph Agent state ·`
+/// decoration first. When this is true we prefer the transcript's first prompt.
+pub fn is_fragment_title(raw: &str) -> bool {
+    let t = raw.rsplit(" · ").next().unwrap_or(raw).trim();
+    let t = match (t.rfind(" ["), t.ends_with(']')) {
+        (Some(i), true) => t[..i].trim(),
+        _ => t,
+    };
+    // A leading ⏱ is cmux's marker for a non-agent shell tab (raw terminal text
+    // as the title); strip it so the underlying junk is judged on its merits.
+    let t = t.trim_start_matches('⏱').trim();
+    t.is_empty()
+        || t.starts_with('<')
+        || t.starts_with("## ")
+        || t.starts_with("http")
+        || t.starts_with('│')
+        || t.contains("Last login")
+        || t.contains("Tips for getting started")
+}
+
+/// The first real user prompt in a transcript — the human's original ask, i.e.
+/// the agent's actual task. Reads only the file head (early-returns on the first
+/// non-hook user line), so it's cheap to call at import. Skips injected
+/// `<…>`/system blocks. Gives an agent a meaningful title when its multiplexer
+/// title is a fragment.
+pub fn first_prompt(path: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let f = std::fs::File::open(path).ok()?;
+    for line in std::io::BufReader::new(f)
+        .lines()
+        .map_while(Result::ok)
+        .take(400)
+    {
+        let Ok(ev) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if ev.get("type").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let content = ev.pointer("/message/content").unwrap_or(&Value::Null);
+        let t = extract_text(content);
+        let t = t.trim();
+        if t.is_empty() || t.starts_with('<') || t.starts_with("## ▸") {
+            continue;
+        }
+        return Some(clip(t, 200));
+    }
+    None
+}
+
 /// Digest the last `n` lines of a transcript into (last_user, last_assistant,
 /// inferred next action). Tolerant of malformed lines and hook/system noise.
 pub fn digest(path: &Path, n: usize) -> Digest {
@@ -67,6 +119,109 @@ pub fn digest(path: &Path, n: usize) -> Digest {
     }
     d.next_action = next_action(&d.last_assistant, &d.last_user);
     d
+}
+
+/// Exact session link for EVERY cmux workspace — live, idle, OR hibernated —
+/// from the `resume_binding` cmux persists so it can resume an agent (the engine
+/// behind cmux Agent Hibernation). For each workspace we read its
+/// `resume_binding.checkpoint_id` (= the Claude session id) and resolve it to a
+/// transcript, keyed by the STABLE `workspace:NN` ref. Unlike the snapshot's
+/// title match, the ref never drifts as the agent works, so a linked time can't
+/// later attach to the wrong tab. Covers the hibernated tabs that have no live
+/// pid and whose title moved on since their last snapshot.
+///
+/// Two `cmux rpc` calls per workspace (~18ms each); runs on the discovery thread,
+/// never the UI. Codex workspaces carry no checkpoint binding and fall through to
+/// the pid/cwd paths.
+///
+/// Returns `(ref → transcript, workspace-UUID → ref)`. The second map lets the
+/// live `cmux events` stream (whose `set_status` payload carries the workspace
+/// UUID) resolve an event back to a `workspace:NN` agent without an extra RPC.
+pub fn cmux_checkpoints() -> (
+    std::collections::HashMap<String, PathBuf>,
+    std::collections::HashMap<String, String>,
+) {
+    use std::collections::HashMap;
+    let mut map = HashMap::new();
+    let mut uuids: HashMap<String, String> = HashMap::new();
+    let Ok(out) = std::process::Command::new("cmux")
+        .args(["rpc", "workspace.list", "{}"])
+        .output()
+    else {
+        return (map, uuids);
+    };
+    let Ok(v) = serde_json::from_slice::<Value>(&out.stdout) else {
+        return (map, uuids);
+    };
+    for w in v
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let (Some(id), Some(ws_ref)) = (
+            w.get("id").and_then(Value::as_str),
+            w.get("ref").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        uuids.insert(id.to_string(), ws_ref.to_string());
+        let params = format!("{{\"workspace_id\":\"{id}\"}}");
+        let Ok(so) = std::process::Command::new("cmux")
+            .args(["rpc", "surface.list", &params])
+            .output()
+        else {
+            continue;
+        };
+        let Ok(sv) = serde_json::from_slice::<Value>(&so.stdout) else {
+            continue;
+        };
+        for s in sv
+            .get("surfaces")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(cid) = s
+                .pointer("/resume_binding/checkpoint_id")
+                .and_then(Value::as_str)
+                && let Some(p) = resolve(cid)
+            {
+                map.insert(ws_ref.to_string(), p);
+                break;
+            }
+        }
+    }
+    (map, uuids)
+}
+
+/// Parse a `cmux events` line. Returns `(workspace-UUID, pid, status)` for a
+/// sidebar `set_status` event — the live status push behind the tab status bar —
+/// else `None`. The payload arg looks like:
+/// `claude_code Needs input --icon=… --tab=<UUID> --panel=… --pid=37706`, i.e.
+/// `<agent-kind> <status words> --flags`.
+pub fn parse_set_status(line: &str) -> Option<(Option<String>, Option<u32>, String)> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    if v.pointer("/payload/command").and_then(Value::as_str) != Some("set_status") {
+        return None;
+    }
+    let args = v.pointer("/payload/args").and_then(Value::as_str)?;
+    // Status = everything between the leading agent-kind word and the first flag.
+    let head = args.split(" --").next().unwrap_or("");
+    let status = head
+        .split_once(' ')
+        .map(|(_, s)| s.trim().to_string())
+        .unwrap_or_default();
+    if status.is_empty() {
+        return None;
+    }
+    let flag = |name: &str| {
+        args.split_whitespace()
+            .find_map(|t| t.strip_prefix(name).map(str::to_string))
+    };
+    let uuid = flag("--tab=");
+    let pid = flag("--pid=").and_then(|s| s.parse::<u32>().ok());
+    Some((uuid, pid, status))
 }
 
 /// Map every running agent PID → its transcript, by scanning `ps` for
@@ -144,9 +299,14 @@ pub fn norm_title(s: &str) -> String {
 }
 
 /// Recover transcripts for DEAD / hibernated cmux tabs (no live pid) from the cmux
-/// snapshot, which records `session_id` per surface. Keyed by normalized title so
-/// the main thread can match it after the exact pid path misses. Refreshes the
-/// snapshot first (≈90ms) so it is current.
+/// snapshot. Keyed by normalized title so the main thread can match it after the
+/// exact pid path misses. Resolution ladder per surface, exact-first: `full_path`
+/// (the snapshot already recorded the transcript path) → `session_id` resolved
+/// under `~/.claude/projects` → `dir` fallback (newest transcript in that cwd: a
+/// Claude project dir for claude surfaces, else the newest Codex rollout for that
+/// cwd). The `dir` step is a "last activity in this dir" approximation that covers
+/// tabs whose session id cmux never captured (most dead/hibernated codex + closed
+/// tabs). Refreshes the snapshot first (≈90ms) so it is current.
 pub fn snapshot_transcripts() -> std::collections::HashMap<String, PathBuf> {
     use std::collections::HashMap;
     let mut map = HashMap::new();
@@ -177,6 +337,8 @@ pub fn snapshot_transcripts() -> std::collections::HashMap<String, PathBuf> {
     let Ok(v) = serde_json::from_str::<Value>(&text) else {
         return map;
     };
+    // Built lazily — only when a codex surface needs the cwd→rollout fallback.
+    let mut codex_idx: Option<HashMap<String, PathBuf>> = None;
     for ws in v
         .get("workspaces")
         .and_then(Value::as_array)
@@ -191,16 +353,79 @@ pub fn snapshot_transcripts() -> std::collections::HashMap<String, PathBuf> {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        for s in surfaces {
+        let mut resolved: Option<PathBuf> = None;
+        // Pass 1: exact links (full_path, then session_id).
+        for s in &surfaces {
+            if let Some(fp) = s.get("full_path").and_then(Value::as_str) {
+                let p = PathBuf::from(fp);
+                if p.is_file() {
+                    resolved = Some(p);
+                    break;
+                }
+            }
             if let Some(sid) = s.get("session_id").and_then(Value::as_str)
                 && let Some(p) = resolve(sid)
             {
-                map.insert(norm_title(name), p);
+                resolved = Some(p);
                 break;
             }
         }
+        // Pass 2: cwd fallback (newest transcript in the surface's dir).
+        if resolved.is_none() {
+            for s in &surfaces {
+                let cwd = s
+                    .get("dir")
+                    .and_then(Value::as_str)
+                    .or_else(|| ws.get("cwd").and_then(Value::as_str))
+                    .unwrap_or("");
+                if cwd.is_empty() {
+                    continue;
+                }
+                let is_claude = s.get("is_claude").and_then(Value::as_bool).unwrap_or(true);
+                let hit = if is_claude {
+                    claude_newest_in_dir(&home, cwd)
+                } else {
+                    codex_idx
+                        .get_or_insert_with(codex_rollouts_by_cwd)
+                        .get(cwd)
+                        .cloned()
+                };
+                if let Some(p) = hit {
+                    resolved = Some(p);
+                    break;
+                }
+            }
+        }
+        if let Some(p) = resolved {
+            map.insert(norm_title(name), p);
+        }
     }
     map
+}
+
+/// Newest Claude transcript under the project dir that encodes `cwd`
+/// (`/Users/me/app` → `-Users-me-app`; `/`, `.`, `_` all map to `-`). Best-effort
+/// "last activity in this dir" when the snapshot captured no exact session id.
+fn claude_newest_in_dir(home: &str, cwd: &str) -> Option<PathBuf> {
+    let enc: String = cwd
+        .trim_start_matches('/')
+        .chars()
+        .map(|c| if matches!(c, '/' | '.' | '_') { '-' } else { c })
+        .collect();
+    let dir = PathBuf::from(home)
+        .join(".claude/projects")
+        .join(format!("-{enc}"));
+    std::fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .max_by_key(|p| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .ok()
+                .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default())
+        })
 }
 
 /// Working directory of a process via `lsof` (the portable way on macOS).
@@ -371,6 +596,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_set_status_pulls_uuid_pid_and_multiword_status() {
+        let line = r#"{"category":"sidebar","name":"sidebar.metadata.updated","payload":{"args":"claude_code Needs input --icon=bolt.fill --tab=42B77046-4683-45D6-8D27-090B4EE2ADBE --panel=X --pid=37706","command":"set_status"}}"#;
+        let (uuid, pid, status) = parse_set_status(line).unwrap();
+        assert_eq!(
+            uuid.as_deref(),
+            Some("42B77046-4683-45D6-8D27-090B4EE2ADBE")
+        );
+        assert_eq!(pid, Some(37706));
+        assert_eq!(status, "Needs input"); // status is the words before the first flag
+        // A non-set_status sidebar event yields nothing.
+        assert!(parse_set_status(r#"{"payload":{"command":"clear_notifications"}}"#).is_none());
+        // Malformed line is tolerated.
+        assert!(parse_set_status("not json").is_none());
+    }
+
+    #[test]
     fn digests_user_and_assistant() {
         let mut f = tempfile();
         writeln!(
@@ -387,6 +628,40 @@ mod tests {
         assert_eq!(d.last_user, "fix the parser");
         assert!(d.last_assistant.contains("done"));
         assert_eq!(d.next_action, "run the tests");
+    }
+
+    #[test]
+    fn fragment_titles_detected() {
+        assert!(is_fragment_title("🟣 Claude ✓ · </task-notification>"));
+        assert!(is_fragment_title(
+            "🟣 Claude ▶ · ## ▸ Last user request foo"
+        ));
+        assert!(is_fragment_title("⏱ https://youtube.com/watch?v=x"));
+        assert!(is_fragment_title("⏱ Last login: Thu May 28"));
+        // a real task is NOT a fragment
+        assert!(!is_fragment_title("🟣 Claude ✓ · fix the auth bug"));
+        assert!(!is_fragment_title("kill dead code"));
+    }
+
+    #[test]
+    fn first_prompt_skips_hook_blocks() {
+        let mut f = tempfile();
+        writeln!(
+            f.0,
+            r#"{{"type":"user","message":{{"content":"<system-reminder>noise</system-reminder>"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f.0,
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"ok"}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f.0,
+            r#"{{"type":"user","message":{{"content":"build the dashboard"}}}}"#
+        )
+        .unwrap();
+        assert_eq!(first_prompt(&f.1).as_deref(), Some("build the dashboard"));
     }
 
     #[test]

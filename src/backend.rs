@@ -96,6 +96,10 @@ pub struct CmuxWorkspace {
     pub title: String,  // the task
     pub status: String, // raw status from tags (working/done/Needs input/…)
     pub pid: Option<u32>,
+    /// Repo state cmux now reports as a `git` tag: dirty / ahead / clean / none.
+    pub git: Option<String>,
+    /// Workflow phase cmux reports as a `phase` tag: e.g. tests-pass / commit.
+    pub phase: Option<String>,
 }
 
 pub fn cmux_available() -> bool {
@@ -177,6 +181,8 @@ pub fn parse_cmux_top(s: &str) -> Vec<CmuxWorkspace> {
                 title: extract_quoted(rest),
                 status: String::new(),
                 pid: None,
+                git: None,
+                phase: None,
             });
         } else if let Some(w) = cur.as_mut() {
             // Agent-type status tag, e.g. `tag claude "working"`.
@@ -204,6 +210,13 @@ pub fn parse_cmux_top(s: &str) -> Vec<CmuxWorkspace> {
                 if let Ok(n) = digits.parse() {
                     w.pid = Some(n);
                 }
+            }
+            // Rich workspace tags cmux now emits alongside the agent status.
+            if w.git.is_none() && line.contains("tag git \"") {
+                w.git = Some(extract_quoted(line));
+            }
+            if w.phase.is_none() && line.contains("tag phase \"") {
+                w.phase = Some(extract_quoted(line));
             }
         }
     }
@@ -246,6 +259,8 @@ mod tests {
         let s = r#"
  99.2%  557.5 MB  6  ├── workspace workspace:96 "🟣 Claude ▶ · kill dead code"
   0.0%       0 B  0  │   ├── tag claude "working"
+  0.0%       0 B  0  │   ├── tag git "dirty"
+  0.0%       0 B  0  │   ├── tag phase "tests-pass"
  99.2%  550.5 MB  5  │   ├── tag claude_code "Running" pid=96335
   0.0%  513.7 MB  6  ├── workspace workspace:108 "🟣 Claude ✓ · answer me"
   0.0%       0 B  0  │   ├── tag claude "done"
@@ -257,8 +272,11 @@ mod tests {
         assert_eq!(w[0].title, "🟣 Claude ▶ · kill dead code");
         assert_eq!(w[0].status, "working");
         assert_eq!(w[0].pid, Some(96335));
+        assert_eq!(w[0].git.as_deref(), Some("dirty"));
+        assert_eq!(w[0].phase.as_deref(), Some("tests-pass"));
         // "Needs input" must win over the "done" agent tag.
         assert_eq!(w[1].status.to_lowercase(), "needs input");
         assert_eq!(w[1].pid, Some(37706));
+        assert_eq!(w[1].git, None);
     }
 }

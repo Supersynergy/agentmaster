@@ -1,102 +1,150 @@
 # agentmaster
 
-**One session to see and steer every agent — Kanban TUI, zero orchestration tax.**
+**TUI command center for Claude Code, Codex, tmux and cmux agent fleets.**
+agentmaster lets one human see and steer many coding agents from one terminal:
+real-time status, human-readable task titles, transcript peeks, desktop alerts,
+and zero orchestration tax.
 
-agentmaster runs your coding agents (Claude Code, Codex, or any CLI/shell) behind
-native PTYs and shows them on a live Kanban board: which agent, which project,
-which process, what state — at a glance. No agent pays LLM tokens to coordinate;
-all coordination is on-disk (SQLite) and all state is *observed*, not *reported*.
+![agentmaster social preview](docs/assets/social-preview.png)
 
-```
- agentmaster  ⛁ 9 agents   ● 3 working  ▲ 1 blocked  ◍ 1 review  ✓ 4 done    cpu 41%  mem 12.3/128.0G
-┌ QUEUED 1 ┐┌ WORKING 3 ───────────┐┌ BLOCKED 1 ──────────┐┌ REVIEW 1 ┐┌ DONE 4 ──┐
-│ ● codex  ││ ● claude   synapse    ││ ● codex   leads-eng  ││ ● claude ││ ● claude │
-│ shell    ││ ⎇ synapse  pid 8821   ││ ⎇ leads   pid 9001   ││ events   ││ siteaudit│
-│ ⏱ 2s     ││ ⏱ 4m  idle 1s working ││ ⏱ 12m  blocked       ││ review   ││ done     │
-│ ▸ queued ││ ▸ running cargo nextes││ ▸ approve rm -rf? [y/N│└──────────┘└──────────┘
-└──────────┘└──────────────────────┘└──────────────────────┘
- [1]kanban [2]tree [3]logs   lane:h/l/Tab  card:j/k  ↵inspect   n)ew s)end K)ill /filter ?help q)uit
-```
+![Rust](https://img.shields.io/badge/Rust-1.95%2B-f46623)
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Status](https://img.shields.io/badge/status-active-20c997)
 
 ## Why
 
-Most multi-agent setups burn tokens on an LLM orchestrator that routes and
-coordinates. agentmaster removes that tax three ways:
+Most multi-agent setups spend tokens asking an LLM orchestrator what is running,
+blocked, done, or waiting. agentmaster removes that cost:
 
-- **You are the router.** The board makes *where/what/which* obvious, so no LLM
-  needs to narrate status.
-- **Coordination is on-disk.** SQLite audit log + mail bus — queryable, free.
-- **State is observed.** Status (working / blocked / review / done) is inferred
-  from each agent's terminal output, exactly what a human sees — no self-report.
+- **Observed state:** status is inferred from terminal output and cmux/tmux state.
+- **Human routing:** the list floats `NEED YOU` work to the top.
+- **On-disk coordination:** SQLite audit log, goals, seen-state and events.
+- **Zero-token peeks:** transcript reads show last user, last assistant and next action.
 
-## Install / run
+## Highlights
+
+- Dense list + detail view that scales to large fleets.
+- Real cmux/tmux discovery on boot, plus native PTY agents.
+- Live status updates from `cmux events` with polling as a backstop.
+- Desktop notifications for `blocked` and `done` transitions (`N` toggles).
+- Human task labels: noisy titles like `</task-notification>` are replaced with
+  the transcript's first real prompt.
+- `H` hide-noise mode removes stale idle rows and non-agent shell tabs.
+- Ground-truth last-response ages from transcript mtimes where available.
+- `focus`, `send`, `broadcast`, `goal`, `peek`, `ls --json` and session-restore
+  helpers for headless workflows.
+
+## Install
 
 ```bash
+git clone https://github.com/Supersynergy/agentmaster.git
+cd agentmaster
 cargo build --release
-./target/release/agentmaster        # launch the TUI (default)
-agentmaster doctor                  # health check (pty, sqlite, runtimes)
+./target/release/agentmaster --version
 ```
 
-Requires Rust 1.95+. Works on any terminal or bare Linux/macOS — agentmaster owns
-the PTYs itself, so it needs no tmux/zellij/kitty cooperation.
-
-## CLI (headless orchestrator — no TUI required)
-
-Everything you can do to agents that live in tmux/cmux is also a subcommand, so
-agentmaster drives a whole fleet from scripts and other agents. `--json` on the
-read commands feeds agent-native pipelines.
+Optional local install:
 
 ```bash
-# see
-agentmaster ls [--json]             # live agents: tmux panes + cmux workspaces (⏸▶✓·)
-agentmaster goals [--json]          # stored goals + progress
-agentmaster peek <session-id>       # last user/assistant/next off a transcript (zero token tax)
-agentmaster events -n 100           # tail the SQLite audit log
+install -m 0755 target/release/agentmaster ~/.local/bin/agentmaster
+agentmaster doctor
+```
 
-# steer
-agentmaster send workspace:96 run the tests        # one cmux agent
-agentmaster send dev:1.0 cargo nextest run         # one tmux pane
-agentmaster broadcast "weiter bitte" --tmux        # every live agent
-agentmaster broadcast "status?" --needs-input      # only cmux agents waiting on you
+Requires Rust 1.95+. macOS and Linux are the target environments.
 
-# goals (rehydrated by the TUI on import)
+## Quick Start
+
+```bash
+agentmaster doctor          # check data dir, PTY, runtimes, tmux/cmux
+agentmaster                 # launch the TUI
+agentmaster ls --json       # inspect discovered live agents headlessly
+agentmaster peek <id>       # read transcript last-user/assistant/next
+```
+
+Inside the TUI, press `d` to discover again, `S` to cycle sort, `/` to filter,
+`H` to hide noise, `f` to jump to the real cmux/tmux tab, and `?` for help.
+
+## CLI
+
+```bash
+# See
+agentmaster ls [--json]
+agentmaster goals [--json]
+agentmaster events -n 100
+agentmaster peek <session-id>
+
+# Steer
+agentmaster send workspace:96 run the tests
+agentmaster send dev:1.0 cargo nextest run
+agentmaster broadcast "status?" --needs-input
+agentmaster focus workspace:96
+
+# Goals and fan-out
 agentmaster goal payments-api ship checkout :: all e2e tests green
-agentmaster goal payments-api                      # (set via TUI key `g` too)
-
-# sessions (passthrough to session-restore) + fan-out
-agentmaster find "auth bug"                         # search all distilled sessions
-agentmaster dash --all                              # grouped session dashboard
-agentmaster start <id> [--here] [--focus]           # cold-start a session
-agentmaster batch tasks.md [--yes] [--model opus]   # spawn one seeded cmux ws per task
+agentmaster batch tasks.md --yes
 ```
 
 ## Keys
 
 | Key | Action |
 |-----|--------|
-| `1` `2` `3` | kanban / tree / logs view |
-| `h` `l` `Tab` | switch lane |
-| `j` `k` | select card |
-| `↵` | inspect agent (live tail + command + cwd) |
-| `n` | new agent — `<runtime> [task]`, e.g. `shell` or `claude fix the bug` |
-| `s` | send a line to the selected agent |
-| `K` | kill selected agent |
-| `/` | filter |
-| `?` | help · `q` quit |
+| `1` `2` `3` `4` | list / board / tree / logs |
+| `j` `k` | move selection |
+| `h` `l` | page in list or move lanes on board |
+| `S` | cycle sort |
+| `H` | hide stale/non-agent noise |
+| `/` | filter by title, task label, last line or goal |
+| `Enter` | inspect selected agent |
+| `f` | jump to the real cmux/tmux tab |
+| `s` | send a line |
+| `g` | set goal + optional definition of done |
+| `p` | refresh transcript peek |
+| `N` | desktop notifications on/off |
+| `d` | discover tmux panes + cmux workspaces |
+| `q` | quit |
 
-## Observability
+## Architecture
 
-Every state change and action is written to **two** sinks:
+agentmaster is one Rust binary. Render is a pure function of application state;
+mutation stays in `src/app.rs`.
 
-- `~/.agentmaster/agentmaster.db` — SQLite `events` table (queryable audit log)
-- `~/.agentmaster/logs/agentmaster.jsonl` — structured JSON traces (`tracing`)
+```text
+src/main.rs      CLI entry
+src/app.rs       event loop, state transitions, cmux/tmux orchestration
+src/ui.rs        ratatui rendering
+src/fleet.rs     Agent, Status, Lane, Fleet
+src/backend.rs   tmux + cmux adapters
+src/peek.rs      transcript resolution + zero-token digest
+src/store.rs     SQLite audit log, goals, seen-state
+src/state.rs     output -> status/progress heuristics
+src/pty.rs       native PTY backend
+```
 
-Filter the JSONL verbosity with `AGENTMASTER_LOG=debug`.
+Docs:
 
-## Status
+- [SPEC](docs/SPEC.md)
+- [Architecture ADR](docs/adr/0001-architecture.md)
+- [TUI Best Practices ADR](docs/adr/0002-tui-best-practices.md)
+- [Competitive Audit](docs/COMPETITIVE-AUDIT.md)
+- [Changelog](CHANGELOG.md)
 
-v0.1 — native-PTY backend, Kanban/Tree/Logs views, state detection, send/kill,
-full audit + JSONL observability. See `docs/SPEC.md` for the roadmap (adapters for
-tmux/cmux/rmux/kitty, SQLite mail bus, daemon + detach/reattach).
+## Development
 
-Built by Maxim Supersynergy.
+```bash
+just setup
+just check      # fmt check + clippy -D warnings + build
+just ci         # doctor + check + tests + release build
+```
+
+Release gate used for v0.17.0:
+
+```bash
+cargo fmt --check
+cargo nextest run
+cargo clippy --all-targets --all-features -- -D warnings
+cargo build --release
+```
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -1,35 +1,50 @@
-# agentmaster — agent guide
+# agentmaster — Agent Guide
 
-Rust 1.95, edition 2024, single binary. Kanban TUI that owns native PTYs to see +
-steer agents. Zero orchestration tax: state is **observed** from output, coordination
-is **on-disk** (SQLite), never paid in tokens.
+agentmaster is a Rust 1.95+ TUI/CLI command center for local coding-agent
+fleets: native PTYs, tmux panes and cmux workspaces. It optimizes for one human
+seeing and steering many agents with zero orchestration-token tax.
 
-## Layout
-- `src/main.rs` — CLI (`tui`/`doctor`/`events`/`find`/`dash`/`start`/`peek`/`batch`)
-- `src/app.rs` — state + event loop + state machine (ALL mutation here)
-- `src/ui.rs` — ratatui rendering (PURE function of `App`, no mutation)
-- `src/fleet.rs` — Agent / Status / Lane / Fleet (+ goal/progress/transcript)
-- `src/backend.rs` — tmux + cmux adapters (discover/capture/send/kill)
-- `src/pty.rs` — native PTY spawn + ANSI-stripping reader thread
-- `src/state.rs` — output → status heuristics + goal progress inference
-- `src/runtime.rs` — runtime name → (program, args) adapter
-- `src/store.rs` — SQLite audit log + mail bus + goals table
-- `src/peek.rs` — zero-tax transcript digest (last user/assistant/next)
-- `src/orch.rs` — orchestrator bridge: sr passthrough + batch fan-out
-- `src/obs.rs` — JSONL tracing + host metrics
+## Commands
 
-## Invariants (do not break)
-- `ui.rs` never mutates state. Render = `f(App)`.
-- Colors only via `status_color`/`kind_color` + the `C_*` constants. One meaning per color.
-- Every state change + action → `store.log(...)` AND a `tracing::` event.
-- Status is inferred from output (`state.rs`); never add a token-costing self-report path.
-- Every dynamic string is `trunc()`-ed to the real cell width.
-- See `docs/adr/0002-tui-best-practices.md` before touching the UI.
+```bash
+just check      # fmt check + clippy -D warnings + build
+just ci         # doctor + check + tests + release build
+cargo nextest run
+cargo run -- doctor
+cargo run       # launch TUI
+```
 
-## Gates (run before "done")
-`just check` (fmt + clippy -D warnings + build) for small edits; `just ci` for normal.
-Keep clippy at 0 warnings. Update `CHANGELOG.md` for any user-visible change.
+## Hard Rules
 
-## Verify the TUI
-Interactive, so drive it under a PTY (see the smoke test): spawn an agent, switch
-views, quit; assert exit 0 + audit trail in `agentmaster events`.
+- `src/ui.rs` renders only. Do not mutate application state from rendering code.
+- `src/app.rs` owns event handling, state transitions, discovery and orchestration.
+- Status must be observed from output, transcript state, cmux/tmux state, or local
+  process state. Do not add token-costing self-report paths.
+- Every user-visible behavior change needs focused tests and a `CHANGELOG.md`
+  entry.
+- Dynamic text in the TUI must be truncated or wrapped to the real cell width.
+- Do not commit local runtime data: `target/`, `.agentmaster/`, transcripts,
+  logs, generated scratch files.
+
+## Important Files
+
+- `src/app.rs` — event loop, filters, sorting, status transitions, cmux events.
+- `src/ui.rs` — ratatui list/board/tree/log/detail rendering.
+- `src/fleet.rs` — `Agent`, `Status`, `Lane`, persistence-facing fields.
+- `src/backend.rs` — tmux/cmux discovery and control.
+- `src/peek.rs` — transcript resolution and zero-token digest/title extraction.
+- `src/store.rs` — SQLite audit log, goals and seen-state.
+- `docs/adr/0002-tui-best-practices.md` — read before UI changes.
+
+## Release Checklist
+
+```bash
+cargo fmt --check
+cargo nextest run
+cargo clippy --all-targets --all-features -- -D warnings
+cargo build --release
+./target/release/agentmaster --version
+```
+
+For TUI behavior, verify under a real PTY when possible. `cmux events` children
+must not survive after quitting the TUI.

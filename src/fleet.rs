@@ -124,6 +124,15 @@ pub struct Agent {
     /// did it last actually respond / do something", read off disk, not inferred
     /// from polling. None until a transcript is resolved + stat'd.
     pub last_seen: Option<i64>,
+    /// Repo state from cmux's `git` tag (dirty / ahead / clean / none) — surfaced
+    /// so "needs a commit" is visible without leaving the board. None = unknown.
+    pub git: Option<String>,
+    /// Workflow phase from cmux's `phase` tag (e.g. tests-pass / commit).
+    pub phase: Option<String>,
+    /// Real task pulled from the transcript's first prompt, used as the display
+    /// title when the multiplexer title is a system fragment (`</task-…>`). None
+    /// when the title is already meaningful or no transcript is linked.
+    pub task_label: Option<String>,
 }
 
 impl Agent {
@@ -168,12 +177,73 @@ impl Agent {
             transcript: None,
             last_change: now,
             last_seen: None,
+            git: None,
+            phase: None,
+            task_label: None,
         }
     }
 
     /// True once this agent reached a terminal lane (done or dead).
     pub fn is_terminal(&self) -> bool {
         matches!(self.status, Status::Done | Status::Dead)
+    }
+
+    /// Stamp `last_seen` from the transcript mtime RIGHT NOW (don't wait for the
+    /// next housekeeping tick) and, for a quiet (non-working) agent, anchor the
+    /// in-state clock to that instant. Without this an imported agent shows
+    /// "blocked 2s" the moment it's discovered — resetting on every restart —
+    /// instead of the real "blocked 18m". Called at import once a transcript is
+    /// linked; the transcript mtime is the ground truth for last real activity.
+    pub fn anchor_time(&mut self) {
+        let Some(t) = self.transcript.as_deref() else {
+            return;
+        };
+        let Ok(secs) = std::fs::metadata(t)
+            .and_then(|m| m.modified())
+            .and_then(|mt| {
+                mt.duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            })
+        else {
+            return;
+        };
+        self.last_seen = Some(secs);
+        // Anchor the time-in-state clock to the last real activity — but only for
+        // quiet agents (a working agent's clock should keep running from now).
+        if !matches!(self.status, Status::Working)
+            && let Some(local) =
+                DateTime::from_timestamp(secs, 0).map(|dt| dt.with_timezone(&Local))
+            && local <= Local::now()
+        {
+            self.last_change = local;
+            self.last_activity = local;
+        }
+    }
+
+    /// Stable identity for cross-restart persistence: the backend ref, not the
+    /// title (which drifts as the agent works). `seen`/`save_seen` key on this so
+    /// "blocked 2h" survives a restart even for agents we can't transcript-link.
+    pub fn ref_key(&self) -> String {
+        match &self.source {
+            Source::Native => format!("native:{}", self.name),
+            Source::Tmux(t) => format!("tmux:{t}"),
+            Source::Cmux(w) => format!("cmux:{w}"),
+        }
+    }
+
+    /// Restore the time-in-state clock from a persisted `since` (epoch seconds).
+    /// Used at import when no transcript anchor is available, so time-in-state is
+    /// continuous across restarts instead of resetting to import time.
+    pub fn restore_state_since(&mut self, secs: i64) {
+        if let Some(local) = DateTime::from_timestamp(secs, 0).map(|dt| dt.with_timezone(&Local))
+            && local <= Local::now()
+        {
+            self.last_change = local;
+            if self.last_activity < local {
+                self.last_activity = local;
+            }
+        }
     }
 
     /// Seconds since the agent last wrote to its transcript — i.e. since its last
@@ -317,6 +387,25 @@ mod tests {
     fn in_status_secs_non_negative() {
         let a = agent();
         assert!(a.in_status_secs() >= 0);
+    }
+
+    #[test]
+    fn ref_key_is_stable_per_source() {
+        let mut a = agent();
+        a.source = Source::Cmux("workspace:96".into());
+        assert_eq!(a.ref_key(), "cmux:workspace:96");
+        a.source = Source::Tmux("main:1.2".into());
+        assert_eq!(a.ref_key(), "tmux:main:1.2");
+        a.source = Source::Native;
+        assert_eq!(a.ref_key(), "native:t");
+    }
+
+    #[test]
+    fn restore_state_since_backdates_the_clock() {
+        let mut a = agent();
+        let earlier = Local::now().timestamp() - 7200; // 2h ago
+        a.restore_state_since(earlier);
+        assert!(a.in_status_secs() >= 7000);
     }
 
     #[test]

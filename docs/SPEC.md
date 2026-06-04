@@ -19,43 +19,45 @@ orchestrator is needed to route or narrate — that removes the orchestration ta
 5. **Visibility = the product.** The board IS the state. If you can see it
    clearly, you don't need to pay an agent to tell you.
 
-## Architecture (v0.1, implemented)
+## Architecture (v0.17, implemented)
 
 ```
-main.rs        CLI: tui | doctor | events
- └ app.rs      App state + single-thread event loop + state machine
+main.rs        CLI: tui | doctor | ls | send | broadcast | focus | goals | peek | batch
+ └ app.rs      App state + event loop + cmux/tmux/native orchestration
     ├ fleet.rs Agent, Status, Lane, Fleet
-    ├ pty.rs   native PTY spawn + ANSI-stripping reader thread  ─┐ AppEvent
-    ├ state.rs output → status heuristics (block/review/done)    │ over mpsc
-    ├ runtime.rs runtime name → (program, args) adapter          │
-    ├ store.rs SQLite events + mail (audit / coordination)       │
-    ├ obs.rs   JSONL tracing + host metrics                      │
-    └ ui.rs    Kanban / Tree / Logs / Inspect / Help (pure draw)─┘
+    ├ backend.rs tmux + cmux discovery/control/capture
+    ├ peek.rs    transcript resolution + zero-tax digest/title extraction
+    ├ pty.rs     native PTY spawn + ANSI-stripping reader thread ─┐ AppEvent
+    ├ state.rs   output → status/progress heuristics              │ over mpsc
+    ├ runtime.rs runtime name → (program, args) adapter           │
+    ├ store.rs   SQLite events + goals + seen-state               │
+    ├ obs.rs     JSONL tracing + host metrics                     │
+    └ ui.rs      List / Board / Tree / Logs / Inspect (pure draw)─┘
 ```
 
-Threading: one reader thread per agent streams clean lines over a channel; the
-main thread drains the channel each tick, polls crossterm for keys, and redraws.
+Threading: one reader thread per native agent streams clean lines over a channel;
+backend refresh and `cmux events` run off-thread; the main thread drains events,
+polls crossterm for keys, and redraws.
 
 ## Backend matrix (target)
 
 | Class | Targets | Mechanism | Control |
 |-------|---------|-----------|---------|
 | Native PTY (**done**) | bare Linux, Ghostty, Alacritty, foot | `portable-pty` | full (owns pid) |
-| Multiplexer | tmux · zellij · rmux · herdr · cmux | send-keys / SDK / socket + capture | full (attach + persist) |
+| Multiplexer (**tmux/cmux done**) | tmux · cmux | send-keys / RPC / capture / events | full for discovered tabs |
+| Multiplexer (target) | zellij · rmux · herdr | SDK / socket + capture | full (attach + persist) |
 | Terminal IPC | kitty · wezterm · iTerm2 | `kitten @` / `wezterm cli` / py-API | send + list |
 | Spawn-only | Windows Terminal | `wt.exe` | start only |
 
 ## Roadmap
 
-- **S2** — multiplexer adapters (rmux SDK first, then cmux/tmux); `↵` true attach;
-  SQLite **mail bus** surfaced as a view; per-agent CPU/mem via `sysinfo`.
+- **S2** — cost/token tracking from transcripts; subagent-tree parsing; worktree
+  isolation where the backend provides per-agent repositories.
 - **S3** — daemon + socket API (detach/reattach, agents survive the client);
-  runtime adapters for codex/copilot/gemini; integrate `grepgod` (search across
-  panes) and `sr find` (recall/restore distilled sessions).
-- **S4** — lead→worker hierarchy (optional), git worktree isolation per worker,
-  tiered merge.
+  additional runtime adapters; richer mail-bus UI.
+- **S4** — lead→worker hierarchy (optional), tiered merge, richer activity feed.
 
-## Non-goals (v0.1)
+## Non-goals
 
-Full TTY passthrough/raw byte mirroring (send-line covers steering); cloud /
-sandboxed agents; web UI. All deferred.
+Full TTY passthrough/raw byte mirroring (send-line + focus covers steering);
+cloud-hosted agents; web UI; token-costing status self-reports.

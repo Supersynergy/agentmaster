@@ -98,6 +98,19 @@ pub enum AppEvent {
         /// normalized-title → transcript (dead/hibernated tabs, from the cmux
         /// snapshot's recorded session_id). Tried when the pid path misses.
         snap_transcripts: std::collections::HashMap<String, String>,
+        /// workspace:NN ref → transcript, from each workspace's resume_binding
+        /// checkpoint. Exact + stable-ref; the primary link for cmux agents.
+        checkpoints: std::collections::HashMap<String, String>,
+        /// workspace-UUID → ref, so live `cmux events` can resolve a status push
+        /// (keyed by UUID) back to a `workspace:NN` agent.
+        ws_uuids: std::collections::HashMap<String, String>,
+    },
+    /// Live status push from the `cmux events` stream (sidebar `set_status`), so
+    /// an agent's lane updates the instant cmux knows — no poll latency.
+    CmuxStatus {
+        uuid: Option<String>,
+        pid: Option<u32>,
+        status: String,
     },
     /// Transcribed voice text, ready to drop into the orchestrator bar.
     VoiceText(String),
@@ -122,6 +135,7 @@ pub enum Sort {
     Status,
     Stuck,
     Cache,
+    Quiet,
     Name,
 }
 
@@ -132,6 +146,7 @@ impl Sort {
             Sort::Status => "status",
             Sort::Stuck => "stuck",
             Sort::Cache => "cache",
+            Sort::Quiet => "quiet",
             Sort::Name => "name",
         }
     }
@@ -139,7 +154,8 @@ impl Sort {
         match self {
             Sort::Smart => Sort::Stuck,
             Sort::Stuck => Sort::Cache,
-            Sort::Cache => Sort::Status,
+            Sort::Cache => Sort::Quiet,
+            Sort::Quiet => Sort::Status,
             Sort::Status => Sort::Name,
             Sort::Name => Sort::Smart,
         }
@@ -183,6 +199,9 @@ pub struct App {
     pub input: String,
     pub input_kind: InputKind,
     pub filter: String,
+    /// List-view noise gate: hide stale idle rows and obvious imported shell tabs
+    /// (`⏱ Last login`, URLs) while keeping real blocked/working agents visible.
+    pub hide_noise: bool,
     pub status_msg: String,
     /// Orchestrator transcript (top strip) — what you told which agent.
     pub chat_log: Vec<String>,
@@ -195,6 +214,19 @@ pub struct App {
     /// Last known terminal rect, refreshed each frame for mouse hit-testing.
     area: Rect,
     tick: u64,
+    /// Auto-peek cache: the selected agent's last user/assistant/next-action read
+    /// off its transcript, so the detail panel shows what it last said without the
+    /// operator pressing `p`. Keyed by agent id; refreshed on selection change and
+    /// on a throttle so a live agent's panel stays current. Zero token cost.
+    peek_cache: Option<(u64, peek::Digest)>,
+    /// workspace-UUID → ref, refreshed on each discovery. Lets the live event
+    /// stream map a `set_status` (keyed by UUID) to its `workspace:NN` agent.
+    ws_uuid: std::collections::HashMap<String, String>,
+    /// Desktop notifications on key transitions (needs-you / done). Toggle with `N`.
+    pub notify_on: bool,
+    /// Epoch secs of the last desktop notification — a global throttle so a burst
+    /// of transitions can't spam Notification Center.
+    last_notify: i64,
 }
 
 /// Entry point for the `tui` subcommand.
@@ -208,12 +240,28 @@ pub fn run(dir: PathBuf) -> Result<()> {
     // Auto-discover on boot: tmux panes + cmux workspaces appear immediately,
     // no need to press `d` first. The scan is off-thread, so startup never blocks.
     app.discover_all();
+    // Tail cmux's live event stream so agent lanes update the instant cmux knows,
+    // instead of waiting for the next poll. Long-lived, self-reconnecting thread.
+    let events_pid = if backend::cmux_available() {
+        Some(spawn_cmux_events(app.tx.clone()))
+    } else {
+        None
+    };
 
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let res = app.main_loop(&mut terminal);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
+    // Reap the `cmux events --reconnect` child so it doesn't outlive the TUI.
+    if let Some(slot) = events_pid {
+        let pid = slot.load(std::sync::atomic::Ordering::Relaxed);
+        if pid != 0 {
+            let _ = std::process::Command::new("kill")
+                .arg(pid.to_string())
+                .output();
+        }
+    }
     app.store
         .log(None, "system", "stop", "agentmaster tui stopped");
     res
@@ -237,6 +285,7 @@ impl App {
             input: String::new(),
             input_kind: InputKind::None,
             filter: String::new(),
+            hide_noise: false,
             chat_log: vec![
                 "orchestrator ready — agents auto-discovered on boot.".into(),
                 "press [o talk], type  #N <message>  to steer agent N  ·  #* to broadcast.".into(),
@@ -248,7 +297,40 @@ impl App {
             refresh_inflight: false,
             area: Rect::new(0, 0, 0, 0),
             tick: 0,
+            peek_cache: None,
+            ws_uuid: std::collections::HashMap::new(),
+            notify_on: true,
+            last_notify: 0,
         }
+    }
+
+    /// Accessor for the rendered detail panel: the cached digest for `id`, if the
+    /// auto-peek currently holds one for that exact agent.
+    pub fn peek_for(&self, id: u64) -> Option<&peek::Digest> {
+        self.peek_cache
+            .as_ref()
+            .filter(|(i, _)| *i == id)
+            .map(|(_, d)| d)
+    }
+
+    /// Keep the auto-peek digest in sync with the current selection. Reads one
+    /// transcript off disk only when the selection changed or `force` is set (a
+    /// throttled refresh for the live agent), never every frame.
+    fn refresh_peek(&mut self, force: bool) {
+        let Some(id) = self.current_agent_id() else {
+            self.peek_cache = None;
+            return;
+        };
+        if !force && self.peek_cache.as_ref().is_some_and(|(i, _)| *i == id) {
+            return;
+        }
+        let digest = self
+            .fleet
+            .get(id)
+            .and_then(|a| a.transcript.clone())
+            .map(|p| peek::digest(std::path::Path::new(&p), 160))
+            .unwrap_or_default();
+        self.peek_cache = Some((id, digest));
     }
 
     /// Braille spinner frame — motion that means "this agent is actively working".
@@ -268,6 +350,8 @@ impl App {
             if self.tick.is_multiple_of(10) {
                 self.housekeep();
             }
+            // Keep the detail panel's auto-peek current (on-change + ~1.5s throttle).
+            self.refresh_peek(self.tick.is_multiple_of(30));
             let sz = terminal.size()?;
             self.area = Rect::new(0, 0, sz.width, sz.height);
             terminal.draw(|f| crate::ui::render(f, self))?;
@@ -404,16 +488,29 @@ impl App {
                 .into_iter()
                 .map(|(pid, p)| (pid, p.to_string_lossy().into_owned()))
                 .collect();
-            let (cmux, snap_transcripts) = if backend::cmux_available() {
-                // Snapshot pass recovers dead/hibernated tabs the live pid scan
-                // can't (no running process), keyed by normalized title.
+            let (cmux, snap_transcripts, checkpoints, ws_uuids) = if backend::cmux_available() {
+                // Exact stable-ref link via each workspace's resume_binding
+                // checkpoint (covers hibernated tabs) — the primary cmux path.
+                // Same pass yields the UUID→ref map the live event stream needs.
+                let (cps_paths, ws_uuids) = peek::cmux_checkpoints();
+                let cps = cps_paths
+                    .into_iter()
+                    .map(|(k, p)| (k, p.to_string_lossy().into_owned()))
+                    .collect();
+                // Snapshot pass: a title-keyed fallback for anything the checkpoint
+                // + pid paths miss (no running process, no resume_binding).
                 let snap = peek::snapshot_transcripts()
                     .into_iter()
                     .map(|(k, p)| (k, p.to_string_lossy().into_owned()))
                     .collect();
-                (backend::list_cmux(), snap)
+                (backend::list_cmux(), snap, cps, ws_uuids)
             } else {
-                (Vec::new(), std::collections::HashMap::new())
+                (
+                    Vec::new(),
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                )
             };
             let panes = h.join().unwrap_or_default();
             let _ = tx.send(AppEvent::Discovered {
@@ -421,8 +518,29 @@ impl App {
                 cmux,
                 transcripts,
                 snap_transcripts,
+                checkpoints,
+                ws_uuids,
             });
         });
+    }
+
+    /// Give a freshly-imported agent the best time-in-state clock available, then
+    /// persist its state so the next restart keeps it. Precedence: transcript mtime
+    /// (ground truth, set by `anchor_time`) → persisted `since` from a prior run →
+    /// import time. The persisted path is what makes "blocked 2h" stay 2h across a
+    /// restart even for agents we can't transcript-link.
+    fn anchor_or_restore(&self, a: &mut Agent) {
+        a.anchor_time();
+        let anchored = a.last_seen.is_some() && !matches!(a.status, Status::Working);
+        if !anchored
+            && let Some((st, since)) = self.store.load_seen(&a.ref_key())
+            && st == a.status.label()
+        {
+            a.restore_state_since(since);
+        }
+        self.store
+            .save_seen(&a.ref_key(), a.status.label(), a.last_change.timestamp());
+        label_task(a);
     }
 
     /// Add newly-discovered tmux panes + cmux workspaces (dedup by source ref).
@@ -433,18 +551,29 @@ impl App {
         cmux: Vec<backend::CmuxWorkspace>,
         transcripts: std::collections::HashMap<u32, String>,
         snap_transcripts: std::collections::HashMap<String, String>,
+        checkpoints: std::collections::HashMap<String, String>,
     ) {
         let mut added = 0;
         for p in panes {
             if p.command.contains("agentmaster") {
                 continue;
             }
-            if self
+            // Already imported? Backfill a still-missing transcript (a tab that had
+            // no resolvable session at first discover may resolve on a later scan)
+            // and re-anchor its clock, then skip re-adding.
+            if let Some(existing) = self
                 .fleet
                 .agents
-                .iter()
-                .any(|a| a.source == Source::Tmux(p.target.clone()))
+                .iter_mut()
+                .find(|a| a.source == Source::Tmux(p.target.clone()))
             {
+                if existing.transcript.is_none()
+                    && let Some(t) = p.pid.and_then(|pid| transcripts.get(&pid))
+                {
+                    existing.transcript = Some(t.clone());
+                    existing.anchor_time();
+                    label_task(existing);
+                }
                 continue;
             }
             let id = self.fleet.next_id;
@@ -466,6 +595,7 @@ impl App {
             a.pid = p.pid;
             a.status = Status::Idle;
             a.transcript = p.pid.and_then(|pid| transcripts.get(&pid)).cloned();
+            self.anchor_or_restore(&mut a);
             self.fleet.agents.push(a);
             self.rehydrate_goal(id, &name);
             self.store
@@ -476,12 +606,25 @@ impl App {
             if w.ws_ref.is_empty() {
                 continue;
             }
-            if self
+            // Already imported? Backfill a still-missing transcript from either the
+            // live-pid map or the snapshot, re-anchor the clock, then skip.
+            if let Some(existing) = self
                 .fleet
                 .agents
-                .iter()
-                .any(|a| a.source == Source::Cmux(w.ws_ref.clone()))
+                .iter_mut()
+                .find(|a| a.source == Source::Cmux(w.ws_ref.clone()))
             {
+                if existing.transcript.is_none() {
+                    existing.transcript = checkpoints
+                        .get(&w.ws_ref)
+                        .or_else(|| w.pid.and_then(|pid| transcripts.get(&pid)))
+                        .or_else(|| snap_transcripts.get(&peek::norm_title(&w.title)))
+                        .cloned();
+                    if existing.transcript.is_some() {
+                        existing.anchor_time();
+                        label_task(existing);
+                    }
+                }
                 continue;
             }
             let id = self.fleet.next_id;
@@ -502,12 +645,16 @@ impl App {
             a.source = Source::Cmux(w.ws_ref.clone());
             a.pid = w.pid;
             a.status = cmux_status(&w.status);
-            // Exact live pid first; fall back to the snapshot for dead tabs.
-            a.transcript = w
-                .pid
-                .and_then(|pid| transcripts.get(&pid))
+            a.git = w.git.clone();
+            a.phase = w.phase.clone();
+            // Resolution ladder: exact stable-ref checkpoint (covers hibernated
+            // tabs) → live pid → snapshot title match.
+            a.transcript = checkpoints
+                .get(&w.ws_ref)
+                .or_else(|| w.pid.and_then(|pid| transcripts.get(&pid)))
                 .or_else(|| snap_transcripts.get(&peek::norm_title(&w.title)))
                 .cloned();
+            self.anchor_or_restore(&mut a);
             a.push_line(w.title.clone());
             self.fleet.agents.push(a);
             self.rehydrate_goal(id, &name);
@@ -516,6 +663,82 @@ impl App {
             added += 1;
         }
         self.status_msg = format!("discovered {added} new agent(s) across tmux + cmux");
+    }
+
+    /// Apply a live status push from the `cmux events` stream: resolve the agent by
+    /// workspace UUID (exact, stable) or pid, update its lane the instant cmux knows
+    /// — no poll latency — and notify on the transitions that want the operator.
+    fn apply_live_status(&mut self, uuid: Option<String>, pid: Option<u32>, raw: &str) {
+        let ns = cmux_status(raw);
+        let id = uuid
+            .as_ref()
+            .and_then(|u| self.ws_uuid.get(u))
+            .and_then(|r| {
+                let src = Source::Cmux(r.clone());
+                self.fleet
+                    .agents
+                    .iter()
+                    .find(|a| a.source == src)
+                    .map(|a| a.id)
+            })
+            .or_else(|| {
+                pid.and_then(|p| {
+                    self.fleet
+                        .agents
+                        .iter()
+                        .find(|a| a.pid == Some(p))
+                        .map(|a| a.id)
+                })
+            });
+        let Some(id) = id else {
+            return;
+        };
+        let changed = match self.fleet.get_mut(id) {
+            Some(a) => {
+                if let Some(p) = pid {
+                    a.pid = Some(p); // keep pid fresh when matched by UUID
+                }
+                a.note_status(ns)
+            }
+            None => return,
+        };
+        if !changed {
+            return;
+        }
+        let Some(a) = self.fleet.get(id) else { return };
+        let (name, label, ref_key) = (a.name.clone(), a.status.label(), a.ref_key());
+        self.store.log(Some(id), &name, "state", label);
+        self.store
+            .save_seen(&ref_key, label, chrono::Local::now().timestamp());
+        tracing::info!(agent = id, status = label, "live status");
+        self.maybe_notify(ns, &name);
+    }
+
+    /// Desktop-notify the operator when an agent flips to a state that wants them —
+    /// blocked (NEEDS YOU) or done — throttled so a burst can't spam, and a no-op
+    /// when notifications are toggled off (`N`).
+    fn maybe_notify(&mut self, st: Status, name: &str) {
+        if !self.notify_on || !matches!(st, Status::Blocked | Status::Done) {
+            return;
+        }
+        let now = chrono::Local::now().timestamp();
+        if now - self.last_notify < 4 {
+            return;
+        }
+        self.last_notify = now;
+        let title = if matches!(st, Status::Blocked) {
+            "agentmaster · needs you"
+        } else {
+            "agentmaster · done"
+        };
+        let body: String = name
+            .rsplit(" · ")
+            .next()
+            .unwrap_or(name)
+            .chars()
+            .take(80)
+            .collect();
+        notify(title, &body);
     }
 
     /// Read the selected agent's transcript off disk and surface its last
@@ -601,7 +824,13 @@ impl App {
                 }
                 if let Some((name, ns)) = transition {
                     self.store.log(Some(id), &name, "state", ns.label());
+                    self.store.save_seen(
+                        &format!("native:{name}"),
+                        ns.label(),
+                        chrono::Local::now().timestamp(),
+                    );
                     tracing::info!(agent = id, status = ns.label(), "state change");
+                    self.maybe_notify(ns, &name);
                 }
                 if let Some((name, np)) = progressed {
                     self.store.save_progress(&name, np);
@@ -620,7 +849,7 @@ impl App {
             // --- results from off-thread worker tasks (never block the UI) ---
             AppEvent::CmuxSnapshot(snap) => {
                 self.refresh_inflight = false;
-                let mut changes: Vec<(u64, String, &'static str)> = Vec::new();
+                let mut changes: Vec<(u64, String, String, &'static str)> = Vec::new();
                 for a in self.fleet.agents.iter_mut() {
                     if let Source::Cmux(ws) = a.source.clone()
                         && let Some(w) = snap.iter().find(|w| w.ws_ref == ws)
@@ -628,7 +857,7 @@ impl App {
                         // note_status resets the in-state clock only on a real
                         // transition, so "blocked 18m" is meaningful.
                         if a.note_status(cmux_status(&w.status)) {
-                            changes.push((a.id, a.name.clone(), a.status.label()));
+                            changes.push((a.id, a.ref_key(), a.name.clone(), a.status.label()));
                         }
                         if !w.title.is_empty() && w.title != a.last_line {
                             a.push_line(w.title.clone());
@@ -636,10 +865,25 @@ impl App {
                         if a.pid.is_none() {
                             a.pid = w.pid;
                         }
+                        // Keep the rich git/phase tags fresh as the agent works.
+                        if w.git.is_some() {
+                            a.git = w.git.clone();
+                        }
+                        if w.phase.is_some() {
+                            a.phase = w.phase.clone();
+                        }
                     }
                 }
-                for (id, name, label) in changes {
+                let now = chrono::Local::now().timestamp();
+                for (id, ref_key, name, label) in changes {
                     self.store.log(Some(id), &name, "state", label);
+                    // Persist the new state so its clock survives a restart.
+                    self.store.save_seen(&ref_key, label, now);
+                    // Notify if this poll caught a transition the event stream
+                    // missed (note_status already deduped any double-fire).
+                    if let Some(st) = self.fleet.get(id).map(|a| a.status) {
+                        self.maybe_notify(st, &name);
+                    }
                 }
             }
             AppEvent::TmuxLine { target, line } => {
@@ -661,8 +905,16 @@ impl App {
                 cmux,
                 transcripts,
                 snap_transcripts,
+                checkpoints,
+                ws_uuids,
             } => {
-                self.apply_discovered(panes, cmux, transcripts, snap_transcripts);
+                if !ws_uuids.is_empty() {
+                    self.ws_uuid = ws_uuids;
+                }
+                self.apply_discovered(panes, cmux, transcripts, snap_transcripts, checkpoints);
+            }
+            AppEvent::CmuxStatus { uuid, pid, status } => {
+                self.apply_live_status(uuid, pid, &status);
             }
             AppEvent::VoiceText(text) => {
                 self.store.log(None, "voice", "transcribe", &text);
@@ -807,12 +1059,16 @@ impl App {
             .agents
             .iter()
             .filter(|a| {
-                f.is_empty()
-                    || a.name.to_lowercase().contains(&f)
-                    || a.last_line.to_lowercase().contains(&f)
-                    || a.goal
-                        .as_deref()
-                        .is_some_and(|g| g.to_lowercase().contains(&f))
+                (!self.hide_noise || !hide_noise_agent(a))
+                    && (f.is_empty()
+                        || a.name.to_lowercase().contains(&f)
+                        || a.last_line.to_lowercase().contains(&f)
+                        || a.task_label
+                            .as_deref()
+                            .is_some_and(|t| t.to_lowercase().contains(&f))
+                        || a.goal
+                            .as_deref()
+                            .is_some_and(|g| g.to_lowercase().contains(&f)))
             })
             .collect();
         // Rank used by Smart + as the tiebreaker everywhere: urgency order.
@@ -838,6 +1094,10 @@ impl App {
             }),
             Sort::Stuck => v.sort_by_key(|a| std::cmp::Reverse(a.in_status_secs())),
             Sort::Cache => v.sort_by_key(|a| a.cache_remaining_secs()),
+            // Longest-silent first; agents with no ground-truth time sink last.
+            Sort::Quiet => {
+                v.sort_by_key(|a| std::cmp::Reverse(a.last_response_secs().unwrap_or(-1)))
+            }
             Sort::Name => v.sort_by_key(|a| a.name.to_lowercase()),
         }
         v
@@ -1045,6 +1305,22 @@ impl App {
                 KeyCode::Char('?') => self.mode = Mode::Help,
                 // S cycles the List sort order (smart/stuck/cache/status/name).
                 KeyCode::Char('S') => self.sort = self.sort.next(),
+                KeyCode::Char('N') => {
+                    self.notify_on = !self.notify_on;
+                    self.status_msg = if self.notify_on {
+                        "🔔 desktop notifications ON (needs-you · done)".into()
+                    } else {
+                        "🔕 desktop notifications OFF".into()
+                    };
+                }
+                KeyCode::Char('H') => {
+                    self.hide_noise = !self.hide_noise;
+                    self.status_msg = if self.hide_noise {
+                        "noise hidden: stale idle + shell tabs".into()
+                    } else {
+                        "noise visible: showing every discovered row".into()
+                    };
+                }
                 KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                     if self.view == View::List {
                         self.nav_list(10); // page down
@@ -1332,6 +1608,107 @@ impl App {
     }
 }
 
+/// Tail cmux's live event stream forever, translating each sidebar `set_status`
+/// push into an `AppEvent::CmuxStatus`. Self-reconnects with a backoff if the
+/// stream drops (e.g. cmux restart). Read-only: `--no-ack`, no heartbeat noise.
+fn spawn_cmux_events(tx: Sender<AppEvent>) -> std::sync::Arc<std::sync::atomic::AtomicU32> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    // Holds the CURRENT child pid (0 = none) so `run` can kill it on exit; with
+    // `--reconnect` an orphaned child would otherwise tail cmux forever.
+    let pid_slot = Arc::new(AtomicU32::new(0));
+    let slot = pid_slot.clone();
+    std::thread::spawn(move || {
+        loop {
+            let spawned = std::process::Command::new("cmux")
+                .args([
+                    "events",
+                    "--category",
+                    "sidebar",
+                    "--no-heartbeat",
+                    "--no-ack",
+                    "--reconnect",
+                ])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            if let Ok(mut child) = spawned {
+                slot.store(child.id(), Ordering::Relaxed);
+                if let Some(out) = child.stdout.take() {
+                    use std::io::BufRead;
+                    for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                        if let Some((uuid, pid, status)) = peek::parse_set_status(&line)
+                            && tx.send(AppEvent::CmuxStatus { uuid, pid, status }).is_err()
+                        {
+                            let _ = child.kill();
+                            return; // UI gone — stop the thread + child.
+                        }
+                    }
+                }
+                let _ = child.wait();
+                slot.store(0, Ordering::Relaxed);
+            }
+            std::thread::sleep(Duration::from_secs(3)); // reconnect backoff
+        }
+    });
+    pid_slot
+}
+
+/// Give an agent a human-readable task title pulled from its transcript when its
+/// multiplexer title is a system fragment (`</task-notification>`, `## ▸ …`). Idempotent
+/// and cheap (head-only transcript read); a no-op once labelled or when the title
+/// is already meaningful / no transcript is linked.
+fn label_task(a: &mut Agent) {
+    if a.task_label.is_some() || !peek::is_fragment_title(&a.name) {
+        return;
+    }
+    if let Some(p) = a.transcript.clone() {
+        a.task_label = peek::first_prompt(std::path::Path::new(&p));
+    }
+}
+
+fn hide_noise_agent(a: &Agent) -> bool {
+    is_non_agent_shell_tab(a) || is_stale_idle(a)
+}
+
+fn is_stale_idle(a: &Agent) -> bool {
+    matches!(a.status, Status::Idle)
+        && a.last_response_secs().unwrap_or_else(|| a.in_status_secs()) > 24 * 60 * 60
+}
+
+fn is_non_agent_shell_tab(a: &Agent) -> bool {
+    if a.task_label
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty())
+    {
+        return false;
+    }
+    let title = a.name.rsplit(" · ").next().unwrap_or(&a.name).trim();
+    let clean = title.trim_start_matches('⏱').trim();
+    let shellish = a.runtime.eq_ignore_ascii_case("shell")
+        || a.name.starts_with('⏱')
+        || !matches!(a.source, Source::Native);
+    shellish
+        && (a.name.starts_with('⏱')
+            || clean.starts_with("http")
+            || clean.contains("Last login")
+            || clean.contains("Tips for getting started"))
+}
+
+/// Post a macOS desktop notification (best-effort, off-thread via `osascript`,
+/// no extra dependency). Failures are ignored — a missing notifier must never
+/// affect the TUI.
+fn notify(title: &str, body: &str) {
+    let title = title.to_string();
+    let body = body.replace('"', "'");
+    std::thread::spawn(move || {
+        let script = format!("display notification \"{body}\" with title \"{title}\"");
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .output();
+    });
+}
+
 /// Map a cmux agent-tag status string to our `Status`. The tags come from
 /// `cmux top --all` (e.g. "Running", "Needs input", "done") — the same words a
 /// human reads off the cmux tree, so this is observation, not a token report.
@@ -1380,8 +1757,85 @@ fn hit_test_geom(area: Rect, col: u16, row: u16) -> Option<(usize, Option<usize>
 mod tests {
     use super::*;
 
+    fn test_app() -> App {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "agentmaster-app-test-{}-{}.db",
+            std::process::id(),
+            chrono::Local::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+        ));
+        let store = Store::open(&p).unwrap();
+        let (tx, rx) = channel();
+        App::new(store, tx, rx)
+    }
+
     fn area() -> Rect {
         Rect::new(0, 0, 100, 44) // 5 lanes of 20 cols
+    }
+
+    #[test]
+    fn hide_noise_keeps_real_work_and_drops_stale_shell_tabs() {
+        let mut app = test_app();
+        let mut real = Agent::new(
+            1,
+            "🟣 Claude ⏸ · </task-notification>".into(),
+            "cmux".into(),
+            "cmux".into(),
+            vec![],
+            String::new(),
+        );
+        real.status = Status::Blocked;
+        real.task_label = Some("fix checkout deadlock".into());
+
+        let mut shell = Agent::new(
+            2,
+            "⏱ Last login: Thu May 28".into(),
+            "shell".into(),
+            "zsh".into(),
+            vec![],
+            String::new(),
+        );
+        shell.status = Status::Idle;
+
+        let mut stale = Agent::new(
+            3,
+            "old local helper".into(),
+            "shell".into(),
+            "zsh".into(),
+            vec![],
+            String::new(),
+        );
+        stale.status = Status::Idle;
+        stale.last_seen = Some(chrono::Local::now().timestamp() - 25 * 60 * 60);
+
+        app.fleet.agents = vec![real, shell, stale];
+
+        assert_eq!(app.sorted_agents().len(), 3);
+        app.hide_noise = true;
+
+        let shown: Vec<u64> = app.sorted_agents().into_iter().map(|a| a.id).collect();
+        assert_eq!(shown, vec![1]);
+    }
+
+    #[test]
+    fn text_filter_matches_visible_task_label() {
+        let mut app = test_app();
+        let mut a = Agent::new(
+            1,
+            "🟣 Claude ⏸ · </task-notification>".into(),
+            "cmux".into(),
+            "cmux".into(),
+            vec![],
+            String::new(),
+        );
+        a.task_label = Some("fix checkout deadlock".into());
+        app.fleet.agents.push(a);
+        app.filter = "checkout".into();
+
+        let shown: Vec<u64> = app.sorted_agents().into_iter().map(|a| a.id).collect();
+        assert_eq!(shown, vec![1]);
     }
 
     #[test]

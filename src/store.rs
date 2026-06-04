@@ -43,9 +43,46 @@ impl Store {
               progress INTEGER NOT NULL DEFAULT 0,
               updated  TEXT NOT NULL
             );
+            -- Time-in-state, keyed by a STABLE source ref (cmux:workspace:NN /
+            -- tmux:target / native:name) so "blocked 2h" survives an agentmaster
+            -- restart instead of resetting to import time. `since` = epoch secs the
+            -- agent entered `status`; `last` = epoch secs we last observed it there.
+            CREATE TABLE IF NOT EXISTS seen(
+              ref    TEXT PRIMARY KEY,
+              status TEXT NOT NULL,
+              since  INTEGER NOT NULL,
+              last   INTEGER NOT NULL
+            );
             "#,
         )?;
         Ok(Store { conn })
+    }
+
+    /// Record an observed status for a stable ref. On a real transition (status
+    /// differs from the stored one) the `since` clock restarts; an unchanged
+    /// status only bumps `last` (liveness). Cheap upsert, called on every change.
+    pub fn save_seen(&self, ref_: &str, status: &str, now: i64) {
+        let _ = self.conn.execute(
+            "INSERT INTO seen(ref, status, since, last) VALUES(?1,?2,?3,?3)
+             ON CONFLICT(ref) DO UPDATE SET
+               since = CASE WHEN status=?2 THEN since ELSE ?3 END,
+               status = ?2,
+               last = ?3",
+            params![ref_, status, now],
+        );
+    }
+
+    /// Restore time-in-state for a ref: `(status, since_epoch)` if known. The
+    /// caller uses `since` as `last_change` only when the persisted status still
+    /// matches what it just observed — so a stale row can't mis-date a new state.
+    pub fn load_seen(&self, ref_: &str) -> Option<(String, i64)> {
+        self.conn
+            .query_row(
+                "SELECT status, since FROM seen WHERE ref=?1",
+                params![ref_],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .ok()
     }
 
     /// Persist an agent's goal + definition-of-done, keyed by name so it survives
@@ -116,5 +153,43 @@ impl Store {
             out.extend(rows.flatten());
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_db() -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        p.push(format!("am-store-test-{n}.db"));
+        p
+    }
+
+    #[test]
+    fn seen_keeps_since_on_same_status_resets_on_change() {
+        let s = Store::open(&tmp_db()).unwrap();
+        s.save_seen("cmux:workspace:1", "blocked", 1000);
+        assert_eq!(
+            s.load_seen("cmux:workspace:1"),
+            Some(("blocked".into(), 1000))
+        );
+        // Same status observed later: `since` is preserved (the clock keeps running).
+        s.save_seen("cmux:workspace:1", "blocked", 1500);
+        assert_eq!(
+            s.load_seen("cmux:workspace:1"),
+            Some(("blocked".into(), 1000))
+        );
+        // A real transition restarts `since`.
+        s.save_seen("cmux:workspace:1", "working", 2000);
+        assert_eq!(
+            s.load_seen("cmux:workspace:1"),
+            Some(("working".into(), 2000))
+        );
+        assert_eq!(s.load_seen("cmux:workspace:404"), None);
     }
 }
