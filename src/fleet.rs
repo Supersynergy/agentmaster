@@ -120,6 +120,10 @@ pub struct Agent {
     /// state" — the operator's real signal (blocked 20s vs blocked 20m), which is
     /// meaningful even for imported agents whose start time we never owned.
     pub last_change: DateTime<Local>,
+    /// Epoch seconds of the agent's transcript mtime — the GROUND TRUTH for "when
+    /// did it last actually respond / do something", read off disk, not inferred
+    /// from polling. None until a transcript is resolved + stat'd.
+    pub last_seen: Option<i64>,
 }
 
 impl Agent {
@@ -163,12 +167,22 @@ impl Agent {
             progress: 0,
             transcript: None,
             last_change: now,
+            last_seen: None,
         }
     }
 
     /// True once this agent reached a terminal lane (done or dead).
     pub fn is_terminal(&self) -> bool {
         matches!(self.status, Status::Done | Status::Dead)
+    }
+
+    /// Seconds since the agent last wrote to its transcript — i.e. since its last
+    /// real response/activity. `None` if we have no transcript for it. This is the
+    /// honest answer to "when did the last response end" (ground truth = mtime),
+    /// not a guess from status polling.
+    pub fn last_response_secs(&self) -> Option<i64> {
+        self.last_seen
+            .map(|t| (Local::now().timestamp() - t).max(0))
     }
 
     /// Has the operator set a goal we can track progress against?
@@ -185,11 +199,13 @@ impl Agent {
     }
 
     /// Seconds left on this agent's Claude/Codex prompt cache (1h TTL), counting
-    /// down from the last generation. A WORKING agent is actively generating, so
-    /// its cache is hot (full window); otherwise it decays from the last activity.
-    /// At 0 the next turn pays full, uncached input cost — the reason to ping it.
+    /// down from the LAST RESPONSE. Anchored on the transcript mtime when we have
+    /// it (ground truth); otherwise falls back to status (working = hot) / the
+    /// observed idle time. At 0 the next turn pays full, uncached input cost.
     pub fn cache_remaining_secs(&self) -> i64 {
-        if matches!(self.status, Status::Working) {
+        if let Some(since) = self.last_response_secs() {
+            (3600 - since).max(0)
+        } else if matches!(self.status, Status::Working) {
             3600
         } else {
             (3600 - self.idle_secs()).max(0)

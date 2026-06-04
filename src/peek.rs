@@ -13,6 +13,9 @@ pub struct Digest {
     pub last_user: String,
     pub last_assistant: String,
     pub next_action: String,
+    /// ISO-8601 timestamp of the last assistant message — when the agent last
+    /// actually responded. The honest "last response" time.
+    pub last_assistant_ts: Option<String>,
 }
 
 /// Pull the plain text out of a Claude-Code `message.content` field, which may be
@@ -52,12 +55,90 @@ pub fn digest(path: &Path, n: usize) -> Digest {
         match typ {
             // Skip injected hook/system blocks that start with a tag.
             "user" if !text.trim_start().starts_with('<') => d.last_user = text,
-            "assistant" => d.last_assistant = text,
+            "assistant" => {
+                d.last_assistant = text;
+                d.last_assistant_ts = ev
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
             _ => {}
         }
     }
     d.next_action = next_action(&d.last_assistant, &d.last_user);
     d
+}
+
+/// Normalize a cmux workspace title to a stable match key: drop the leading
+/// glyph/agent/status decoration (everything up to the last ` · `) and any
+/// trailing ` [ref]`, lowercased. Robust to the status glyph drifting between a
+/// snapshot read and a `cmux top` read.
+pub fn norm_title(s: &str) -> String {
+    let t = s.rsplit_once(" · ").map(|(_, b)| b).unwrap_or(s).trim();
+    let t = match (t.rfind(" ["), t.ends_with(']')) {
+        (Some(i), true) => &t[..i],
+        _ => t,
+    };
+    t.trim().to_lowercase()
+}
+
+/// Map each live cmux workspace (by normalized title) to its Claude transcript.
+/// Refreshes the cmux snapshot first (≈90ms) so just-spawned sessions are seen,
+/// then reads `name → session_id` from it and resolves the transcript path.
+pub fn cmux_transcripts() -> std::collections::HashMap<String, PathBuf> {
+    use std::collections::HashMap;
+    let mut map = HashMap::new();
+    // Best-effort fresh snapshot; ignore failure (we then read whatever exists).
+    let _ = std::process::Command::new("cmux-snapshot").output();
+    let Ok(home) = std::env::var("HOME") else {
+        return map;
+    };
+    let dir = PathBuf::from(&home).join(".cmux-snapshots");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return map;
+    };
+    let latest = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
+        .max_by_key(|p| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .ok()
+                .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default())
+        });
+    let Some(latest) = latest else { return map };
+    let Ok(text) = std::fs::read_to_string(&latest) else {
+        return map;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return map;
+    };
+    for ws in v
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(name) = ws.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let key = norm_title(name);
+        let surfaces = ws
+            .pointer("/layout/surfaces")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for s in surfaces {
+            if let Some(sid) = s.get("session_id").and_then(Value::as_str)
+                && let Some(p) = resolve(sid)
+            {
+                map.insert(key.clone(), p);
+                break;
+            }
+        }
+    }
+    map
 }
 
 /// Heuristic "what's the next move": pull an explicit next-step/TODO/checkbox/
@@ -141,6 +222,19 @@ pub fn resolve(id_or_path: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn norm_title_matches_across_glyph_drift() {
+        // snapshot read and `cmux top` read may show a different status glyph —
+        // both must normalize to the same key.
+        assert_eq!(norm_title("🟣 Claude ▶ · kill dead code"), "kill dead code");
+        assert_eq!(norm_title("🟣 Claude ✓ · kill dead code"), "kill dead code");
+        assert_eq!(
+            norm_title("🧠 Codex 🧪 · score projects [ws:5]"),
+            "score projects"
+        );
+        assert_eq!(norm_title("plain"), "plain");
+    }
 
     #[test]
     fn digests_user_and_assistant() {

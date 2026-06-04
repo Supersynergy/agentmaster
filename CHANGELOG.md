@@ -2,6 +2,33 @@
 
 All notable changes to agentmaster are documented here. Newest first.
 
+## [0.10.0] — 2026-06-04
+
+Honest times + full mouse. The board now knows *when each agent last actually
+responded* — read off its transcript, not guessed from polling — and everything
+is operable with the mouse and the wheel.
+
+### Added
+- **Real "last response" time** (`fleet::last_seen` / `last_response_secs`): each
+  cmux/Claude agent is linked to its session transcript (the cmux snapshot's
+  `session_id`, refreshed on discovery, resolved to `~/.claude/projects/**.jsonl`),
+  and its mtime is the ground-truth last-activity clock. The list shows `↩ 14m`;
+  the detail pane shows `↩ last response 14m ago (14:32)`. Verified: 28/28
+  snapshot sessions resolved to real transcripts with accurate ages.
+- **Cache TTL now anchored on the real last response** (transcript mtime) instead
+  of a status guess — so `🧊` countdowns are trustworthy.
+- **Mouse everywhere**: click the list **column header** → cycle sort; click the
+  **detail pane** → open the agent inside; **wheel scrolls** the list, the board,
+  and now the **inspect output** (also `j`/`k` in inspect); click a row → select,
+  again → jump to its tab. Toolbar + chat pane already clickable.
+
+### Notes
+- Agents not present in the cmux snapshot (e.g. not-yet-indexed) fall back to the
+  observed time-in-state — no worse than before, real times where available.
+- fmt clean, clippy `-D warnings` 0, **29/29 tests** (+norm_title match key).
+  tmux capture confirmed the `↩` column + correct "(no transcript linked)"
+  fallback for plain shell panes.
+
 ## [0.9.0] — 2026-06-04
 
 A genuinely usable overview for a big fleet — every agent reachable, dense and

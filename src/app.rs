@@ -88,9 +88,12 @@ pub enum AppEvent {
         line: String,
     },
     /// Result of a discovery scan (raw lists; the main thread dedups + adds).
+    /// `transcripts` maps a normalized cmux title → its Claude transcript path,
+    /// so imported agents get a real "last response" clock.
     Discovered {
         panes: Vec<backend::ExternalPane>,
         cmux: Vec<backend::CmuxWorkspace>,
+        transcripts: std::collections::HashMap<String, String>,
     },
     /// Transcribed voice text, ready to drop into the orchestrator bar.
     VoiceText(String),
@@ -171,6 +174,8 @@ pub struct App {
     /// derived from `sel` each frame, so it always keeps the selection on screen.
     pub sel: usize,
     pub sort: Sort,
+    /// Inspect-view output scrollback: how many lines up from the tail. 0 = live.
+    pub inspect_scroll: usize,
     pub input: String,
     pub input_kind: InputKind,
     pub filter: String,
@@ -224,6 +229,7 @@ impl App {
             card_idx: 0,
             sel: 0,
             sort: Sort::Smart,
+            inspect_scroll: 0,
             input: String::new(),
             input_kind: InputKind::None,
             filter: String::new(),
@@ -286,12 +292,23 @@ impl App {
             .iter()
             .filter_map(|&p| self.metrics.proc_stats(p).map(|(c, m)| (p, c, m)))
             .collect();
+        // Refresh transcript mtimes (the real "last response" clock) ~1.5s, cheap:
+        // one stat() per agent that has a resolved transcript.
+        let refresh_seen = self.tick.is_multiple_of(30);
         for a in self.fleet.agents.iter_mut() {
             if let Some(pid) = a.pid
                 && let Some(&(_, cpu, mem)) = stats.iter().find(|(p, _, _)| *p == pid)
             {
                 a.cpu = cpu;
                 a.mem_bytes = mem;
+            }
+            if refresh_seen
+                && let Some(t) = &a.transcript
+                && let Ok(meta) = std::fs::metadata(t)
+                && let Ok(mtime) = meta.modified()
+                && let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH)
+            {
+                a.last_seen = Some(dur.as_secs() as i64);
             }
             if matches!(a.source, Source::Native) {
                 state::idle_sweep(a, 20);
@@ -377,13 +394,23 @@ impl App {
                     Vec::new()
                 }
             });
-            let cmux = if backend::cmux_available() {
-                backend::list_cmux()
+            let (cmux, transcripts) = if backend::cmux_available() {
+                // Resolve each workspace's transcript (refreshes the snapshot once),
+                // so the list can show a real last-response time per agent.
+                let t = peek::cmux_transcripts()
+                    .into_iter()
+                    .map(|(k, p)| (k, p.to_string_lossy().into_owned()))
+                    .collect();
+                (backend::list_cmux(), t)
             } else {
-                Vec::new()
+                (Vec::new(), std::collections::HashMap::new())
             };
             let panes = h.join().unwrap_or_default();
-            let _ = tx.send(AppEvent::Discovered { panes, cmux });
+            let _ = tx.send(AppEvent::Discovered {
+                panes,
+                cmux,
+                transcripts,
+            });
         });
     }
 
@@ -393,6 +420,7 @@ impl App {
         &mut self,
         panes: Vec<backend::ExternalPane>,
         cmux: Vec<backend::CmuxWorkspace>,
+        transcripts: std::collections::HashMap<String, String>,
     ) {
         let mut added = 0;
         for p in panes {
@@ -461,6 +489,7 @@ impl App {
             a.source = Source::Cmux(w.ws_ref.clone());
             a.pid = w.pid;
             a.status = cmux_status(&w.status);
+            a.transcript = transcripts.get(&peek::norm_title(&w.title)).cloned();
             a.push_line(w.title.clone());
             self.fleet.agents.push(a);
             self.rehydrate_goal(id, &name);
@@ -609,8 +638,12 @@ impl App {
                     a.push_line(line);
                 }
             }
-            AppEvent::Discovered { panes, cmux } => {
-                self.apply_discovered(panes, cmux);
+            AppEvent::Discovered {
+                panes,
+                cmux,
+                transcripts,
+            } => {
+                self.apply_discovered(panes, cmux, transcripts);
             }
             AppEvent::VoiceText(text) => {
                 self.store.log(None, "voice", "transcribe", &text);
@@ -978,6 +1011,10 @@ impl App {
                 KeyCode::Char('g') => self.start_input(InputKind::Goal),
                 KeyCode::Char('p') => self.peek_selected(),
                 KeyCode::Char('f') => self.focus_source(),
+                KeyCode::Up | KeyCode::Char('k') => self.inspect_scroll += 3,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.inspect_scroll = self.inspect_scroll.saturating_sub(3)
+                }
                 _ => {}
             },
             Mode::Normal => match k.code {
@@ -1026,6 +1063,7 @@ impl App {
                     }
                 }
                 KeyCode::Enter if self.current_agent_id().is_some() => {
+                    self.inspect_scroll = 0;
                     self.mode = Mode::Inspect;
                 }
                 // `f` = jump to the agent's REAL tab (cmux/tmux), the second view:
@@ -1154,6 +1192,18 @@ impl App {
     // ---- mouse handling ---------------------------------------------------
 
     fn handle_mouse(&mut self, m: MouseEvent) {
+        // Inspect view: the wheel scrolls the output buffer; a click leaves it.
+        if self.mode == Mode::Inspect {
+            match m.kind {
+                MouseEventKind::ScrollUp => self.inspect_scroll += 3,
+                MouseEventKind::ScrollDown => {
+                    self.inspect_scroll = self.inspect_scroll.saturating_sub(3)
+                }
+                MouseEventKind::Down(MouseButton::Left) => self.mode = Mode::Normal,
+                _ => {}
+            }
+            return;
+        }
         if self.mode != Mode::Normal {
             return;
         }
@@ -1181,10 +1231,21 @@ impl App {
                 MouseEventKind::ScrollDown => self.nav_list(3),
                 MouseEventKind::ScrollUp => self.nav_list(-3),
                 MouseEventKind::Down(MouseButton::Left) => {
-                    let rows_top = HEADER_H + 2; // block border + column header
+                    let header_row = HEADER_H + 1; // the column header line
+                    let rows_top = HEADER_H + 2; // first agent row
                     let board_bottom = self.area.height.saturating_sub(CHAT_PANE_H + FOOTER_H);
                     let left_w = self.area.width * 62 / 100;
-                    if m.column < left_w && m.row >= rows_top && m.row + 1 < board_bottom {
+                    if m.row == header_row && m.column < left_w {
+                        // Click the column header → cycle the sort order.
+                        self.sort = self.sort.next();
+                    } else if m.column >= left_w && m.row >= header_row && m.row + 1 < board_bottom
+                    {
+                        // Click the detail pane → open the agent INSIDE the board.
+                        if self.current_agent_id().is_some() {
+                            self.inspect_scroll = 0;
+                            self.mode = Mode::Inspect;
+                        }
+                    } else if m.column < left_w && m.row >= rows_top && m.row + 1 < board_bottom {
                         let vis = board_bottom.saturating_sub(rows_top + 1) as usize;
                         let scroll = if self.sel >= vis {
                             self.sel + 1 - vis

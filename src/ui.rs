@@ -85,6 +85,13 @@ fn status_line(a: &Agent, col: Color) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Wall-clock HH:MM for an event that happened `secs_ago` seconds in the past.
+fn clock_at(secs_ago: i64) -> String {
+    (chrono::Local::now() - chrono::Duration::seconds(secs_ago))
+        .format("%H:%M")
+        .to_string()
+}
+
 /// Cache countdown MM:SS (or H:MM:SS for the full hour-plus window).
 fn fmt_countdown(s: i64) -> String {
     let s = s.max(0);
@@ -502,8 +509,13 @@ fn agent_row(a: &Agent, selected: bool, spin: char, width: usize) -> Line<'stati
             format!("{:<7} ", a.status.label()),
             Style::new().fg(col).patch(sel_bg),
         ),
+        // Real "last response" age (transcript mtime) when known, else the
+        // observed time-in-state. The ↩ marks a ground-truth time.
         Span::styled(
-            format!("{:>5} ", fmt_dur(a.in_status_secs())),
+            match a.last_response_secs() {
+                Some(s) => format!("↩{:>5} ", fmt_dur(s)),
+                None => format!("{:>6} ", fmt_dur(a.in_status_secs())),
+            },
             Style::new().fg(C_DIM).patch(sel_bg),
         ),
         Span::styled(
@@ -562,6 +574,18 @@ fn detail_panel(f: &mut Frame, area: Rect, a: Option<&Agent>) {
                 Style::new().fg(cache_color(a.cache_remaining_secs())),
             ),
         ]),
+        // Real last-response time off the transcript mtime: when did this agent
+        // last actually do something? (the precise clock the user asked for)
+        Line::from(match a.last_response_secs() {
+            Some(s) => Span::styled(
+                format!("↩ last response {} ago  ({})", fmt_dur(s), clock_at(s)),
+                Style::new().fg(if s > 1800 { C_BLOCKED } else { C_WORKING }),
+            ),
+            None => Span::styled(
+                "↩ last response: (no transcript linked)",
+                Style::new().fg(C_FAINT),
+            ),
+        }),
     ];
     if a.has_goal() {
         lines.push(Line::from(vec![
@@ -870,11 +894,15 @@ fn inspect(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let h = out_slot.height as usize;
-    let start = a.output.len().saturating_sub(h);
+    // Scroll back through the buffer with the wheel / j-k (0 = live tail).
+    let max_scroll = a.output.len().saturating_sub(h);
+    let scroll = app.inspect_scroll.min(max_scroll);
+    let start = max_scroll - scroll;
     let lines: Vec<Line> = a
         .output
         .iter()
         .skip(start)
+        .take(h)
         .map(|l| Line::from(trunc(l, out_slot.width as usize)))
         .collect();
     let body = if lines.is_empty() {
