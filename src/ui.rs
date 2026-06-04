@@ -421,10 +421,18 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
 /// the board's cards cannot.
 fn list(f: &mut Frame, area: Rect, app: &App) {
     let agents = app.sorted_agents();
-    let cols =
-        Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(area);
+    // Responsive: a narrow terminal gets the full width as one compact, symbol-led
+    // column (the form Maxim asked for); a wide one keeps the detail pane on the
+    // right. Keeping the wide branch is also what keeps `detail_panel` live.
+    let wide = area.width >= 100;
+    let (list_area, detail_area) = if wide {
+        let cols = Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(area);
+        (cols[0], Some(cols[1]))
+    } else {
+        (area, None)
+    };
 
-    // ---- left: the agent table ----
     let noise = if app.hide_noise { "noise" } else { "all" };
     let title = format!(
         " agents {}  ·  sort:{} (S)  ·  H hide:{}  ·  / filter ",
@@ -434,7 +442,7 @@ fn list(f: &mut Frame, area: Rect, app: &App) {
     );
     // Scroll geometry up front so the position can live in the block's bottom
     // border instead of overlapping a data row. Borders take 2 rows, header 1.
-    let vis = (cols[0].height as usize).saturating_sub(3).max(1);
+    let vis = (list_area.height as usize).saturating_sub(3).max(1);
     let scroll = if app.sel >= vis { app.sel + 1 - vis } else { 0 };
     let mut lblock = Block::bordered()
         .title(title)
@@ -451,8 +459,8 @@ fn list(f: &mut Frame, area: Rect, app: &App) {
             .right_aligned(),
         );
     }
-    let linner = lblock.inner(cols[0]);
-    f.render_widget(lblock, cols[0]);
+    let linner = lblock.inner(list_area);
+    f.render_widget(lblock, list_area);
     if agents.is_empty() {
         f.render_widget(
             Paragraph::new("no agents — press d to discover, n to spawn")
@@ -462,21 +470,13 @@ fn list(f: &mut Frame, area: Rect, app: &App) {
         );
     } else {
         let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(linner);
-        // column header — aligned to the same title width the rows use.
-        let tw = (parts[1].width as usize).saturating_sub(40).max(10);
-        let header = format!(
-            "   {:<tw$} {:<6} {:<7} {:>5} {:>6} {:>4}",
-            "agent / task",
-            "kind",
-            "state",
-            "for",
-            "🧊 ttl",
-            "cpu",
-            tw = tw
-        );
+        // Legend, not a rigid column header — the row is symbol-led, not tabular.
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(header, Style::new().fg(C_FAINT))))
-                .style(Style::new().bg(Color::Indexed(235))),
+            Paragraph::new(Line::from(Span::styled(
+                "  state · 📁proj · agent · task — what it's doing · signals · ↩last · 🧊ttl",
+                Style::new().fg(C_FAINT),
+            )))
+            .style(Style::new().bg(Color::Indexed(235))),
             parts[0],
         );
         let w = parts[1].width as usize;
@@ -493,16 +493,158 @@ fn list(f: &mut Frame, area: Rect, app: &App) {
     }
 
     // ---- right: detail of the selected agent (+ its auto-peek digest) ----
-    let sel = agents.get(app.sel).copied();
-    let digest = sel.and_then(|a| app.peek_for(a.id));
-    detail_panel(f, cols[1], sel, digest);
+    if let Some(da) = detail_area {
+        let sel = agents.get(app.sel).copied();
+        let digest = sel.and_then(|a| app.peek_for(a.id));
+        detail_panel(f, da, sel, digest);
+    }
 }
 
 /// One dense row in the list. Fixed-width columns then the title fills the rest.
+/// Display width in terminal cells (emoji count as 2), so fixed columns stay
+/// aligned even when content mixes emoji and ASCII.
+fn cells(s: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    s.width()
+}
+
+/// Right-pad `s` with spaces to exactly `n` cells (truncating to fit if longer).
+fn pad_cells(s: &str, n: usize) -> String {
+    let w = cells(s);
+    if w == n {
+        return s.to_string();
+    }
+    if w < n {
+        return format!("{s}{}", " ".repeat(n - w));
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let cw = cells(&ch.to_string());
+        if used + cw > n {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    while cells(&out) < n {
+        out.push(' ');
+    }
+    out
+}
+
+/// A stable emoji per project, so the eye can group the fleet by repo at a glance.
+/// Substring match keeps it robust to path/casing variants; all icons are 2-cell.
+/// (Future: load an override map from `~/.config/agentmaster/icons.toml`.)
+fn project_icon(project: &str) -> &'static str {
+    let p = project.to_ascii_lowercase();
+    if p.is_empty() {
+        "  " // native shell, no repo
+    } else if p.contains("agentmaster") {
+        "🤖"
+    } else if p.contains("synapse") {
+        "🔮"
+    } else if p.contains("event") {
+        "🎫"
+    } else if p.contains("supermax") {
+        "⚡"
+    } else if p.contains("supersyn") {
+        "🌀"
+    } else if p.contains("cmux") {
+        "🧩"
+    } else if p.contains("lead") {
+        "🧲"
+    } else if p.contains("crm") {
+        "📇"
+    } else if p.contains("zeroclaw") {
+        "🦀"
+    } else if p.contains("achiev") {
+        "🏆"
+    } else {
+        "📁"
+    }
+}
+
+/// Claude vs Codex (vs any other runtime) as a short colored word — replaces the
+/// old 🟣/🧠 emoji. Color carries the identity; the word stays readable in a
+/// screenshot or logfile. Claude = warm amber, Codex = cool blue.
+fn agent_tag(a: &Agent) -> (String, Color) {
+    match agent_kind(a) {
+        "claude" => ("Claude".to_string(), Color::Indexed(215)),
+        "codex" => ("Codex".to_string(), Color::Indexed(75)),
+        other => (other.to_string(), C_DIM),
+    }
+}
+
+/// Per-agent signal glyphs — only the ones that currently apply, most-urgent
+/// first. Each carries info (waiting on you, uncommitted work, goal progress,
+/// workflow phase, long idle) so a glance says what each agent *needs*.
+fn agent_flags(a: &Agent) -> Vec<Span<'static>> {
+    let mut v: Vec<Span<'static>> = Vec::new();
+    // 1) waiting on you — the one thing that needs the operator now.
+    if matches!(a.status, Status::Blocked) {
+        let held = a.in_status_secs();
+        if held > 300 {
+            v.push(Span::styled(
+                format!("⏰{} ", fmt_dur(held)),
+                Style::new().fg(C_BLOCKED).bold(),
+            ));
+        } else {
+            v.push(Span::styled(
+                "🔔 ".to_string(),
+                Style::new().fg(C_BLOCKED).bold(),
+            ));
+        }
+    }
+    // 2) goal progress
+    if a.has_goal() {
+        v.push(Span::styled(
+            format!("🎯{}% ", a.progress),
+            Style::new().fg(progress_color(a.progress)),
+        ));
+    }
+    // 3) repo state — uncommitted / unpushed work waiting
+    if let Some(g) = a.git.as_deref() {
+        let (sym, col) = match g {
+            "dirty" => ("⎇dirty", C_BLOCKED),
+            "ahead" => ("⇡ahead", C_REVIEW),
+            "clean" => ("⎇clean", C_WORKING),
+            _ => ("⎇·", C_DIM),
+        };
+        v.push(Span::styled(format!("{sym} "), Style::new().fg(col)));
+    }
+    // 4) workflow phase
+    if let Some(p) = a.phase.as_deref() {
+        v.push(Span::styled(format!("◇{p} "), Style::new().fg(C_ACCENT)));
+    }
+    // 5) gone quiet for a long time
+    if matches!(a.status, Status::Idle) && a.in_status_secs() > 600 {
+        v.push(Span::styled(
+            format!("💤{} ", fmt_dur(a.in_status_secs())),
+            Style::new().fg(C_IDLE),
+        ));
+    }
+    v
+}
+
+/// One compact, symbol-led row: `status · 📁proj · agent · task · signals · ↩last · 🧊ttl`.
+/// Leading status glyph (1 cell, colored) says *what is happening*; the project
+/// icon and agent tag say *where* and *who*; the flags say *what it needs*; the
+/// right edge holds the real last-response age and the cache TTL.
 fn agent_row(a: &Agent, selected: bool, spin: char, width: usize) -> Line<'static> {
     let col = status_color(a.status);
     let glyph = status_glyph(a.status, spin);
-    let kind = agent_kind(a);
+    let sel_bg = if selected {
+        Style::new().bg(Color::Indexed(237))
+    } else {
+        Style::new()
+    };
+    let mark = if selected { "▸" } else { " " };
+
+    let (tag, tag_col) = agent_tag(a);
+    let proj = project_icon(&a.project);
+
+    // Right meta: real last-response age (transcript mtime) + cache TTL.
     let cache = a.cache_remaining_secs();
     let cache_txt = if matches!(a.status, Status::Working) {
         "hot".to_string()
@@ -511,62 +653,77 @@ fn agent_row(a: &Agent, selected: bool, spin: char, width: usize) -> Line<'stati
     } else {
         fmt_countdown(cache)
     };
-    // Title fills everything the fixed columns (kind+state+dur+cache+cpu ≈ 38) leave.
-    let title_w = width.saturating_sub(40).max(10);
-    let sel_bg = if selected {
-        Style::new().bg(Color::Indexed(237))
-    } else {
-        Style::new()
-    };
-    let mark = if selected { "▸" } else { " " };
     let cache_col = if matches!(a.status, Status::Working) {
         C_WORKING
     } else {
         cache_color(cache)
     };
-    Line::from(vec![
+    let (age_txt, age_col) = match a.last_response_secs() {
+        Some(s) => (
+            format!("↩{}", fmt_dur(s)),
+            if s > 1800 { C_BLOCKED } else { C_DIM },
+        ),
+        None => (fmt_dur(a.in_status_secs()), C_FAINT),
+    };
+    let time = format!("{age_txt}  🧊{cache_txt}");
+    let time_cells = cells(&time);
+
+    // Flags, capped to a fixed budget so the time block always aligns right.
+    const FLAG_BUDGET: usize = 14;
+    let mut acc = 0usize;
+    let mut flags: Vec<Span<'static>> = Vec::new();
+    for sp in agent_flags(a) {
+        let c = cells(&sp.content);
+        if acc + c > FLAG_BUDGET {
+            break;
+        }
+        acc += c;
+        flags.push(sp);
+    }
+    let flag_cells = acc;
+
+    // Left identity block = mark(1)+glyph(1)+sp(1) + proj(2)+sp(1) + tag(6)+sp(1) = 13.
+    let left_fixed = 13;
+    let title_w = width
+        .saturating_sub(left_fixed + FLAG_BUDGET + time_cells + 2)
+        .max(10);
+    let task = pad_cells(&display_title(a), title_w);
+
+    // Push the time block to the right edge: slack the flags didn't use.
+    let used = left_fixed + cells(&task) + flag_cells;
+    let gap = width.saturating_sub(used + time_cells).max(1);
+
+    let mut spans: Vec<Span<'static>> = vec![
         Span::styled(
             format!("{mark}{glyph} "),
             Style::new().fg(col).bold().patch(sel_bg),
         ),
+        Span::styled(format!("{proj} "), sel_bg),
+        Span::styled(pad_cells(&tag, 6), Style::new().fg(tag_col).patch(sel_bg)),
+        Span::styled(" ", sel_bg),
         Span::styled(
-            format!(
-                "{:<width$} ",
-                trunc(&display_title(a), title_w),
-                width = title_w
-            ),
+            task,
             if selected {
                 Style::new().fg(Color::White).bold().patch(sel_bg)
             } else {
                 Style::new().fg(Color::Indexed(252)).patch(sel_bg)
             },
         ),
-        Span::styled(
-            format!("{:<6} ", trunc(kind, 6)),
-            Style::new().fg(C_ACCENT).patch(sel_bg),
-        ),
-        Span::styled(
-            format!("{:<7} ", a.status.label()),
-            Style::new().fg(col).patch(sel_bg),
-        ),
-        // Real "last response" age (transcript mtime) when known, else the
-        // observed time-in-state. The ↩ marks a ground-truth time.
-        Span::styled(
-            match a.last_response_secs() {
-                Some(s) => format!("↩{:>5} ", fmt_dur(s)),
-                None => format!("{:>6} ", fmt_dur(a.in_status_secs())),
-            },
-            Style::new().fg(C_DIM).patch(sel_bg),
-        ),
-        Span::styled(
-            format!("🧊{cache_txt:>5} "),
-            Style::new().fg(cache_col).patch(sel_bg),
-        ),
-        Span::styled(
-            format!("{:>3.0}%", a.cpu),
-            Style::new().fg(C_FAINT).patch(sel_bg),
-        ),
-    ])
+    ];
+    for mut sp in flags {
+        sp.style = sp.style.patch(sel_bg);
+        spans.push(sp);
+    }
+    spans.push(Span::styled(" ".repeat(gap), sel_bg));
+    spans.push(Span::styled(
+        format!("{age_txt}  "),
+        Style::new().fg(age_col).patch(sel_bg),
+    ));
+    spans.push(Span::styled(
+        format!("🧊{cache_txt}"),
+        Style::new().fg(cache_col).patch(sel_bg),
+    ));
+    Line::from(spans)
 }
 
 /// Right pane: everything about the selected agent + the actions you can take.
@@ -1420,5 +1577,53 @@ mod tests {
         assert_eq!(fmt_countdown(65), "1:05");
         assert_eq!(fmt_countdown(3600), "1:00:00");
         assert_eq!(fmt_countdown(-5), "0:00");
+    }
+
+    #[test]
+    fn cells_counts_emoji_as_two() {
+        assert_eq!(cells("ab"), 2);
+        assert_eq!(cells("🤖"), 2);
+        assert_eq!(cells("🤖x"), 3);
+    }
+
+    #[test]
+    fn pad_cells_pads_and_truncates_by_display_width() {
+        assert_eq!(pad_cells("Codex", 6), "Codex ");
+        assert_eq!(pad_cells("Claude", 6), "Claude");
+        // emoji is 2 cells, so padding is width-aware, not char-aware
+        assert_eq!(cells(&pad_cells("🤖", 4)), 4);
+        // over-long is cut to fit the cell budget
+        assert_eq!(cells(&pad_cells("toolongname", 4)), 4);
+    }
+
+    #[test]
+    fn agent_tag_distinguishes_claude_and_codex() {
+        let mut a = Agent::new(
+            1,
+            "🟣 Claude ▶ · x".into(),
+            "cmux".into(),
+            "cmux".into(),
+            vec![],
+            String::new(),
+        );
+        assert_eq!(agent_tag(&a).0, "Claude");
+        a.name = "🧠 Codex ✓ · y".into();
+        assert_eq!(agent_tag(&a).0, "Codex");
+        // the two get different colors (that's the only identity signal now)
+        let claude_col = {
+            a.name = "🟣 Claude ▶ · x".into();
+            agent_tag(&a).1
+        };
+        a.name = "🧠 Codex ✓ · y".into();
+        assert_ne!(claude_col, agent_tag(&a).1);
+    }
+
+    #[test]
+    fn project_icon_maps_known_and_falls_back() {
+        assert_eq!(project_icon("agentmaster"), "🤖");
+        assert_eq!(project_icon("~/BASE/projects/synapse"), "🔮");
+        assert_eq!(project_icon("events-hub"), "🎫");
+        assert_eq!(project_icon("some-random-repo"), "📁");
+        assert_eq!(project_icon(""), "  ");
     }
 }

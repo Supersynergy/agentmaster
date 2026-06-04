@@ -2,6 +2,37 @@
 
 All notable changes to agentmaster are documented here. Newest first.
 
+## [0.18.0] — 2026-06-04
+
+Symbol-led list rows — read the fleet at a glance: *what is happening · where ·
+who · what it needs*, no identity emoji, no rigid table.
+
+### Added
+- **Project icons** (`project_icon`). A stable per-repo emoji (🤖 agentmaster,
+  🔮 synapse, 🎫 events-hub, ⚡ supermax, 🌀 supersyn, 🧩 cmux, 🧲 lead, 📇 crm,
+  🦀 zeroclaw, 🏆 achiever, 📁 other) so the eye groups the fleet by project.
+- **Per-agent signal flags** (`agent_flags`): `🔔`/`⏰<dur>` waiting-on-you,
+  `🎯N%` goal, `⎇dirty`/`⇡ahead`/`⎇clean` repo state, `◇<phase>` workflow phase,
+  `💤<dur>` long idle — only the ones that apply, most-urgent first, capped to a
+  fixed width so the right-edge time block always aligns.
+- **Cell-accurate column alignment** (`cells`/`pad_cells`, new `unicode-width`
+  dep) — emoji count as 2 cells, so mixed emoji/ASCII rows line up.
+
+### Changed
+- List row is now `status · 📁proj · agent · task — what it's doing · signals ·
+  ↩last · 🧊ttl`. The dynamic status glyph leads on the far left ("was passiert").
+- **Claude vs Codex** is a short colored word tag (`Claude` amber / `Codex` blue)
+  instead of the old `🟣`/`🧠` emoji — readable in screenshots and logs.
+- **Responsive layout**: a narrow terminal renders the list full-width as one
+  compact column; a wide one (≥100 cols) keeps the detail pane on the right.
+- The column header is replaced by a one-line legend (the row is symbol-led, not
+  tabular). The `kind`/`cpu` columns are dropped from the row.
+
+### Notes
+- fmt clean, clippy `-D warnings` 0, tests green (incl. new `cells`, `pad_cells`,
+  `agent_tag`, `project_icon` cases).
+- Next: load a project→icon override map from `~/.config/agentmaster/icons.toml`.
+
 ## [0.17.0] — 2026-06-04
 
 Signal filter pass — the list can now collapse stale/non-agent noise without
