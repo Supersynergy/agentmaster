@@ -2,6 +2,33 @@
 
 All notable changes to agentmaster are documented here. Newest first.
 
+## [0.8.0] — 2026-06-04
+
+Two views of every agent — steer it inside the board, or **jump to its real tab**
+and watch it live in its own session. Plus a more clickable board.
+
+### Added
+- **Jump to the live tab** (`f`, click a selected card, `[f tab]`, or
+  `agentmaster focus <ref>`): switches the cmux UI (`workspace.select` RPC, accepts
+  the short `workspace:NN` ref) or the tmux client (`select-window`/`select-pane`)
+  straight to the session where the agent runs. Native agents have no external tab.
+  Runs off-thread so the board never blocks.
+- **Two clear views**: `↵` opens the agent **inside** agentmaster (output + send a
+  line); `f`/click opens it **in its own tab**. The selected card spells both out.
+- **Headless** `agentmaster focus <ref>` for scripts.
+
+### Changed
+- Clicking an already-selected card now **jumps to its tab** (was: inspect inside).
+  Inspect-inside moved to `↵`/double-nothing — the two views are now distinct.
+- The selected card **pulses** (bright ↔ accent, thick border) so focus visibly
+  blinks, and its border shows the live action hint `↵ inspect · f→tab`.
+
+### Verified (tmux capture)
+- Footer renders `[f tab]`; selected card shows the pulsing thick border titled
+  `↵ inspect · f→tab` over `claude fix the auth bug` / `working for 4s 🧊1:00:00`.
+  `agentmaster focus workspace:3` switched the cmux UI live (then back). fmt clean,
+  clippy `-D warnings` 0, 28/28 tests, release reinstalled.
+
 ## [0.7.0] — 2026-06-04
 
 Open it and your fleet is just *there* — plus a live prompt-cache countdown so you

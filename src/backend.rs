@@ -123,6 +123,36 @@ pub fn cmux_send(ws_ref: &str, text: &str) {
         .output();
 }
 
+/// Switch the cmux UI to a workspace's tab — "jump to the live session". Uses the
+/// `workspace.select` RPC (accepts the short `workspace:NN` ref). Returns true if
+/// the call succeeded, so the caller can report a switch vs a stale ref.
+pub fn cmux_focus(ws_ref: &str) -> bool {
+    Command::new("cmux")
+        .args([
+            "rpc",
+            "workspace.select",
+            &format!("{{\"workspace_id\":\"{ws_ref}\"}}"),
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Switch the tmux client's view to a pane's window + select the pane — the tmux
+/// equivalent of "jump to the live session". `target` = `session:window.pane`.
+pub fn tmux_focus(target: &str) -> bool {
+    // window target = everything before the trailing `.pane`.
+    let window = target.rsplit_once('.').map(|(w, _)| w).unwrap_or(target);
+    let _ = Command::new("tmux")
+        .args(["select-window", "-t", window])
+        .output();
+    Command::new("tmux")
+        .args(["select-pane", "-t", target])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 fn extract_quoted(s: &str) -> String {
     match (s.find('"'), s.rfind('"')) {
         (Some(a), Some(b)) if b > a => s[a + 1..b].to_string(),

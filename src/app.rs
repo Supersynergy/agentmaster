@@ -36,6 +36,7 @@ pub enum ButtonId {
     Tree,
     Logs,
     Orchestrate,
+    Jump,
     New,
     Discover,
     Mouse,
@@ -43,11 +44,12 @@ pub enum ButtonId {
     Quit,
 }
 
-pub const TOOLBAR: [(ButtonId, &str); 9] = [
+pub const TOOLBAR: [(ButtonId, &str); 10] = [
     (ButtonId::Kanban, "[1 kanban]"),
     (ButtonId::Tree, "[2 tree]"),
     (ButtonId::Logs, "[3 logs]"),
     (ButtonId::Orchestrate, "[o talk]"),
+    (ButtonId::Jump, "[f tab]"),
     (ButtonId::New, "[+ new]"),
     (ButtonId::Discover, "[* find]"),
     (ButtonId::Mouse, "[m mouse]"),
@@ -456,6 +458,38 @@ impl App {
         self.status_msg = format!("peeked {name}");
     }
 
+    /// Jump to the selected agent's REAL tab — switch the cmux UI (or tmux client)
+    /// to the live session where it runs. The "second view": instead of steering
+    /// it inside the board, you land in its own session. Native agents have no
+    /// external tab to switch to. The switch runs off-thread so the UI never waits.
+    fn focus_source(&mut self) {
+        let Some(id) = self.current_agent_id() else {
+            return;
+        };
+        let (name, source) = match self.fleet.get(id) {
+            Some(a) => (a.name.clone(), a.source.clone()),
+            None => return,
+        };
+        match source {
+            Source::Cmux(ws) => {
+                let w = ws.clone();
+                std::thread::spawn(move || backend::cmux_focus(&w));
+                self.store.log(Some(id), &name, "focus", &ws);
+                self.status_msg = format!("→ jumped to {ws}  ({name})");
+            }
+            Source::Tmux(target) => {
+                let t = target.clone();
+                std::thread::spawn(move || backend::tmux_focus(&t));
+                self.store.log(Some(id), &name, "focus", &target);
+                self.status_msg = format!("→ switched to tmux {target}");
+            }
+            Source::Native => {
+                self.status_msg =
+                    format!("{name} is a native agent — open it inside (Enter), no external tab");
+            }
+        }
+    }
+
     // ---- pty events -------------------------------------------------------
 
     fn handle_pty(&mut self, ev: AppEvent) {
@@ -854,6 +888,7 @@ impl App {
                 KeyCode::Char('i') | KeyCode::Char('s') => self.start_input(InputKind::Send),
                 KeyCode::Char('g') => self.start_input(InputKind::Goal),
                 KeyCode::Char('p') => self.peek_selected(),
+                KeyCode::Char('f') => self.focus_source(),
                 _ => {}
             },
             Mode::Normal => match k.code {
@@ -885,6 +920,9 @@ impl App {
                 KeyCode::Enter if self.current_agent_id().is_some() => {
                     self.mode = Mode::Inspect;
                 }
+                // `f` = jump to the agent's REAL tab (cmux/tmux), the second view:
+                // see it live in its own session instead of inside the board.
+                KeyCode::Char('f') if self.current_agent_id().is_some() => self.focus_source(),
                 KeyCode::Char('n') => self.start_input(InputKind::NewAgent),
                 KeyCode::Char('o') => self.start_input(InputKind::Orchestrate),
                 KeyCode::Char('g') if self.current_agent_id().is_some() => {
@@ -950,6 +988,7 @@ impl App {
             ButtonId::Tree => self.view = View::Tree,
             ButtonId::Logs => self.view = View::Logs,
             ButtonId::Orchestrate => self.start_input(InputKind::Orchestrate),
+            ButtonId::Jump => self.focus_source(),
             ButtonId::New => self.start_input(InputKind::NewAgent),
             ButtonId::Discover => self.discover_all(),
             ButtonId::Mouse => self.toggle_mouse(),
@@ -1021,9 +1060,11 @@ impl App {
                         }
                         None => self.card_idx = 0,
                     }
-                    // Click an already-selected card again → open it.
+                    // Click an already-selected card again → JUMP to its real
+                    // cmux/tmux tab (the live session). Inspecting inside the board
+                    // is the Enter key; the click takes you to where it's running.
                     if same && self.current_agent_id().is_some() {
-                        self.mode = Mode::Inspect;
+                        self.focus_source();
                     }
                 }
             }

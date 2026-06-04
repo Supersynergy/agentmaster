@@ -109,6 +109,22 @@ pub fn list(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Jump to an agent's live tab. `workspace:NN` → cmux `workspace.select`,
+/// anything else → tmux `select-window`/`select-pane`.
+pub fn focus(reference: &str) -> Result<()> {
+    let ok = if reference.starts_with("workspace:") {
+        backend::cmux_focus(reference)
+    } else {
+        backend::tmux_focus(reference)
+    };
+    if ok {
+        println!("→ focused {reference}");
+        Ok(())
+    } else {
+        anyhow::bail!("could not focus {reference} (stale ref or backend unavailable)")
+    }
+}
+
 /// Resolve a ref to its backend and send a line. `workspace:NN` → cmux,
 /// `session:win.pane` (anything else) → tmux. Returns true if routed.
 pub fn send(reference: &str, msg: &str, dir: &Path) -> Result<()> {

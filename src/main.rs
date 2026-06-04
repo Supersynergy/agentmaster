@@ -104,6 +104,11 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Jump to an agent's live tab: switch the cmux UI / tmux client to it
+    Focus {
+        /// agent ref: cmux `workspace:NN` or tmux `session:window.pane`
+        target: String,
+    },
 }
 
 fn home() -> PathBuf {
@@ -173,6 +178,7 @@ fn main() -> anyhow::Result<()> {
             cli::goal_set(&name, g, dod, &dir)?
         }
         Cmd::Goals { json } => cli::goals_list(json, &dir)?,
+        Cmd::Focus { target } => cli::focus(&target)?,
     }
     Ok(())
 }

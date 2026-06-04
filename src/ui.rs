@@ -406,9 +406,10 @@ fn render_cards(f: &mut Frame, inner: Rect, agents: &[&Agent], focused: bool, ap
     let constraints: Vec<Constraint> = (0..max).map(|_| Constraint::Length(CARD_H)).collect();
     let slots = Layout::vertical(constraints).split(inner);
     let spin = app.spin();
+    let pulse = app.tick().is_multiple_of(2); // selection blink
     for (idx, agent) in agents.iter().take(max).enumerate() {
         let selected = focused && idx == app.card_idx;
-        card(f, slots[idx], agent, selected, &app.filter, spin);
+        card(f, slots[idx], agent, selected, &app.filter, spin, pulse);
     }
     if agents.len() > max {
         // Honesty over silent truncation: say how many cards are hidden.
@@ -429,26 +430,48 @@ fn render_cards(f: &mut Frame, inner: Rect, agents: &[&Agent], focused: bool, ap
     }
 }
 
-fn card(f: &mut Frame, area: Rect, a: &Agent, selected: bool, filter: &str, spin: char) {
+fn card(
+    f: &mut Frame,
+    area: Rect,
+    a: &Agent,
+    selected: bool,
+    filter: &str,
+    spin: char,
+    pulse: bool,
+) {
     let col = status_color(a.status);
     let dim = matches!(a.status, Status::Idle | Status::Dead);
     let matched = filter.is_empty()
         || a.name.to_lowercase().contains(&filter.to_lowercase())
         || a.last_line.to_lowercase().contains(&filter.to_lowercase());
 
+    // Selected card pulses (bright ↔ accent) so the focus visibly blinks — and
+    // its border spells out the two actions, so clicking feels intentional.
     let bstyle = if selected {
-        Style::new().fg(C_ACCENT).bold()
+        let c = if pulse { Color::White } else { C_ACCENT };
+        Style::new().fg(c).bold()
     } else if !matched {
         Style::new().fg(C_FAINT)
     } else {
         Style::new().fg(Color::Indexed(239))
     };
     let mut block = Block::bordered()
-        .border_type(BorderType::Rounded)
+        .border_type(if selected {
+            BorderType::Thick
+        } else {
+            BorderType::Rounded
+        })
         .border_style(bstyle);
-    // Selected card gets a subtle background — focus feedback, not color-only.
     if selected {
+        // Subtle bg + an action hint: Enter opens it inside, f/click jumps to the
+        // real session tab. Native agents have no tab, so only show the inspect cue.
         block = block.style(Style::new().bg(Color::Indexed(236)));
+        let hint = if matches!(a.source, Source::Native) {
+            " ↵ inspect ".to_string()
+        } else {
+            " ↵ inspect · f→tab ".to_string()
+        };
+        block = block.title(hint);
     }
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -537,7 +560,7 @@ fn inspect(f: &mut Frame, area: Rect, app: &App) {
     };
     let Some(a) = app.fleet.get(id) else { return };
     let title = format!(
-        " inspect: {} [{}] pid {} — Esc back · s send · g goal · p peek ",
+        " inspect: {} [{}] pid {} — Esc back · s send · f→live tab · g goal · p peek ",
         a.name,
         a.status.label(),
         a.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
@@ -832,10 +855,15 @@ fn help(f: &mut Frame, area: Rect) {
         head("Views"),
         Line::from("  1 kanban    2 tree    3 logs"),
         Line::from(""),
-        head("Navigate (kanban)"),
-        Line::from("  h / l / Tab   switch lane        j / k   select card        ↵   inspect"),
+        head("Navigate (kanban) — two views of an agent"),
         Line::from(
-            "  🖱  click a card to select · click again to open · wheel scrolls · m toggles mouse",
+            "  ↵   inspect INSIDE the board (output, send a line)        j / k   select card",
+        ),
+        Line::from(
+            "  f   JUMP to its real cmux/tmux tab (the live session)     h / l / Tab   lane",
+        ),
+        Line::from(
+            "  🖱  click a card to select · click it again → jump to its tab · wheel scrolls · m mouse",
         ),
         Line::from(""),
         head("Act"),
