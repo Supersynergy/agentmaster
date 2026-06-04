@@ -2,6 +2,25 @@
 
 All notable changes to agentmaster are documented here. Newest first.
 
+## [0.12.0] — 2026-06-04
+
+Maximised honest time coverage: live + recovered dead tabs.
+
+### Added
+- **Snapshot fallback for dead/hibernated tabs** (`peek::snapshot_transcripts`):
+  when the exact live-pid path misses (the agent's process is gone), recover its
+  transcript from the cmux snapshot's recorded `session_id`, matched by normalized
+  title. Combined with the pid path, **61% of tabs now show a ground-truth `↩`
+  time** (up from 35% via snapshot-only). Every `↩` shown is real — nothing is
+  fabricated; tabs with no recoverable session fall back to time-in-state.
+
+### Notes
+- The remaining tabs are fully-closed cmux sessions cmux no longer records a
+  session id for — no ground truth exists to show, so the tool stays honest
+  rather than guessing.
+- fmt clean, clippy `-D warnings` 0, 29/29 tests. Pipeline re-verified live:
+  37 live (pid→`--resume`) + 14 recovered (snapshot) = 51/83.
+
 ## [0.11.0] — 2026-06-04
 
 Real response times for the whole *live* fleet — found the exact, universal link

@@ -131,6 +131,78 @@ pub fn pid_transcripts() -> std::collections::HashMap<u32, PathBuf> {
     map
 }
 
+/// Normalize a cmux workspace title to a stable match key: drop the leading
+/// glyph/agent/status decoration (everything up to the last ` · `) and a trailing
+/// ` [ref]`, lowercased — robust to the status glyph drifting between reads.
+pub fn norm_title(s: &str) -> String {
+    let t = s.rsplit_once(" · ").map(|(_, b)| b).unwrap_or(s).trim();
+    let t = match (t.rfind(" ["), t.ends_with(']')) {
+        (Some(i), true) => &t[..i],
+        _ => t,
+    };
+    t.trim().to_lowercase()
+}
+
+/// Recover transcripts for DEAD / hibernated cmux tabs (no live pid) from the cmux
+/// snapshot, which records `session_id` per surface. Keyed by normalized title so
+/// the main thread can match it after the exact pid path misses. Refreshes the
+/// snapshot first (≈90ms) so it is current.
+pub fn snapshot_transcripts() -> std::collections::HashMap<String, PathBuf> {
+    use std::collections::HashMap;
+    let mut map = HashMap::new();
+    let _ = std::process::Command::new("cmux-snapshot").output();
+    let Ok(home) = std::env::var("HOME") else {
+        return map;
+    };
+    let dir = PathBuf::from(&home).join(".cmux-snapshots");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return map;
+    };
+    let Some(latest) = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
+        .max_by_key(|p| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .ok()
+                .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default())
+        })
+    else {
+        return map;
+    };
+    let Ok(text) = std::fs::read_to_string(&latest) else {
+        return map;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return map;
+    };
+    for ws in v
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(name) = ws.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let surfaces = ws
+            .pointer("/layout/surfaces")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for s in surfaces {
+            if let Some(sid) = s.get("session_id").and_then(Value::as_str)
+                && let Some(p) = resolve(sid)
+            {
+                map.insert(norm_title(name), p);
+                break;
+            }
+        }
+    }
+    map
+}
+
 /// Working directory of a process via `lsof` (the portable way on macOS).
 fn pid_cwd(pid: u32) -> Option<String> {
     let out = std::process::Command::new("lsof")

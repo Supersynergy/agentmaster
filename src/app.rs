@@ -93,7 +93,11 @@ pub enum AppEvent {
     Discovered {
         panes: Vec<backend::ExternalPane>,
         cmux: Vec<backend::CmuxWorkspace>,
+        /// pid → transcript (live agents, exact, from `ps --resume`).
         transcripts: std::collections::HashMap<u32, String>,
+        /// normalized-title → transcript (dead/hibernated tabs, from the cmux
+        /// snapshot's recorded session_id). Tried when the pid path misses.
+        snap_transcripts: std::collections::HashMap<String, String>,
     },
     /// Transcribed voice text, ready to drop into the orchestrator bar.
     VoiceText(String),
@@ -400,16 +404,23 @@ impl App {
                 .into_iter()
                 .map(|(pid, p)| (pid, p.to_string_lossy().into_owned()))
                 .collect();
-            let cmux = if backend::cmux_available() {
-                backend::list_cmux()
+            let (cmux, snap_transcripts) = if backend::cmux_available() {
+                // Snapshot pass recovers dead/hibernated tabs the live pid scan
+                // can't (no running process), keyed by normalized title.
+                let snap = peek::snapshot_transcripts()
+                    .into_iter()
+                    .map(|(k, p)| (k, p.to_string_lossy().into_owned()))
+                    .collect();
+                (backend::list_cmux(), snap)
             } else {
-                Vec::new()
+                (Vec::new(), std::collections::HashMap::new())
             };
             let panes = h.join().unwrap_or_default();
             let _ = tx.send(AppEvent::Discovered {
                 panes,
                 cmux,
                 transcripts,
+                snap_transcripts,
             });
         });
     }
@@ -421,6 +432,7 @@ impl App {
         panes: Vec<backend::ExternalPane>,
         cmux: Vec<backend::CmuxWorkspace>,
         transcripts: std::collections::HashMap<u32, String>,
+        snap_transcripts: std::collections::HashMap<String, String>,
     ) {
         let mut added = 0;
         for p in panes {
@@ -490,7 +502,12 @@ impl App {
             a.source = Source::Cmux(w.ws_ref.clone());
             a.pid = w.pid;
             a.status = cmux_status(&w.status);
-            a.transcript = w.pid.and_then(|pid| transcripts.get(&pid)).cloned();
+            // Exact live pid first; fall back to the snapshot for dead tabs.
+            a.transcript = w
+                .pid
+                .and_then(|pid| transcripts.get(&pid))
+                .or_else(|| snap_transcripts.get(&peek::norm_title(&w.title)))
+                .cloned();
             a.push_line(w.title.clone());
             self.fleet.agents.push(a);
             self.rehydrate_goal(id, &name);
@@ -643,8 +660,9 @@ impl App {
                 panes,
                 cmux,
                 transcripts,
+                snap_transcripts,
             } => {
-                self.apply_discovered(panes, cmux, transcripts);
+                self.apply_discovered(panes, cmux, transcripts, snap_transcripts);
             }
             AppEvent::VoiceText(text) => {
                 self.store.log(None, "voice", "transcribe", &text);
