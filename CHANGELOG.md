@@ -2,6 +2,38 @@
 
 All notable changes to agentmaster are documented here. Newest first.
 
+## [0.9.0] — 2026-06-04
+
+A genuinely usable overview for a big fleet — every agent reachable, dense and
+calm, with a golden-ratio master-detail layout. Designed around how a human reads
+it: "who needs me", scan, read, act.
+
+### Added
+- **List view (`1`, now the default)** — a dense, full-width, scrollable table of
+  EVERY agent beside a detail pane (golden-ratio 62/38 split). Columns: glyph ·
+  task · kind · state · time-in-state · 🧊cache-ttl · cpu. Scales to hundreds where
+  the board's cards can't. The detail pane shows the selected agent's title,
+  source, status, cache, goal+progress, and recent output, with the actions.
+- **Sort (`S` / `[S sort]`)** — cycle smart / stuck / cache / status / name.
+  `smart` floats what needs you (blocked, longest-waiting) to the top.
+- **Everything reachable** — List scrolls through the whole fleet (j/k, wheel,
+  h/l page); the board's lanes now scroll too (`↑N above · ↓N below` replaces the
+  dead-end `+N more…`). No more agents you can see but can't open.
+
+### Changed
+- **Killed the flicker**: removed the per-tick selection pulse and the NEED-YOU
+  strobe (both now stable), and slowed the working spinner to ~3×/s — a board of
+  77 agents no longer shimmers.
+- Views renumbered: `1` list · `2` board · `3` tree · `4` logs.
+- Cards/rows de-cluttered: titles strip cmux decoration AND the trailing
+  ` [ref]`; dropped the redundant prompt/last-line column; `cmux cmux` → a single
+  `claude`/`codex` kind badge.
+
+### Verified (tmux capture)
+- List rendered 4 agents with aligned columns + wide titles (no `[ref]` noise),
+  `▸` selection, live detail pane; `j` moved selection and the detail followed;
+  no flicker. fmt clean, clippy `-D warnings` 0, 28/28 tests, release reinstalled.
+
 ## [0.8.0] — 2026-06-04
 
 Two views of every agent — steer it inside the board, or **jump to its real tab**

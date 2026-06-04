@@ -1,6 +1,6 @@
 [package]
 name = "agentmaster"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.95"
 description = "See and steer every agent from one session — Kanban TUI, zero orchestration tax"

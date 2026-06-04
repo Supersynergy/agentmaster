@@ -32,27 +32,29 @@ pub const CHAT_PANE_H: u16 = 7;
 /// display width == char count == hit-test width.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ButtonId {
+    List,
     Kanban,
     Tree,
     Logs,
+    Sort,
     Orchestrate,
     Jump,
     New,
     Discover,
-    Mouse,
     Help,
     Quit,
 }
 
-pub const TOOLBAR: [(ButtonId, &str); 10] = [
-    (ButtonId::Kanban, "[1 kanban]"),
-    (ButtonId::Tree, "[2 tree]"),
-    (ButtonId::Logs, "[3 logs]"),
+pub const TOOLBAR: [(ButtonId, &str); 11] = [
+    (ButtonId::List, "[1 list]"),
+    (ButtonId::Kanban, "[2 board]"),
+    (ButtonId::Tree, "[3 tree]"),
+    (ButtonId::Logs, "[4 logs]"),
+    (ButtonId::Sort, "[S sort]"),
     (ButtonId::Orchestrate, "[o talk]"),
     (ButtonId::Jump, "[f tab]"),
     (ButtonId::New, "[+ new]"),
     (ButtonId::Discover, "[* find]"),
-    (ButtonId::Mouse, "[m mouse]"),
     (ButtonId::Help, "[? help]"),
     (ButtonId::Quit, "[q quit]"),
 ];
@@ -98,9 +100,43 @@ pub enum AppEvent {
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum View {
+    /// Dense, full-width, scrollable master-detail list of EVERY agent. Primary
+    /// view — scales to hundreds of agents where the board cannot.
+    List,
     Kanban,
     Tree,
     Logs,
+}
+
+/// Sort order for the List view. `Smart` floats what needs you to the top.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Sort {
+    Smart,
+    Status,
+    Stuck,
+    Cache,
+    Name,
+}
+
+impl Sort {
+    pub fn label(self) -> &'static str {
+        match self {
+            Sort::Smart => "smart",
+            Sort::Status => "status",
+            Sort::Stuck => "stuck",
+            Sort::Cache => "cache",
+            Sort::Name => "name",
+        }
+    }
+    pub fn next(self) -> Sort {
+        match self {
+            Sort::Smart => Sort::Stuck,
+            Sort::Stuck => Sort::Cache,
+            Sort::Cache => Sort::Status,
+            Sort::Status => Sort::Name,
+            Sort::Name => Sort::Smart,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -131,6 +167,10 @@ pub struct App {
     pub mode: Mode,
     pub lane_idx: usize,
     pub card_idx: usize,
+    /// List-view selection index (over the sorted+filtered agent list). Scroll is
+    /// derived from `sel` each frame, so it always keeps the selection on screen.
+    pub sel: usize,
+    pub sort: Sort,
     pub input: String,
     pub input_kind: InputKind,
     pub filter: String,
@@ -178,10 +218,12 @@ impl App {
             metrics: Metrics::new(),
             tx,
             rx,
-            view: View::Kanban,
+            view: View::List, // dense list scales to the whole fleet
             mode: Mode::Normal,
             lane_idx: 1, // focus WORKING by default
             card_idx: 0,
+            sel: 0,
+            sort: Sort::Smart,
             input: String::new(),
             input_kind: InputKind::None,
             filter: String::new(),
@@ -199,15 +241,12 @@ impl App {
         }
     }
 
-    /// Current housekeeping tick — used by the renderer for blink/animation.
-    pub fn tick(&self) -> u64 {
-        self.tick
-    }
-
     /// Braille spinner frame — motion that means "this agent is actively working".
+    /// Advances ~3×/s (tick/6), not every frame: enough to read "alive", slow
+    /// enough that a board of 77 spinners doesn't strobe.
     pub fn spin(&self) -> char {
-        const F: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-        F[(self.tick / 2) as usize % F.len()]
+        const F: [char; 8] = ['⠋', '⠙', '⠸', '⠴', '⠦', '⠇', '⠏', '⠹'];
+        F[(self.tick / 6) as usize % F.len()]
     }
 
     fn main_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
@@ -696,10 +735,60 @@ impl App {
     }
 
     pub fn current_agent_id(&self) -> Option<u64> {
+        if self.view == View::List {
+            return self.sorted_agents().get(self.sel).map(|a| a.id);
+        }
         self.fleet
             .in_lane(self.current_lane())
             .get(self.card_idx)
             .map(|a| a.id)
+    }
+
+    /// The List view's agent list: filtered by `filter`, ordered by `sort`. The
+    /// `Smart` order floats what needs you (blocked, longest-waiting) to the top,
+    /// then review, working, idle, queued, done — so the screen reads top-down by
+    /// "who needs me now". Pure read; no mutation.
+    pub fn sorted_agents(&self) -> Vec<&Agent> {
+        let f = self.filter.to_lowercase();
+        let mut v: Vec<&Agent> = self
+            .fleet
+            .agents
+            .iter()
+            .filter(|a| {
+                f.is_empty()
+                    || a.name.to_lowercase().contains(&f)
+                    || a.last_line.to_lowercase().contains(&f)
+                    || a.goal
+                        .as_deref()
+                        .is_some_and(|g| g.to_lowercase().contains(&f))
+            })
+            .collect();
+        // Rank used by Smart + as the tiebreaker everywhere: urgency order.
+        let rank = |s: Status| match s {
+            Status::Blocked => 0,
+            Status::Review => 1,
+            Status::Working => 2,
+            Status::Idle => 3,
+            Status::Queued => 4,
+            Status::Done => 5,
+            Status::Dead => 6,
+        };
+        match self.sort {
+            Sort::Smart => v.sort_by(|a, b| {
+                rank(a.status)
+                    .cmp(&rank(b.status))
+                    .then(b.in_status_secs().cmp(&a.in_status_secs()))
+            }),
+            Sort::Status => v.sort_by(|a, b| {
+                rank(a.status)
+                    .cmp(&rank(b.status))
+                    .then(a.name.cmp(&b.name))
+            }),
+            Sort::Stuck => v.sort_by_key(|a| std::cmp::Reverse(a.in_status_secs())),
+            Sort::Cache => v.sort_by_key(|a| a.cache_remaining_secs()),
+            Sort::Name => v.sort_by_key(|a| a.name.to_lowercase()),
+        }
+        v
     }
 
     // ---- input ------------------------------------------------------------
@@ -893,28 +982,47 @@ impl App {
             },
             Mode::Normal => match k.code {
                 KeyCode::Char('q') => self.should_quit = true,
-                KeyCode::Char('1') => self.view = View::Kanban,
-                KeyCode::Char('2') => self.view = View::Tree,
-                KeyCode::Char('3') => self.view = View::Logs,
+                KeyCode::Char('1') => self.view = View::List,
+                KeyCode::Char('2') => self.view = View::Kanban,
+                KeyCode::Char('3') => self.view = View::Tree,
+                KeyCode::Char('4') => self.view = View::Logs,
                 KeyCode::Char('?') => self.mode = Mode::Help,
+                // S cycles the List sort order (smart/stuck/cache/status/name).
+                KeyCode::Char('S') => self.sort = self.sort.next(),
                 KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
-                    self.lane_idx = (self.lane_idx + 1) % 5;
-                    self.card_idx = 0;
+                    if self.view == View::List {
+                        self.nav_list(10); // page down
+                    } else {
+                        self.lane_idx = (self.lane_idx + 1) % 5;
+                        self.card_idx = 0;
+                    }
                 }
                 KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-                    self.lane_idx = (self.lane_idx + 4) % 5;
-                    self.card_idx = 0;
+                    if self.view == View::List {
+                        self.nav_list(-10); // page up
+                    } else {
+                        self.lane_idx = (self.lane_idx + 4) % 5;
+                        self.card_idx = 0;
+                    }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    let n = self.fleet.in_lane(self.current_lane()).len();
-                    if n > 0 {
-                        self.card_idx = (self.card_idx + 1) % n;
+                    if self.view == View::List {
+                        self.nav_list(1);
+                    } else {
+                        let n = self.fleet.in_lane(self.current_lane()).len();
+                        if n > 0 {
+                            self.card_idx = (self.card_idx + 1) % n;
+                        }
                     }
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    let n = self.fleet.in_lane(self.current_lane()).len();
-                    if n > 0 {
-                        self.card_idx = (self.card_idx + n - 1) % n;
+                    if self.view == View::List {
+                        self.nav_list(-1);
+                    } else {
+                        let n = self.fleet.in_lane(self.current_lane()).len();
+                        if n > 0 {
+                            self.card_idx = (self.card_idx + n - 1) % n;
+                        }
                     }
                 }
                 KeyCode::Enter if self.current_agent_id().is_some() => {
@@ -984,14 +1092,15 @@ impl App {
 
     fn dispatch_button(&mut self, b: ButtonId) {
         match b {
+            ButtonId::List => self.view = View::List,
             ButtonId::Kanban => self.view = View::Kanban,
             ButtonId::Tree => self.view = View::Tree,
             ButtonId::Logs => self.view = View::Logs,
+            ButtonId::Sort => self.sort = self.sort.next(),
             ButtonId::Orchestrate => self.start_input(InputKind::Orchestrate),
             ButtonId::Jump => self.focus_source(),
             ButtonId::New => self.start_input(InputKind::NewAgent),
             ButtonId::Discover => self.discover_all(),
-            ButtonId::Mouse => self.toggle_mouse(),
             ButtonId::Help => self.mode = Mode::Help,
             ButtonId::Quit => self.should_quit = true,
         }
@@ -1004,6 +1113,26 @@ impl App {
         } else if self.card_idx >= n {
             self.card_idx = n - 1;
         }
+        // Keep the List selection in range too (the agent set shifts as statuses
+        // change and the sort reorders).
+        let ln = self.sorted_agents().len();
+        if ln == 0 {
+            self.sel = 0;
+        } else if self.sel >= ln {
+            self.sel = ln - 1;
+        }
+    }
+
+    /// Move the List-view selection by `delta` rows, clamped (no wrap — wrapping a
+    /// 77-row list is disorienting). Public render computes scroll from `sel`.
+    fn nav_list(&mut self, delta: isize) {
+        let n = self.sorted_agents().len();
+        if n == 0 {
+            self.sel = 0;
+            return;
+        }
+        let max = n as isize - 1;
+        self.sel = (self.sel as isize + delta).clamp(0, max) as usize;
     }
 
     /// Toggle mouse capture. Off hands the mouse back to the terminal for native
@@ -1044,6 +1173,37 @@ impl App {
                 self.start_input(InputKind::Orchestrate);
                 return;
             }
+        }
+        // List view: wheel scrolls the selection, a click selects a row and a
+        // second click on the same row jumps to its live tab.
+        if self.view == View::List {
+            match m.kind {
+                MouseEventKind::ScrollDown => self.nav_list(3),
+                MouseEventKind::ScrollUp => self.nav_list(-3),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let rows_top = HEADER_H + 2; // block border + column header
+                    let board_bottom = self.area.height.saturating_sub(CHAT_PANE_H + FOOTER_H);
+                    let left_w = self.area.width * 62 / 100;
+                    if m.column < left_w && m.row >= rows_top && m.row + 1 < board_bottom {
+                        let vis = board_bottom.saturating_sub(rows_top + 1) as usize;
+                        let scroll = if self.sel >= vis {
+                            self.sel + 1 - vis
+                        } else {
+                            0
+                        };
+                        let idx = scroll + (m.row - rows_top) as usize;
+                        if idx < self.sorted_agents().len() {
+                            let same = idx == self.sel;
+                            self.sel = idx;
+                            if same {
+                                self.focus_source();
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
         }
         if self.view != View::Kanban {
             return;
@@ -1159,11 +1319,11 @@ mod tests {
 
     #[test]
     fn toolbar_first_and_gap() {
-        // "[1 kanban]" = 10 chars at cols 0..10, then a space at 10, next starts 11.
-        assert_eq!(toolbar_hit(0), Some(ButtonId::Kanban));
+        // "[1 list]" = 8 chars at cols 0..8, then a space at 8, next starts 9.
+        assert_eq!(toolbar_hit(0), Some(ButtonId::List));
+        assert_eq!(toolbar_hit(7), Some(ButtonId::List));
+        assert_eq!(toolbar_hit(8), None); // separator space
         assert_eq!(toolbar_hit(9), Some(ButtonId::Kanban));
-        assert_eq!(toolbar_hit(10), None); // separator space
-        assert_eq!(toolbar_hit(11), Some(ButtonId::Tree));
     }
 
     #[test]

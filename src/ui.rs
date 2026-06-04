@@ -106,13 +106,21 @@ fn cache_color(rem: i64) -> Color {
     }
 }
 
-/// Strip cmux's own title decoration (`🟣 Claude ✓ · <task>`) down to the task.
-/// Our own glyph + color already convey agent + state, so the prefix is noise.
+/// Strip cmux's own title decoration (`🟣 Claude ✓ · <task>`) down to the task,
+/// and drop a trailing ` [target]` (the tmux pane/cmux ref we already show
+/// elsewhere). Our glyph + color convey agent + state, so the rest is noise.
 fn clean_title(s: &str) -> &str {
-    match s.split_once(" · ") {
+    let s = match s.split_once(" · ") {
         Some((_, task)) if !task.trim().is_empty() => task.trim(),
         _ => s.trim(),
+    };
+    // strip a trailing " [..]" address suffix
+    if let Some(idx) = s.rfind(" [")
+        && s.ends_with(']')
+    {
+        return s[..idx].trim_end();
     }
+    s
 }
 
 /// Agent kind (claude / codex / …) parsed from a cmux-style title prefix, for a
@@ -195,6 +203,7 @@ pub fn render(f: &mut Frame, app: &App) {
         Mode::Help => help(f, rows[1]),
         Mode::Inspect => inspect(f, rows[1], app),
         _ => match app.view {
+            View::List => list(f, rows[1], app),
             View::Kanban => kanban(f, rows[1], app),
             View::Tree => tree(f, rows[1], app),
             View::Logs => logs(f, rows[1], app),
@@ -297,17 +306,13 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(format!("✓ {} done", c[4]), Style::new().fg(C_DONE)),
     ];
     // Needs-you alert: blocked agents are the one thing that wants the operator
-    // right now. Make it loud (and blink on odd ticks) so it can't be missed.
+    // right now. Loud but STABLE (a solid badge, no strobe — flicker reads as
+    // noise, not urgency).
     if c[2] > 0 {
-        let style = Style::new().fg(Color::Black).bg(C_BLOCKED).bold();
         spans.push(Span::raw("   "));
         spans.push(Span::styled(
             format!(" ⏸ {} NEED YOU ", c[2]),
-            if app.tick().is_multiple_of(2) {
-                style
-            } else {
-                Style::new().fg(C_BLOCKED).bold()
-            },
+            Style::new().fg(Color::Black).bg(C_BLOCKED).bold(),
         ));
         // Of those, how many have been blocked long enough to be truly stuck —
         // the subset worth interrupting first.
@@ -327,7 +332,8 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
 
     let view_name = match app.view {
-        View::Kanban => "kanban",
+        View::List => "list",
+        View::Kanban => "board",
         View::Tree => "tree",
         View::Logs => "logs",
     };
@@ -357,6 +363,233 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
         ),
     ]);
     f.render_widget(Paragraph::new(l1), rows[1]);
+}
+
+// ---- list (master-detail, the primary overview) ---------------------------
+
+/// Dense, full-width, scrollable list of EVERY agent (left ~62%) beside a detail
+/// panel for the selected one (right ~38%) — the golden-ratio split a human reads
+/// top-down: "who needs me", scan, then read/act. Scales to the whole fleet where
+/// the board's cards cannot.
+fn list(f: &mut Frame, area: Rect, app: &App) {
+    let agents = app.sorted_agents();
+    let cols =
+        Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(area);
+
+    // ---- left: the agent table ----
+    let title = format!(
+        " agents {}  ·  sort:{} (S)  ·  / filter ",
+        agents.len(),
+        app.sort.label()
+    );
+    let lblock = Block::bordered()
+        .title(title)
+        .border_style(Style::new().fg(C_ACCENT));
+    let linner = lblock.inner(cols[0]);
+    f.render_widget(lblock, cols[0]);
+    if agents.is_empty() {
+        f.render_widget(
+            Paragraph::new("no agents — press d to discover, n to spawn")
+                .alignment(Alignment::Center)
+                .style(Style::new().fg(C_FAINT)),
+            linner,
+        );
+    } else {
+        let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(linner);
+        // column header — aligned to the same title width the rows use.
+        let tw = (parts[1].width as usize).saturating_sub(40).max(10);
+        let header = format!(
+            "   {:<tw$} {:<6} {:<7} {:>5} {:>6} {:>4}",
+            "agent / task",
+            "kind",
+            "state",
+            "for",
+            "🧊 ttl",
+            "cpu",
+            tw = tw
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(header, Style::new().fg(C_FAINT))))
+                .style(Style::new().bg(Color::Indexed(235))),
+            parts[0],
+        );
+        let w = parts[1].width as usize;
+        let vis = parts[1].height as usize;
+        // keep the selection on screen
+        let scroll = if app.sel >= vis { app.sel + 1 - vis } else { 0 };
+        let spin = app.spin();
+        let end = (scroll + vis).min(agents.len());
+        let rows: Vec<Line> = agents[scroll..end]
+            .iter()
+            .enumerate()
+            .map(|(i, a)| agent_row(a, scroll + i == app.sel, spin, w))
+            .collect();
+        f.render_widget(Paragraph::new(rows), parts[1]);
+        // scroll bar hint along the right edge
+        if agents.len() > vis {
+            let above = scroll;
+            let below = agents.len() - end;
+            let bar = Rect {
+                x: parts[1].x,
+                y: parts[1].y,
+                width: parts[1].width,
+                height: 1,
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!("↑{above}"),
+                    Style::new().fg(C_DIM),
+                )))
+                .alignment(Alignment::Right),
+                bar,
+            );
+            let _ = below; // shown in the footer hint of the detail panel
+        }
+    }
+
+    // ---- right: detail of the selected agent ----
+    detail_panel(f, cols[1], agents.get(app.sel).copied());
+}
+
+/// One dense row in the list. Fixed-width columns then the title fills the rest.
+fn agent_row(a: &Agent, selected: bool, spin: char, width: usize) -> Line<'static> {
+    let col = status_color(a.status);
+    let glyph = status_glyph(a.status, spin);
+    let kind = agent_kind(a);
+    let cache = a.cache_remaining_secs();
+    let cache_txt = if matches!(a.status, Status::Working) {
+        "hot".to_string()
+    } else if cache == 0 {
+        "cold".to_string()
+    } else {
+        fmt_countdown(cache)
+    };
+    // Title fills everything the fixed columns (kind+state+dur+cache+cpu ≈ 38) leave.
+    let title_w = width.saturating_sub(40).max(10);
+    let sel_bg = if selected {
+        Style::new().bg(Color::Indexed(237))
+    } else {
+        Style::new()
+    };
+    let mark = if selected { "▸" } else { " " };
+    let cache_col = if matches!(a.status, Status::Working) {
+        C_WORKING
+    } else {
+        cache_color(cache)
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("{mark}{glyph} "),
+            Style::new().fg(col).bold().patch(sel_bg),
+        ),
+        Span::styled(
+            format!(
+                "{:<width$} ",
+                trunc(clean_title(&a.name), title_w),
+                width = title_w
+            ),
+            if selected {
+                Style::new().fg(Color::White).bold().patch(sel_bg)
+            } else {
+                Style::new().fg(Color::Indexed(252)).patch(sel_bg)
+            },
+        ),
+        Span::styled(
+            format!("{:<6} ", trunc(kind, 6)),
+            Style::new().fg(C_ACCENT).patch(sel_bg),
+        ),
+        Span::styled(
+            format!("{:<7} ", a.status.label()),
+            Style::new().fg(col).patch(sel_bg),
+        ),
+        Span::styled(
+            format!("{:>5} ", fmt_dur(a.in_status_secs())),
+            Style::new().fg(C_DIM).patch(sel_bg),
+        ),
+        Span::styled(
+            format!("🧊{cache_txt:>5} "),
+            Style::new().fg(cache_col).patch(sel_bg),
+        ),
+        Span::styled(
+            format!("{:>3.0}%", a.cpu),
+            Style::new().fg(C_FAINT).patch(sel_bg),
+        ),
+    ])
+}
+
+/// Right pane: everything about the selected agent + the actions you can take.
+fn detail_panel(f: &mut Frame, area: Rect, a: Option<&Agent>) {
+    let block = Block::bordered()
+        .title(" detail — ↵ inspect · f tab · s send · g goal ")
+        .border_style(Style::new().fg(C_FAINT));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let Some(a) = a else {
+        f.render_widget(
+            Paragraph::new("nothing selected").style(Style::new().fg(C_FAINT)),
+            inner,
+        );
+        return;
+    };
+    let col = status_color(a.status);
+    let w = inner.width as usize;
+    let mut lines = vec![
+        Line::from(Span::styled(
+            trunc(clean_title(&a.name), w),
+            Style::new().fg(Color::White).bold(),
+        )),
+        Line::from(vec![
+            Span::styled(format!("{} ", agent_kind(a)), Style::new().fg(C_ACCENT)),
+            Span::styled(source_label(a), Style::new().fg(C_DIM)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!("{} ", a.status.label()),
+                Style::new().fg(col).bold(),
+            ),
+            Span::styled(
+                format!("for {}   ", fmt_dur(a.in_status_secs())),
+                Style::new().fg(C_DIM),
+            ),
+            Span::styled(
+                if matches!(a.status, Status::Working) {
+                    "🧊 cache hot".to_string()
+                } else if a.cache_remaining_secs() == 0 {
+                    "🧊 cache cold".to_string()
+                } else {
+                    format!("🧊 {}", fmt_countdown(a.cache_remaining_secs()))
+                },
+                Style::new().fg(cache_color(a.cache_remaining_secs())),
+            ),
+        ]),
+    ];
+    if a.has_goal() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("🎯 {} {:>3}% ", progress_bar(a.progress), a.progress),
+                Style::new().fg(progress_color(a.progress)).bold(),
+            ),
+            Span::styled(
+                trunc(a.goal.as_deref().unwrap_or(""), w.saturating_sub(20)),
+                Style::new().fg(Color::Indexed(250)),
+            ),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        "─ recent ─",
+        Style::new().fg(C_FAINT),
+    )));
+    let body_h = inner.height as usize;
+    let used = lines.len();
+    let tail = body_h.saturating_sub(used);
+    let start = a.output.len().saturating_sub(tail);
+    for l in a.output.iter().skip(start) {
+        lines.push(Line::from(Span::styled(
+            trunc(l.trim(), w),
+            Style::new().fg(C_DIM),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 // ---- kanban ---------------------------------------------------------------
@@ -402,54 +635,63 @@ fn render_cards(f: &mut Frame, inner: Rect, agents: &[&Agent], focused: bool, ap
         f.render_widget(p, inner);
         return;
     }
-    let max = (inner.height / CARD_H).max(1) as usize;
-    let constraints: Vec<Constraint> = (0..max).map(|_| Constraint::Length(CARD_H)).collect();
-    let slots = Layout::vertical(constraints).split(inner);
+    // Reserve one row for the scroll indicator when the lane overflows, so the
+    // hidden cards are reachable (j/k scrolls) instead of a dead "+N more".
+    let overflow = agents.len() > (inner.height / CARD_H) as usize;
+    let body_h = if overflow {
+        inner.height.saturating_sub(1)
+    } else {
+        inner.height
+    };
+    let vis = (body_h / CARD_H).max(1) as usize;
+    // Scroll the focused lane so the selected card is always on screen.
+    let offset = if focused && app.card_idx >= vis {
+        app.card_idx - vis + 1
+    } else {
+        0
+    };
+    let end = (offset + vis).min(agents.len());
+    let constraints: Vec<Constraint> = (0..vis).map(|_| Constraint::Length(CARD_H)).collect();
+    let slots = Layout::vertical(constraints).split(Rect {
+        height: body_h,
+        ..inner
+    });
     let spin = app.spin();
-    let pulse = app.tick().is_multiple_of(2); // selection blink
-    for (idx, agent) in agents.iter().take(max).enumerate() {
-        let selected = focused && idx == app.card_idx;
-        card(f, slots[idx], agent, selected, &app.filter, spin, pulse);
+    for (slot_i, agent) in agents[offset..end].iter().enumerate() {
+        let selected = focused && (offset + slot_i) == app.card_idx;
+        card(f, slots[slot_i], agent, selected, &app.filter, spin);
     }
-    if agents.len() > max {
-        // Honesty over silent truncation: say how many cards are hidden.
-        let last = slots[max.saturating_sub(1)];
+    if overflow {
+        let above = offset;
+        let below = agents.len().saturating_sub(end);
         let note = Rect {
-            x: last.x,
-            y: last.y.saturating_add(CARD_H.saturating_sub(1)),
-            width: last.width,
+            x: inner.x,
+            y: inner.y + body_h,
+            width: inner.width,
             height: 1,
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!("  +{} more…", agents.len() - max),
+                format!("  ↑{above} above · ↓{below} below — j/k scroll"),
                 Style::new().fg(C_DIM),
-            ))),
+            )))
+            .alignment(Alignment::Center),
             note,
         );
     }
 }
 
-fn card(
-    f: &mut Frame,
-    area: Rect,
-    a: &Agent,
-    selected: bool,
-    filter: &str,
-    spin: char,
-    pulse: bool,
-) {
+fn card(f: &mut Frame, area: Rect, a: &Agent, selected: bool, filter: &str, spin: char) {
     let col = status_color(a.status);
     let dim = matches!(a.status, Status::Idle | Status::Dead);
     let matched = filter.is_empty()
         || a.name.to_lowercase().contains(&filter.to_lowercase())
         || a.last_line.to_lowercase().contains(&filter.to_lowercase());
 
-    // Selected card pulses (bright ↔ accent) so the focus visibly blinks — and
-    // its border spells out the two actions, so clicking feels intentional.
+    // Selected card: a STABLE bright highlight (no blink) + a border that spells
+    // out the two actions, so clicking feels intentional without strobing.
     let bstyle = if selected {
-        let c = if pulse { Color::White } else { C_ACCENT };
-        Style::new().fg(c).bold()
+        Style::new().fg(Color::White).bold()
     } else if !matched {
         Style::new().fg(C_FAINT)
     } else {
@@ -785,6 +1027,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
         // Clickable toolbar. Active view button is highlighted; every button is a
         // real click target (see app::toolbar_hit).
         let active = match app.view {
+            View::List => ButtonId::List,
             View::Kanban => ButtonId::Kanban,
             View::Tree => ButtonId::Tree,
             View::Logs => ButtonId::Logs,
@@ -853,17 +1096,15 @@ fn help(f: &mut Frame, area: Rect) {
     let head = |s: &'static str| Line::from(Span::styled(s, Style::new().fg(C_ACCENT).bold()));
     let lines = vec![
         head("Views"),
-        Line::from("  1 kanban    2 tree    3 logs"),
+        Line::from("  1 list (all agents, scroll)   2 board   3 tree   4 logs    S cycle sort"),
         Line::from(""),
-        head("Navigate (kanban) — two views of an agent"),
+        head("Navigate — two views of an agent"),
         Line::from(
-            "  ↵   inspect INSIDE the board (output, send a line)        j / k   select card",
+            "  j / k   move (scrolls)    h / l   page    ↵   inspect INSIDE (output, send a line)",
         ),
+        Line::from("  f   JUMP to its real cmux/tmux tab (the live session) — the second view"),
         Line::from(
-            "  f   JUMP to its real cmux/tmux tab (the live session)     h / l / Tab   lane",
-        ),
-        Line::from(
-            "  🖱  click a card to select · click it again → jump to its tab · wheel scrolls · m mouse",
+            "  🖱  click a row/card to select · click again → jump to its tab · wheel scrolls · m mouse",
         ),
         Line::from(""),
         head("Act"),
