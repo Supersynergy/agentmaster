@@ -111,6 +111,16 @@ pub fn cmux_available() -> bool {
 }
 
 pub fn list_cmux() -> Vec<CmuxWorkspace> {
+    // Prefer the stable structured surface (`--json`); the human-readable tree is
+    // only kept as a fallback for older cmux builds that lack the flag.
+    if let Ok(o) = Command::new("cmux")
+        .args(["top", "--all", "--json"])
+        .output()
+        && o.status.success()
+        && let Some(ws) = parse_cmux_top_json(&o.stdout)
+    {
+        return ws;
+    }
     match Command::new("cmux").args(["top", "--all"]).output() {
         Ok(o) if o.status.success() => parse_cmux_top(&String::from_utf8_lossy(&o.stdout)),
         _ => Vec::new(),
@@ -162,6 +172,97 @@ fn extract_quoted(s: &str) -> String {
         (Some(a), Some(b)) if b > a => s[a + 1..b].to_string(),
         _ => String::new(),
     }
+}
+
+/// Parse `cmux top --all --json` into one entry per workspace. This is the
+/// stable, structured surface — preferred over the human-readable tree. Returns
+/// `None` if the bytes are not the expected JSON, so the caller can fall back to
+/// [`parse_cmux_top`] for older cmux builds.
+pub fn parse_cmux_top_json(bytes: &[u8]) -> Option<Vec<CmuxWorkspace>> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let mut out = Vec::new();
+    collect_cmux_workspaces(&v, &mut out);
+    out.retain(|w| !w.ws_ref.is_empty());
+    Some(out)
+}
+
+/// Walk the `top --json` tree and collect every node tagged `"kind":"workspace"`.
+fn collect_cmux_workspaces(v: &serde_json::Value, out: &mut Vec<CmuxWorkspace>) {
+    match v {
+        serde_json::Value::Object(map) => {
+            if map.get("kind").and_then(|k| k.as_str()) == Some("workspace") {
+                out.push(cmux_workspace_from_json(map));
+            }
+            for child in map.values() {
+                collect_cmux_workspaces(child, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_cmux_workspaces(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Build one [`CmuxWorkspace`] from a JSON workspace node. Mirrors the text-tree
+/// semantics exactly via two passes: the agent-type tag (`claude`/`codex`/…)
+/// sets the base status, then the `*_code` tag overrides only when it reports
+/// `Needs input` or no base status exists, and carries the agent pid.
+fn cmux_workspace_from_json(map: &serde_json::Map<String, serde_json::Value>) -> CmuxWorkspace {
+    let mut ws = CmuxWorkspace {
+        ws_ref: map
+            .get("ref")
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string(),
+        title: map
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string(),
+        status: String::new(),
+        pid: None,
+        git: None,
+        phase: None,
+    };
+    let Some(tags) = map.get("tags").and_then(|t| t.as_array()) else {
+        return ws;
+    };
+    let tag_kv = |t: &serde_json::Value| -> (String, String) {
+        let o = t.as_object();
+        let get = |k: &str| {
+            o.and_then(|m| m.get(k))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        (get("key"), get("value"))
+    };
+    // Pass 1: repo/phase tags and the agent-type base status.
+    for tag in tags {
+        let (key, value) = tag_kv(tag);
+        match key.as_str() {
+            "git" if ws.git.is_none() => ws.git = Some(value),
+            "phase" if ws.phase.is_none() => ws.phase = Some(value),
+            "claude" | "codex" | "opencode" | "amp" if ws.status.is_empty() => ws.status = value,
+            _ => {}
+        }
+    }
+    // Pass 2: the `*_code` tag — strongest status signal + the agent pid.
+    for tag in tags {
+        let (key, value) = tag_kv(tag);
+        if key.ends_with("_code") {
+            if value.eq_ignore_ascii_case("needs input") || ws.status.is_empty() {
+                ws.status = value;
+            }
+            if let Some(pid) = tag.get("pid").and_then(|p| p.as_u64()) {
+                ws.pid = Some(pid as u32);
+            }
+        }
+    }
+    ws
 }
 
 /// Parse `cmux top --all` into one entry per workspace. Tolerant of the tree
@@ -278,5 +379,60 @@ mod tests {
         assert_eq!(w[1].status.to_lowercase(), "needs input");
         assert_eq!(w[1].pid, Some(37706));
         assert_eq!(w[1].git, None);
+    }
+
+    #[test]
+    fn parses_cmux_top_json() {
+        // Mirrors `parses_cmux_top` against the structured `--json` surface, and
+        // shuffles ws:108's tag order so the `_code` tag precedes the agent tag —
+        // the two-pass mapping must still let the agent tag set the base status.
+        let s = r#"{
+          "windows": [{
+            "kind": "window",
+            "children": [
+              { "kind": "workspace", "ref": "workspace:96",
+                "title": "🟣 Claude ▶ · kill dead code",
+                "tags": [
+                  { "kind": "tag", "key": "claude", "value": "working", "pid": null },
+                  { "kind": "tag", "key": "git", "value": "dirty", "pid": null },
+                  { "kind": "tag", "key": "phase", "value": "tests-pass", "pid": null },
+                  { "kind": "tag", "key": "proc", "value": "0", "pid": null },
+                  { "kind": "tag", "key": "claude_code", "value": "Running", "pid": 96335 }
+                ] },
+              { "kind": "workspace", "ref": "workspace:108",
+                "title": "🟣 Claude ✓ · answer me",
+                "tags": [
+                  { "kind": "tag", "key": "claude_code", "value": "Needs input", "pid": 37706 },
+                  { "kind": "tag", "key": "claude", "value": "done", "pid": null }
+                ] },
+              { "kind": "workspace", "ref": "workspace:102",
+                "title": "idle shell", "tags": [
+                  { "kind": "tag", "key": "phase", "value": "tests-pass", "pid": null }
+                ] }
+            ]
+          }]
+        }"#;
+        let w = parse_cmux_top_json(s.as_bytes()).expect("valid json");
+        assert_eq!(w.len(), 3);
+        assert_eq!(w[0].ws_ref, "workspace:96");
+        assert_eq!(w[0].title, "🟣 Claude ▶ · kill dead code");
+        assert_eq!(w[0].status, "working");
+        assert_eq!(w[0].pid, Some(96335));
+        assert_eq!(w[0].git.as_deref(), Some("dirty"));
+        assert_eq!(w[0].phase.as_deref(), Some("tests-pass"));
+        // "Needs input" wins over "done" even though its tag comes first.
+        assert_eq!(w[1].status.to_lowercase(), "needs input");
+        assert_eq!(w[1].pid, Some(37706));
+        assert_eq!(w[1].git, None);
+        // A workspace with no agent tag is still listed (no status/pid).
+        assert_eq!(w[2].ws_ref, "workspace:102");
+        assert_eq!(w[2].status, "");
+        assert_eq!(w[2].pid, None);
+        assert_eq!(w[2].phase.as_deref(), Some("tests-pass"));
+    }
+
+    #[test]
+    fn cmux_top_json_rejects_garbage() {
+        assert!(parse_cmux_top_json(b"not json").is_none());
     }
 }

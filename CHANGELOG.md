@@ -2,6 +2,19 @@
 
 All notable changes to agentmaster are documented here. Newest first.
 
+## [Unreleased]
+
+### Changed
+- **cmux discovery now reads `cmux top --all --json`** instead of scraping the
+  human-readable tree. The structured surface gives stable `ref`/`title`/`tags`
+  fields, so workspace titles, status, git/phase tags and the agent pid no longer
+  depend on tree-drawing characters or column layout. The text parser
+  (`parse_cmux_top`) is kept as an automatic fallback for older cmux builds that
+  lack `--json`. New `parse_cmux_top_json` mirrors the text-tree status semantics
+  exactly (agent-type tag = base status, `*_code` tag wins on `Needs input`) and
+  is order-independent. Covered by `parses_cmux_top_json` +
+  `cmux_top_json_rejects_garbage`.
+
 ## [0.18.0] — 2026-06-04
 
 Symbol-led list rows — read the fleet at a glance: *what is happening · where ·
