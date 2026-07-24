@@ -4,6 +4,168 @@ All notable changes to agentmaster are documented here. Newest first.
 
 ## [Unreleased]
 
+### Added — New lane runtimes: kimi, cursor-agent, devin
+- `kimi` (positional prompt), `cursor-agent` with aliases `cursor`/`composer`
+  (positional prompt), and `devin` (prompt after `--`; in-session `/model`
+  switches across 35 model families incl. Gemini Flash, Kimi K2.7, GLM-5.2,
+  Grok 4.5, GPT-5.6, Claude). Picked up by `doctor` and the TUI new-agent
+  completer via `KNOWN_RUNTIMES`; focused tests in `runtime.rs`.
+
+### Added — Auto-router + oracle-gated swarm (cheapest-passing model selection)
+- **`models [--tier T] [--json]`** — static model registry (2026-07 pricing,
+  9 models across 3 tiers: frontier_closed, mid_tier, open_weight). Each row
+  carries vendor, input/output prices, context window, strengths, weaknesses,
+  and `best_for` task types. `--json` for machine consumption (agent-token-saver
+  integration). Single source of truth for cost-ladder decisions — no remote
+  API calls, no runtime discovery.
+- **`auto "<task>" [--name N] [--dry-run]`** — classify the task by keywords,
+  pick the cheapest model that's strong at that task type, then `assign` it.
+  Classifier maps to 9 task types (code_generation, code_review, planning,
+  research, shell_projection, long_context, verification, creative, general).
+  Ponytail: one keyword matcher, one cost-sorted pick, reuse `assign`. The
+  model flag is injected as `--model <flag>` for runtimes that accept it;
+  aider/opencode/shell get the bare task (fail-open).
+- **`swarm <name> --oracle "<cmd>" [-n 3] [--budget B] [--dry-run] "<task>"`**
+  — oracle-gated swarm. Spawns N diverse agents on the same goal, first
+  oracle PASS wins. Diversifies across runtimes + tiers (cheapest + mid-tier
+  + frontier, never duplicate runtimes) so a single model's failure mode
+  doesn't block convergence. Each lane gets a bounded capsule (300-700
+  tokens) written to `~/.agentmaster/capsules/<name>-lane<i>-<model>.md`
+  — the agent-token-saver contract. The swarm auto-inits an omnigoal so
+  `goal-check <name>` gates all lanes. First PASS wins; kill the rest with
+  `focus <lane>` + Ctrl-C.
+- **`src/router.rs`** — new module: `ModelSpec`, `TaskType`, `Tier`, `REGISTRY`,
+  `classify()`, `pick()`, `pick_swarm()`. 11 unit tests covering classification,
+  cheapest-passing pick, swarm diversity (no duplicate runtimes), cost sorting.
+- **Integration with agent-token-saver**: capsules are bounded (300-700 tokens,
+  paths/hashes, constraints, PASS/FAIL oracle) — never transcripts. The
+  `models --json` output is machine-readable for `si route` or token-cfo
+  pricing pipelines. Swarm lanes are independent workers (no transcript
+  sharing) — the token-saver contract for subagent teams.
+- Verified: `cargo test` 55/55 green (44 existing + 11 new router tests);
+  `models`, `auto --dry-run`, `swarm --dry-run` smoke-tested across 4 task
+  types (shell/code-gen/long-context/planning).
+
+### Added — Omnigoal lifecycle (closed-loop goal controller, ponytail-style)
+- **`goal <name> <text> --oracle <cmd> [--budget N] [--deadline ISO]`** —
+  omnigoal init. Stores a machine-checkable oracle (shell command that exits 0
+  iff the goal is done), a token budget cap, and an ISO deadline alongside the
+  goal text + DoD. The TUI and `goal check` rehydrate these. Flags must come
+  before the trailing goal text (clap `trailing_var_arg`).
+- **`goal-check <name>`** — runs the oracle in a subshell, classifies the
+  result, and records a try. On failure, scans stdout+stderr for the
+  bottleneck (first line matching `error|fail|missing|panic|not found|undefined`)
+  and persists it to the goal row. Three tries without oracle passing → goal
+  auto-abandoned (no infinite loops). Budget cap (`AM_GOAL_SPEND_<NAME>` env
+  var) and deadline also trigger abandonment. Exit codes: 0=pass, 1=fail,
+  2=abandoned, 3=no oracle.
+- **`goal-close <name> [--summary ...] [--abandon]`** — marks a goal done (or
+  abandoned) with a closing summary. The summary is persisted to the goal row
+  + the event stream, so the next session can rehydrate the outcome without
+  replaying the transcript. This is the "persistent outcome" primitive.
+- **`goal-spawn <name> [--capsule path] [--skill name]`** — registers a
+  subagent against this goal with a bounded capsule + skill. Ponytail: we log
+  the event only — the capsule file lives on disk and is referenced by path,
+  never inlined into the goal row. Cross-agent coordination happens via the
+  goal JSON (the row), not by sharing transcripts.
+- **Schema migration**: `goals` table extended with `oracle`, `budget_tokens`,
+  `deadline`, `tries`, `status`, `bottleneck`, `summary`, `closed_ts` columns.
+  Tolerant migration via `PRAGMA table_info` — fresh DBs get the full schema,
+  legacy DBs get `ALTER TABLE` only for missing columns.
+- Verified: `cargo test` 44/44 green; live smoke test exercises init → check
+  (try 1/3 fail with bottleneck) → check (try 2/3 fail) → spawn → close.
+
+### Added — Cursor 3 Agents Window integration (the missing UI layer)
+- **`cursor-sdk/`** — TypeScript SDK adapter that turns Cursor 3's Agents
+  Window into the GUI for the agentmaster fleet. Zero frontend code: ~80 lines
+  of TS + the official `@cursor/sdk` + `@modelcontextprotocol/sdk`. Cursor's
+  Agents Window becomes a polished multi-workspace Kanban for agentmaster's
+  fleet — every `am_assign` spawn shows up as a card, every `am_handoff` is a
+  watchable conversation. The Rust CLI stays the source of truth; the adapter
+  is just call sites.
+- **`.cursor/agents/agentmaster.md`** — Cursor subagent definition. Cursor
+  auto-discovers it on session start. The subagent orchestrates the external
+  fleet via `am_*` tools, never writes code itself, reports a 5-line digest.
+- **`.cursor/skills/am/SKILL.md`** — drop-in skill doc for the `am` ponytail
+  router. Cursor auto-loads it; the supervisor agent can call `am_skill
+  <runtime>` to discover any runtime's control-skill doc dynamically.
+- **`.cursor/hooks.json`** — bridges Cursor's `PostToolUse` / `UserPromptSubmit`
+  / `Stop` lifecycle into agentmaster's audit log. `agentmaster events`
+  becomes a cross-tool timeline (Cursor actions + fleet actions in one stream).
+- **`.cursor/mcp.json`** — exposes `am_ls`, `am_peek`, `am_assign`, `am_handoff`,
+  `am_skill`, `am_doctor` as MCP tools. Works in Cursor, Cline, Claude Code,
+  and Devin Desktop via ACP — one adapter, every MCP host.
+- **`src/index.ts`** — async wrappers (`amLs`, `amPeek`, `amAssign`, `amHandoff`,
+  `amSkill`, `amDoctor`) + `createAgentmasterTools()` returning Cursor SDK
+  tool descriptors + `waitForStatus()` polling helper.
+- **`src/mcp-server.ts`** — stdio MCP server (~60 lines) exposed via the
+  `agentmaster-mcp` bin entry.
+- **`install-cursor-sdk.sh`** — one-command drop-in for any project:
+  `./install-cursor-sdk.sh /path/to/project` copies `.cursor/` files.
+- Verified: `npx tsc` clean, `node dist/demo.js` exercises `am_ls` +
+  `am_doctor --costs` + `am_skill claude` + lists all 6 registered tools,
+  MCP server starts and waits on stdio.
+
+### Added — Advanced orchestration levers (CAO-class primitives, ponytail-style)
+- **Runtime-agnostic `batch()`**: tasks can now carry a `runtime` field
+  (`- runtime: codex` in MD, `"runtime":"hermes"` in JSON) and `batch` spawns
+  each via `runtime::resolve()` instead of hardcoding `claude`. Default
+  runtime remains `claude` (legacy). `--model` is only forwarded to runtimes
+  that accept it (claude/codex/hermes/gemini/cline); aider/opencode/shell
+  launch with their native flags. Dry-run prints `runtime=` per task.
+- **`send --wait <secs>`** (handoff primitive): sends the line, then polls the
+  target's transcript every 2s until a NEW assistant message lands (baseline
+  captured pre-send) or the timeout expires. Zero token tax — reads the JSONL
+  directly via `peek::digest`, never asks the agent to report. Timeout returns
+  a "still running — peek later" notice, the agent keeps working (same
+  semantics as CAO's `handoff`).
+- **`assign <runtime> <task> [--name N]`** (async fan-out primitive): spawns
+  one fresh cmux workspace seeded with the task and returns immediately.
+  Auto-generates a slug from the task text as workspace name. Logs the
+  callback-ref (`workspace:NN`) to the audit log so the supervisor can
+  `peek` it later. Fire-and-forget like CAO's `assign` — the worker is
+  expected to work independently.
+- **`doctor --costs`**: reads the audit log and prints per-target send/assign
+  counts. No token spend (agentmaster never sees provider billing — use
+  `agent-token-ledger` for that). Ponytail: reuses the existing log, no new
+  accounting state.
+- **`am` master router** rewritten with new commands: `am handoff <ref> <msg>
+  [--wait 120]` → `agentmaster send --wait`; `am assign <runtime> <task>
+  [--name N]` → `agentmaster assign`; `am message` as alias of `am send`;
+  `am skill <runtime>` dynamically reads the control-skill's `SKILL.md` path
+  and prints its first non-frontmatter heading (no hardcoded doc snippets to
+  drift). Failsafe: missing skill → "no control skill registered", missing
+  binary → "unknown command", unknown subcommand → runtime passthrough if the
+  name is on PATH, else 127. ~80 lines of bash, zero deps.
+- **`am skill <runtime>`** bridges to the per-agent control skills
+  dynamically — prints the `SKILL.md` path and first heading so a supervisor
+  agent can discover what a runtime's skill does without a second round-trip.
+
+### Added (earlier this session)
+- **`am` master router** (first version): one entry point for the whole fleet.
+- **`doctor --verbose`** probes each found runtime's `--version` (falls back to
+  `-V`) so you see not just presence but what's on PATH — e.g.
+  `runtime claude : found  2.1.218 (Claude Code)`.
+- **`peek --tail N`** prints the last N raw transcript events (tagged 🧑/🤖)
+  instead of the structural digest — stream-of-thought view for live debugging.
+- **`send --goal <name> [--dod <text>]`** combines steer + pin: sends the line
+  to the agent AND persists a goal on that name in one command, so you don't
+  have to chain `send` + `goal`.
+- **Tab completion in the TUI's new-agent input**: typing `cl<Tab>` expands to
+  `claude `; bare Tab on empty input cycles through `KNOWN_RUNTIMES`. Discovers
+  the registry without leaving the keyboard.
+
+### Added (earlier this session)
+- **Eight agent runtimes** now first-class: `claude`, `codex`, `hermes`, `ggcoder`,
+  `aider`, `opencode`, `gemini`, `cline`, plus the existing `shell`. `runtime::resolve`
+  maps each to its CLI; `KNOWN_RUNTIMES` is the single source of truth. The TUI's
+  new-agent prompt and help line list every runtime. `agent_kind` / `agent_tag`
+  give each a distinct colored badge (Claude amber, Codex blue, Hermes cyan,
+  GGcoder green, Aider magenta, OpenCode violet, Gemini orange, Cline rose) so
+  the fleet reads at a glance. `doctor` probes every runtime's presence on PATH.
+  Aider and OpenCode launch bare (their positionals are files/paths, not a
+  prompt) — steer them via `agentmaster send` after spawn.
+
 ### Changed
 - **cmux discovery now reads `cmux top --all --json`** instead of scraping the
   human-readable tree. The structured surface gives stable `ref`/`title`/`tags`
