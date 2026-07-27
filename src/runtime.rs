@@ -3,6 +3,9 @@
 //! Cline, or a plain shell all become "an agent" the board can see and steer.
 //! Pluggable by design — adding a CLI is one match arm.
 
+use std::path::Path;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSpec {
     pub program: String,
     pub args: Vec<String>,
@@ -122,6 +125,79 @@ pub fn resolve_with_model(runtime: &str, task: Option<&str>, model: Option<&str>
     spec
 }
 
+/// Resolve a non-interactive runtime command for the parallel swarm engine.
+/// These argv contracts are verified against each installed CLI's `--help`;
+/// other runtimes retain their existing resolver contract.
+pub fn resolve_headless_with_model(
+    runtime: &str,
+    task: &str,
+    model: Option<&str>,
+    usage_file: Option<&Path>,
+    hermes_accept_hooks: bool,
+) -> RuntimeSpec {
+    let mut args = Vec::new();
+    match runtime {
+        "claude" | "claude-escalate" => {
+            args.push("--print".to_string());
+            push_model(&mut args, model);
+            args.push(task.to_string());
+            RuntimeSpec {
+                program: "claude".into(),
+                args,
+            }
+        }
+        "codex" => {
+            args.push("exec".to_string());
+            push_model(&mut args, model);
+            args.push(task.to_string());
+            RuntimeSpec {
+                program: "codex".into(),
+                args,
+            }
+        }
+        "gemini" => {
+            push_model(&mut args, model);
+            args.extend(["--prompt".to_string(), task.to_string()]);
+            RuntimeSpec {
+                program: "gemini".into(),
+                args,
+            }
+        }
+        "hermes" => {
+            push_model(&mut args, model);
+            args.extend(["-z".to_string(), task.to_string(), "--cli".to_string()]);
+            if hermes_accept_hooks {
+                args.push("--accept-hooks".to_string());
+            }
+            if let Some(path) = usage_file {
+                args.extend([
+                    "--usage-file".to_string(),
+                    path.to_string_lossy().into_owned(),
+                ]);
+            }
+            RuntimeSpec {
+                program: "hermes".into(),
+                args,
+            }
+        }
+        "ggcoder" => {
+            push_model(&mut args, model);
+            args.extend(["--json".to_string(), task.to_string()]);
+            RuntimeSpec {
+                program: "ggcoder".into(),
+                args,
+            }
+        }
+        _ => resolve_with_model(runtime, Some(task), model),
+    }
+}
+
+fn push_model(args: &mut Vec<String>, model: Option<&str>) {
+    if let Some(model) = model {
+        args.extend(["--model".to_string(), model.to_string()]);
+    }
+}
+
 /// All runtimes agentmaster knows how to launch. Used by `doctor` for the
 /// runtime-availability check and by the TUI's new-agent completer.
 pub const KNOWN_RUNTIMES: &[&str] = &[
@@ -172,6 +248,55 @@ mod tests {
         assert_eq!(spec.args, ["--model", "gpt-5.6", "fix tests"]);
         let worker = resolve_with_model("kimi-worker", Some("fix tests"), Some("kimi-k3"));
         assert_eq!(worker.args, ["fix tests"]);
+    }
+
+    #[test]
+    fn headless_resolver_uses_help_verified_argv_contracts() {
+        let codex = resolve_headless_with_model("codex", "fix tests", Some("gpt-5.6"), None, false);
+        assert_eq!(codex.args, ["exec", "--model", "gpt-5.6", "fix tests"]);
+
+        let gemini =
+            resolve_headless_with_model("gemini", "fix tests", Some("gemini-flash"), None, false);
+        assert_eq!(
+            gemini.args,
+            ["--model", "gemini-flash", "--prompt", "fix tests"]
+        );
+
+        let usage = Path::new("/tmp/hermes usage.json");
+        let hermes =
+            resolve_headless_with_model("hermes", "fix tests", Some("kimi-k3"), Some(usage), false);
+        assert_eq!(
+            hermes.args,
+            [
+                "--model",
+                "kimi-k3",
+                "-z",
+                "fix tests",
+                "--cli",
+                "--usage-file",
+                "/tmp/hermes usage.json"
+            ]
+        );
+    }
+
+    #[test]
+    fn headless_claude_and_ggcoder_disable_interactive_ui() {
+        let claude =
+            resolve_headless_with_model("claude", "fix tests", Some("sonnet"), None, false);
+        assert_eq!(claude.args, ["--print", "--model", "sonnet", "fix tests"]);
+
+        let ggcoder =
+            resolve_headless_with_model("ggcoder", "fix tests", Some("qwen"), None, false);
+        assert_eq!(ggcoder.args, ["--model", "qwen", "--json", "fix tests"]);
+    }
+
+    #[test]
+    fn hermes_hook_acceptance_requires_explicit_resolver_opt_in() {
+        let default = resolve_headless_with_model("hermes", "task", None, None, false);
+        assert!(!default.args.iter().any(|arg| arg == "--accept-hooks"));
+
+        let opted_in = resolve_headless_with_model("hermes", "task", None, None, true);
+        assert!(opted_in.args.iter().any(|arg| arg == "--accept-hooks"));
     }
 
     #[test]

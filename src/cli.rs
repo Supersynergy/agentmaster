@@ -806,6 +806,19 @@ pub fn swarm_spawn(request: SwarmRequest<'_>, dir: &Path) -> Result<()> {
     if deadline_secs > 0 {
         println!("   deadline: {deadline_secs}s");
     }
+    let hermes_accept_hooks = explicit_env_opt_in(
+        std::env::var("AGENTMASTER_HERMES_ACCEPT_HOOKS")
+            .ok()
+            .as_deref(),
+    );
+    println!(
+        "   Hermes hook trust: {}",
+        if hermes_accept_hooks {
+            "ENABLED by AGENTMASTER_HERMES_ACCEPT_HOOKS=1 (headless Hermes lanes)"
+        } else {
+            "off (default; unseen hooks are not auto-approved)"
+        }
+    );
     // Skill choice belongs to the task, not to a model name. Route once, keep
     // at most one verified path, and never relay the router's raw JSON.
     let routed_skill = ats::route_skill(task);
@@ -835,7 +848,7 @@ pub fn swarm_spawn(request: SwarmRequest<'_>, dir: &Path) -> Result<()> {
         name,
         "swarm-init",
         &format!(
-            "n={n} type={task_type} oracle={oracle} parallel={parallel} per_lane_cap={lane_budget:?} deadline={deadline_secs} recall={recall}",
+            "n={n} type={task_type} oracle={oracle} parallel={parallel} per_lane_cap={lane_budget:?} deadline={deadline_secs} recall={recall} hermes_accept_hooks={hermes_accept_hooks}",
             parallel = if no_parallel { "off" } else { "on" },
         ),
     );
@@ -875,6 +888,7 @@ pub fn swarm_spawn(request: SwarmRequest<'_>, dir: &Path) -> Result<()> {
             oracle: oracle.to_string(),
             skill_path: routed_skill.clone(),
             budget_tokens: lane_budget,
+            hermes_accept_hooks,
             workdir: workdir.clone(),
         };
         lanes.push(lane);
@@ -889,23 +903,46 @@ pub fn swarm_spawn(request: SwarmRequest<'_>, dir: &Path) -> Result<()> {
     // Build a tokio runtime inline. Ponytail: no global runtime, no async
     // main — we just block on the swarm future.
     let rt = swarm_runtime()?;
-    let winner = rt.block_on(swarm_engine::run_parallel_swarm(lanes, deadline));
+    let run = rt.block_on(swarm_engine::run_parallel_swarm(lanes, deadline));
+
+    for lane in &run.lanes {
+        if lane.outcome == swarm_engine::LaneOutcome::Passed {
+            continue;
+        }
+        let outcome = lane_outcome(&lane.outcome);
+        println!(
+            "   lane {} ({}/{}) — {} in {:.1}s, tokens={}",
+            lane.lane_index,
+            lane.runtime,
+            lane.model_name,
+            outcome,
+            lane.elapsed.as_secs_f64(),
+            lane.tokens_used,
+        );
+        s.log(
+            None,
+            name,
+            "lane-result",
+            &format!(
+                "lane={} model={} runtime={} outcome={} tokens={} elapsed={:.1}s",
+                lane.lane_index,
+                lane.model_name,
+                lane.runtime,
+                outcome,
+                lane.tokens_used,
+                lane.elapsed.as_secs_f64(),
+            ),
+        );
+    }
 
     // Report the result.
-    match &winner {
+    match &run.winner {
         Some(w) => {
             println!(
-                "\n🏆 winner: lane {} ({}/{}) — {} in {:.1}s, tokens={}",
+                "\n🏆 winner: lane {} ({}/{}) — PASSED in {:.1}s, tokens={}",
                 w.lane_index,
                 w.runtime,
                 w.model_name,
-                match w.outcome {
-                    swarm_engine::LaneOutcome::Passed => "PASSED",
-                    swarm_engine::LaneOutcome::BudgetExceeded => "BUDGET-EXCEEDED",
-                    swarm_engine::LaneOutcome::SpawnFailed(_) => "SPAWN-FAILED",
-                    swarm_engine::LaneOutcome::Timeout => "TIMEOUT",
-                    swarm_engine::LaneOutcome::Pruned => "PRUNED",
-                },
                 w.elapsed.as_secs_f64(),
                 w.tokens_used,
             );
@@ -961,6 +998,25 @@ pub fn swarm_spawn(request: SwarmRequest<'_>, dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn lane_outcome(outcome: &crate::swarm::LaneOutcome) -> String {
+    match outcome {
+        crate::swarm::LaneOutcome::Passed => "PASSED".to_string(),
+        crate::swarm::LaneOutcome::BudgetExceeded => "BUDGET-EXCEEDED".to_string(),
+        crate::swarm::LaneOutcome::SpawnFailed(detail) => {
+            format!("SPAWN-FAILED: {detail}")
+        }
+        crate::swarm::LaneOutcome::ChildExited(detail) => {
+            format!("CHILD-EXITED: {detail}")
+        }
+        crate::swarm::LaneOutcome::Timeout => "TIMEOUT".to_string(),
+        crate::swarm::LaneOutcome::Pruned => "PRUNED".to_string(),
+    }
+}
+
+fn explicit_env_opt_in(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
 fn effective_lane_budget(total: u64, per_lane: u64, lanes: usize) -> Option<usize> {
     let from_total = (total > 0 && lanes > 0)
         .then(|| total / lanes as u64)
@@ -1005,6 +1061,7 @@ fn swarm_spawn_sequential(
             oracle: oracle.to_string(),
             skill_path: skill_path.map(str::to_string),
             budget_tokens: None,
+            hermes_accept_hooks: false,
             workdir: dir.to_path_buf(),
         };
         let capsule = crate::swarm::build_capsule(&lane);
@@ -1051,6 +1108,30 @@ mod tests {
         assert_eq!(effective_lane_budget(9, 2, 3), Some(2));
         assert_eq!(effective_lane_budget(0, 2, 3), Some(2));
         assert_eq!(effective_lane_budget(0, 0, 3), None);
+    }
+
+    #[test]
+    fn lane_failure_text_preserves_diagnostic_detail() {
+        assert_eq!(
+            lane_outcome(&crate::swarm::LaneOutcome::ChildExited(
+                "exit status: 7 before oracle passed".into()
+            )),
+            "CHILD-EXITED: exit status: 7 before oracle passed"
+        );
+        assert_eq!(
+            lane_outcome(&crate::swarm::LaneOutcome::SpawnFailed(
+                "binary missing".into()
+            )),
+            "SPAWN-FAILED: binary missing"
+        );
+    }
+
+    #[test]
+    fn hermes_hook_trust_env_requires_exact_one() {
+        assert!(!explicit_env_opt_in(None));
+        assert!(!explicit_env_opt_in(Some("0")));
+        assert!(!explicit_env_opt_in(Some("true")));
+        assert!(explicit_env_opt_in(Some("1")));
     }
 
     #[test]

@@ -4,6 +4,16 @@ All notable changes to agentmaster are documented here. Newest first.
 
 ## [Unreleased]
 
+### Fixed — headless swarm execution
+- Parallel lanes now use verified non-interactive CLI contracts, probe cmux
+  before workspace spawn, and fall back to a directly managed Tokio child when
+  the cmux socket is unavailable. Early child exits and every non-winning lane
+  are reported and audit-logged; an omnigoal closes only when an oracle-backed
+  winner exists.
+- Headless Hermes lanes keep unseen-hook approval off by default. Operators can
+  opt in explicitly with `AGENTMASTER_HERMES_ACCEPT_HOOKS=1`; swarm plans and
+  dry-runs print the active trust state before any lane starts.
+
 ### Deferred — Cursor SDK adapter
 - `cursor-sdk/` remains an experimental, unshipped adapter. It is deliberately
   excluded from v0.19.0 until its pinned TypeScript dependencies are installed
