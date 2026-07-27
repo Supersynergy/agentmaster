@@ -1,4 +1,3 @@
-use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +15,9 @@ const MAX_STDERR: usize = 65_536;
 const MAX_ORACLE_STDOUT: usize = 16_384;
 const MAX_USAGE_BYTES: u64 = 65_536;
 const ORACLE_TIMEOUT_SECS: u64 = 30;
+const CAPABILITY_TIMEOUT_SECS: u64 = 5;
+const MAX_WORKERS: usize = 3;
+const MAX_PROMPT_BYTES: usize = 1_800;
 
 pub struct EnsembleRequest<'a> {
     pub name: &'a str,
@@ -37,23 +39,124 @@ struct LanePolicy {
     paid: bool,
 }
 
-#[derive(Deserialize)]
-struct AdapterOutput {
-    ok: usize,
-    results: Vec<AdapterResult>,
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdapterCapability {
+    schema_version: u64,
+    ask_v2: bool,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    default_max_workers: Option<usize>,
+    max_workers: usize,
+    #[serde(default)]
+    fanout_max_workers: Option<usize>,
+    max_result_tokens: u32,
+    #[serde(default)]
+    max_result_tokens_semantics: Option<String>,
+    max_prompt_bytes: usize,
+    #[serde(default)]
+    tools_available: Option<bool>,
+    #[serde(default)]
+    capsule_visible_input_tokens_proxy: Option<usize>,
+    #[serde(default)]
+    route: Option<String>,
+    #[serde(default)]
+    packet: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdapterOutput {
+    schema: String,
+    schema_version: u64,
+    status: String,
+    exit_code: i32,
+    prompt: PromptReference,
+    stage: String,
+    lanes: AdapterLanes,
+    ok: usize,
+    total: usize,
+    results: Vec<AdapterResult>,
+    accounting: UsageOutput,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromptReference {
+    sha256: String,
+    bytes: usize,
+    transport: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdapterLanes {
+    requested: String,
+    selected: usize,
+    cap: usize,
+    fanout: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AdapterResult {
     lane: String,
+    #[serde(default)]
+    model: Option<String>,
+    kind: String,
+    class: String,
     ok: bool,
+    terminal: String,
+    ms: u64,
     answer: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    cached: Option<bool>,
+    call_started: bool,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    token_count_source: String,
+    max_tokens: u32,
+    cap_mode: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct UsageOutput {
+    schema: String,
+    schema_version: u64,
+    status: String,
+    terminal_records_complete: bool,
+    prompt_sha256: String,
+    prompt_bytes: usize,
+    transport: String,
+    stage: String,
+    requested_lane_spec: String,
+    selected_lane_count: usize,
+    lane_cap: usize,
+    fanout: bool,
+    max_tokens: u32,
+    calls_started: usize,
+    calls_completed: usize,
+    cache_hits: usize,
+    input_tokens: TokenAccounting,
+    output_tokens: TokenAccounting,
+    estimated_cost_usd: (),
+    cost_status: String,
     completed: bool,
     failed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TokenAccounting {
+    reported: u64,
+    estimated: u64,
+    unknown_calls: usize,
 }
 
 struct Captured {
@@ -69,11 +172,42 @@ struct CapturedStream {
     truncated: bool,
 }
 
+struct UsageArtifactGuard {
+    path: PathBuf,
+    validated: bool,
+}
+
+impl UsageArtifactGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            validated: false,
+        }
+    }
+
+    fn keep(&mut self) {
+        self.validated = true;
+    }
+}
+
+impl Drop for UsageArtifactGuard {
+    fn drop(&mut self) {
+        if !self.validated {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct RunManifest {
     schema_version: u8,
     task_sha256: String,
+    task_bytes: usize,
     task_transport: &'static str,
+    llmadapter_schema_version: u64,
+    llmadapter_max_workers: usize,
+    llmadapter_max_result_tokens: u32,
+    llmadapter_max_prompt_bytes: usize,
     lanes: String,
     remote: bool,
     paid: bool,
@@ -86,6 +220,9 @@ struct RunManifest {
     usage_artifact: &'static str,
     usage_status: &'static str,
     adapter: Option<ProcessEvidence>,
+    adapter_result_status: Option<String>,
+    adapter_result_exit_code: Option<i32>,
+    adapter_lanes: Vec<LaneEvidence>,
     candidates: Vec<CandidateEvidence>,
     final_status: &'static str,
     total_elapsed_ms: u64,
@@ -100,6 +237,24 @@ struct ProcessEvidence {
     stderr_bytes: usize,
     stdout_truncated: bool,
     stderr_truncated: bool,
+}
+
+#[derive(Serialize)]
+struct LaneEvidence {
+    lane: String,
+    model: Option<String>,
+    kind: String,
+    class: String,
+    ok: bool,
+    terminal: String,
+    elapsed_ms: u64,
+    max_tokens: u32,
+    cap_mode: String,
+    token_count_source: String,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cached: bool,
+    call_started: bool,
 }
 
 #[derive(Serialize)]
@@ -172,12 +327,29 @@ pub fn run(request: EnsembleRequest<'_>, data_dir: &Path) -> Result<()> {
 fn run_with_program(request: EnsembleRequest<'_>, data_dir: &Path, program: &Path) -> Result<()> {
     let policy = validate(&request)?;
     let task_hash = sha256_hex(request.task.as_bytes());
+    let task_bytes = request.task.len();
     let no_cache = policy.remote || request.fresh;
+    let capability = probe_capability(program, data_dir)?;
+    if task_bytes > capability.max_prompt_bytes {
+        bail!(
+            "task is {task_bytes} bytes; llmadapter v2 capability allows at most {}",
+            capability.max_prompt_bytes
+        );
+    }
+    if request.max_tokens > capability.max_result_tokens {
+        bail!(
+            "requested max tokens {} exceeds llmadapter v2 capability {}",
+            request.max_tokens,
+            capability.max_result_tokens
+        );
+    }
 
     if request.dry_run {
         println!("ensemble dry-run");
         println!("  task sha256 : {task_hash}");
-        println!("  transport   : argv (visible to same-host process inspection)");
+        println!("  task bytes  : {task_bytes}");
+        println!("  transport   : private unlinked file descriptor -> stdin");
+        println!("  protocol    : llmadapter result schema v2");
         println!("  lanes       : {}", request.lanes);
         println!("  remote      : {}", policy.remote);
         println!("  paid        : {}", policy.paid);
@@ -186,11 +358,13 @@ fn run_with_program(request: EnsembleRequest<'_>, data_dir: &Path, program: &Pat
             request.max_tokens
         );
         println!(
-            "  command     : {} ask <task> --swarm --lanes {} --max-tokens {} --timeout {} --json --usage-out <private-path>{}",
+            "  command     : {} ask-v2 --stdin --swarm --lanes {} --max-tokens {} --deadline-secs {} --usage-out <private-path>{}{}{}",
             program.display(),
             request.lanes,
             request.max_tokens,
             request.deadline_secs,
+            if policy.remote { " --allow-remote" } else { "" },
+            if policy.paid { " --allow-paid" } else { "" },
             if no_cache { " --no-cache" } else { "" }
         );
         return Ok(());
@@ -200,14 +374,20 @@ fn run_with_program(request: EnsembleRequest<'_>, data_dir: &Path, program: &Pat
     let run_dir = create_run_dir(data_dir, &safe_name)?;
     let usage_path = run_dir.join("usage.json");
     create_private_file(&usage_path)?;
+    let mut usage_guard = UsageArtifactGuard::new(usage_path.clone());
     let started = Instant::now();
     let mut evidence = ManifestGuard {
         path: run_dir.join("manifest.json"),
         started,
         document: RunManifest {
-            schema_version: 1,
+            schema_version: 2,
             task_sha256: task_hash.clone(),
-            task_transport: "argv",
+            task_bytes,
+            task_transport: "stdin",
+            llmadapter_schema_version: capability.schema_version,
+            llmadapter_max_workers: capability.max_workers,
+            llmadapter_max_result_tokens: capability.max_result_tokens,
+            llmadapter_max_prompt_bytes: capability.max_prompt_bytes,
             lanes: request.lanes.to_owned(),
             remote: policy.remote,
             paid: policy.paid,
@@ -220,6 +400,9 @@ fn run_with_program(request: EnsembleRequest<'_>, data_dir: &Path, program: &Pat
             usage_artifact: "usage.json",
             usage_status: "PENDING",
             adapter: None,
+            adapter_result_status: None,
+            adapter_result_exit_code: None,
+            adapter_lanes: Vec::new(),
             candidates: Vec::new(),
             final_status: "RUNNING",
             total_elapsed_ms: 0,
@@ -238,29 +421,34 @@ fn run_with_program(request: EnsembleRequest<'_>, data_dir: &Path, program: &Pat
     );
 
     let mut command = Command::new(program);
-    command.args([
-        OsStr::new("ask"),
-        OsStr::new(request.task),
-        OsStr::new("--swarm"),
-        OsStr::new("--lanes"),
-        OsStr::new(request.lanes),
-        OsStr::new("--max-tokens"),
-        OsStr::new(&request.max_tokens.to_string()),
-        OsStr::new("--timeout"),
-        OsStr::new(&request.deadline_secs.to_string()),
-        OsStr::new("--json"),
-        OsStr::new("--usage-out"),
-        usage_path.as_os_str(),
-    ]);
+    command
+        .arg("ask-v2")
+        .arg("--stdin")
+        .arg("--swarm")
+        .arg("--lanes")
+        .arg(request.lanes)
+        .arg("--max-tokens")
+        .arg(request.max_tokens.to_string())
+        .arg("--deadline-secs")
+        .arg(request.deadline_secs.to_string())
+        .arg("--usage-out")
+        .arg(&usage_path);
+    if policy.remote {
+        command.arg("--allow-remote");
+    }
+    if policy.paid {
+        command.arg("--allow-paid");
+    }
     if no_cache {
         command.arg("--no-cache");
     }
     if policy.remote {
         command.env("ATS_PII_SHIELD", "1");
     }
-    eprintln!(
-        "warning: llmadapter currently receives the task via argv; do not include secrets or PII"
-    );
+    command.stdin(Stdio::from(private_stdin_file(
+        &run_dir,
+        request.task.as_bytes(),
+    )?));
 
     let adapter_started = Instant::now();
     let output = run_bounded(
@@ -289,6 +477,59 @@ fn run_with_program(request: EnsembleRequest<'_>, data_dir: &Path, program: &Pat
             request.deadline_secs
         );
     }
+    if output.stdout.truncated {
+        bail!(
+            "llmadapter JSON exceeded the {}-byte stdout limit",
+            MAX_ADAPTER_STDOUT
+        );
+    }
+
+    let parsed: AdapterOutput =
+        serde_json::from_slice(&output.stdout.bytes).context("llmadapter returned invalid JSON")?;
+    validate_adapter_output(
+        &parsed,
+        &output,
+        &request,
+        &policy,
+        &capability,
+        &task_hash,
+        task_bytes,
+    )?;
+    evidence.document.adapter_result_status = Some(parsed.status.clone());
+    evidence.document.adapter_result_exit_code = Some(parsed.exit_code);
+    evidence.document.adapter_lanes = parsed
+        .results
+        .iter()
+        .map(|result| LaneEvidence {
+            lane: result.lane.clone(),
+            model: result.model.clone(),
+            kind: result.kind.clone(),
+            class: result.class.clone(),
+            ok: result.ok,
+            terminal: result.terminal.clone(),
+            elapsed_ms: result.ms,
+            max_tokens: result.max_tokens,
+            cap_mode: result.cap_mode.clone(),
+            token_count_source: result.token_count_source.clone(),
+            input_tokens: result.input_tokens,
+            output_tokens: result.output_tokens,
+            cached: result.cached.unwrap_or(false),
+            call_started: result.call_started,
+        })
+        .collect();
+    evidence.checkpoint()?;
+    validate_usage(
+        &usage_path,
+        &parsed.accounting,
+        &parsed,
+        &request,
+        &capability,
+        &task_hash,
+        task_bytes,
+    )?;
+    usage_guard.keep();
+    evidence.document.usage_status = "COMPLETE";
+    evidence.checkpoint()?;
     if !output.status.success() {
         log_status(
             &store,
@@ -299,27 +540,13 @@ fn run_with_program(request: EnsembleRequest<'_>, data_dir: &Path, program: &Pat
             &run_dir,
         );
         bail!(
-            "llmadapter failed: status={} stdout_bytes={} stderr_bytes={}{}",
-            output.status,
-            output.stdout.total,
-            output.stderr.total,
-            truncation_note(&output)
-        );
-    }
-    if output.stdout.truncated {
-        bail!(
-            "llmadapter JSON exceeded the {}-byte stdout limit",
-            MAX_ADAPTER_STDOUT
+            "llmadapter structured failure: status={} exit_code={}",
+            parsed.status,
+            parsed.exit_code
         );
     }
 
-    let parsed: AdapterOutput =
-        serde_json::from_slice(&output.stdout.bytes).context("llmadapter returned invalid JSON")?;
-    validate_adapter_output(&parsed)?;
-    validate_usage(&usage_path)?;
-    evidence.document.usage_status = "COMPLETE";
-    evidence.checkpoint()?;
-
+    let valid_answers = parsed.ok;
     for (index, result) in parsed.results.into_iter().filter(|r| r.ok).enumerate() {
         let answer = result
             .answer
@@ -376,7 +603,10 @@ fn run_with_program(request: EnsembleRequest<'_>, data_dir: &Path, program: &Pat
             MAX_STDERR,
             &run_dir,
         )?;
-        let passed = !oracle_output.timed_out && oracle_output.status.success();
+        let passed = !oracle_output.timed_out
+            && oracle_output.status.success()
+            && !oracle_output.stdout.truncated
+            && !oracle_output.stderr.truncated;
         let candidate = &mut evidence.document.candidates[candidate_index];
         candidate.oracle = Some(OracleEvidence {
             elapsed_ms: millis(oracle_started.elapsed()),
@@ -416,7 +646,7 @@ fn run_with_program(request: EnsembleRequest<'_>, data_dir: &Path, program: &Pat
     evidence.finish("FAIL")?;
     bail!(
         "ensemble exhausted {} valid answer(s) without an oracle PASS; artifacts: {}",
-        parsed.ok,
+        valid_answers,
         run_dir.display()
     )
 }
@@ -473,10 +703,135 @@ fn validate(request: &EnsembleRequest<'_>) -> Result<LanePolicy> {
     Ok(policy)
 }
 
-fn validate_adapter_output(output: &AdapterOutput) -> Result<()> {
-    if output.results.is_empty() {
-        bail!("llmadapter returned no results");
+fn probe_capability(program: &Path, data_dir: &Path) -> Result<AdapterCapability> {
+    private_dir(data_dir)?;
+    let mut command = Command::new(program);
+    command
+        .args(["contract", "agentmaster capability probe"])
+        .stdin(Stdio::null());
+    let output = run_bounded(
+        command,
+        Duration::from_secs(CAPABILITY_TIMEOUT_SECS),
+        MAX_USAGE_BYTES as usize,
+        MAX_STDERR,
+        data_dir,
+    )
+    .context("llmadapter v2 capability probe failed")?;
+    if output.timed_out {
+        bail!("llmadapter v2 capability probe timed out");
     }
+    if !output.status.success() || output.stdout.truncated {
+        bail!(
+            "llmadapter v2 capability probe failed: status={} stdout_bytes={} stderr_bytes={}{}",
+            output.status,
+            output.stdout.total,
+            output.stderr.total,
+            truncation_note(&output)
+        );
+    }
+    let capability: AdapterCapability = serde_json::from_slice(&output.stdout.bytes)
+        .context("llmadapter capability is not parseable v2 JSON")?;
+    if capability.schema_version != 2
+        || !capability.ask_v2
+        || !(1..=MAX_WORKERS).contains(&capability.max_workers)
+        || !(1..=500).contains(&capability.max_result_tokens)
+        || !(1..=MAX_PROMPT_BYTES).contains(&capability.max_prompt_bytes)
+        || capability
+            .mode
+            .as_deref()
+            .is_some_and(|value| value != "swarm")
+        || capability
+            .default_max_workers
+            .is_some_and(|value| value != capability.max_workers)
+        || capability
+            .fanout_max_workers
+            .is_some_and(|value| value < capability.max_workers)
+        || capability
+            .max_result_tokens_semantics
+            .as_deref()
+            .is_some_and(|value| value != "requested_ceiling_by_capability")
+        || capability.tools_available == Some(true)
+        || capability
+            .capsule_visible_input_tokens_proxy
+            .is_some_and(|value| value == 0 || value > 500)
+        || capability
+            .route
+            .as_deref()
+            .is_some_and(|value| value != "none")
+        || capability
+            .packet
+            .as_deref()
+            .is_some_and(|value| value.is_empty() || value.len() > 4_096)
+    {
+        bail!(
+            "llmadapter v2 capability required (schema_version=2, ask_v2=true, max_workers<=3, max_result_tokens<=500, max_prompt_bytes<=1800)"
+        );
+    }
+    Ok(capability)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_adapter_output(
+    output: &AdapterOutput,
+    captured: &Captured,
+    request: &EnsembleRequest<'_>,
+    policy: &LanePolicy,
+    capability: &AdapterCapability,
+    task_hash: &str,
+    task_bytes: usize,
+) -> Result<()> {
+    if output.schema != "llmadapter.result" || output.schema_version != 2 {
+        bail!(
+            "llmadapter result schema mismatch: schema={} version={}",
+            output.schema,
+            output.schema_version
+        );
+    }
+    if output.prompt.sha256 != task_hash
+        || output.prompt.bytes != task_bytes
+        || output.prompt.transport != "stdin"
+    {
+        bail!("llmadapter prompt hash/size/transport mismatch");
+    }
+    if output.stage != "worker" {
+        bail!("llmadapter returned unsupported stage {}", output.stage);
+    }
+    let actual_exit = captured
+        .status
+        .code()
+        .context("llmadapter exited without a numeric status")?;
+    if output.exit_code != actual_exit {
+        bail!(
+            "llmadapter exit-code mismatch: process={actual_exit} result={}",
+            output.exit_code
+        );
+    }
+    if !matches!(
+        output.status.as_str(),
+        "ok" | "partial" | "failed" | "invalid"
+    ) {
+        bail!("llmadapter returned invalid status {}", output.status);
+    }
+    if (actual_exit == 0) != matches!(output.status.as_str(), "ok" | "partial") {
+        bail!(
+            "llmadapter status/exit mismatch: status={} exit_code={actual_exit}",
+            output.status
+        );
+    }
+    if output.lanes.requested != request.lanes
+        || output.lanes.fanout
+        || !(1..=capability.max_workers).contains(&output.lanes.cap)
+        || output.lanes.selected > output.lanes.cap
+    {
+        bail!("llmadapter lane selection/cap contract mismatch");
+    }
+    if output.total != output.results.len()
+        || output.total != output.lanes.selected
+        || output.total > capability.max_workers
+    {
+        bail!("llmadapter result count/cap contract mismatch");
+    }
+
     let valid = output
         .results
         .iter()
@@ -485,35 +840,197 @@ fn validate_adapter_output(output: &AdapterOutput) -> Result<()> {
                 .answer
                 .as_deref()
                 .is_some_and(|answer| !answer.trim().is_empty())
+                && matches!(r.terminal.as_str(), "succeeded" | "cached")
         })
         .count();
-    if output.ok != valid || valid == 0 {
+    if output.ok != valid || (captured.status.success() && valid == 0) {
         bail!(
             "llmadapter result contract failed: ok={} valid_results={valid}",
             output.ok
         );
     }
+    for result in &output.results {
+        if result.lane.is_empty()
+            || !matches!(result.kind.as_str(), "openrouter" | "ollama" | "cli")
+            || !matches!(result.class.as_str(), "free" | "paid" | "local" | "cli")
+            || !matches!(
+                result.terminal.as_str(),
+                "succeeded" | "failed" | "timeout" | "output_limit" | "cached"
+            )
+            || !matches!(
+                result.token_count_source.as_str(),
+                "provider_reported" | "estimated" | "unknown"
+            )
+            || !matches!(
+                result.cap_mode.as_str(),
+                "provider_server" | "local_native" | "advisory_only"
+            )
+        {
+            bail!("llmadapter result contains an invalid lane status");
+        }
+        let cached = result.cached.unwrap_or(false);
+        if result.error.as_ref().is_some_and(|value| value.len() > 80)
+            || result.detail.as_ref().is_some_and(|value| value.len() > 80)
+            || cached != (result.terminal == "cached")
+            || (cached && result.call_started)
+            || (matches!(
+                result.terminal.as_str(),
+                "succeeded" | "timeout" | "output_limit"
+            ) && !result.call_started)
+        {
+            bail!("llmadapter result contains inconsistent terminal evidence");
+        }
+        if result.max_tokens != request.max_tokens
+            || (result.class != "local" && !policy.remote)
+            || (result.class == "paid" && !policy.paid)
+            || (result.ok != matches!(result.terminal.as_str(), "succeeded" | "cached"))
+            || !matches!(
+                (
+                    result.kind.as_str(),
+                    result.class.as_str(),
+                    result.cap_mode.as_str()
+                ),
+                ("openrouter", "free" | "paid", "provider_server")
+                    | ("ollama", "local", "local_native")
+                    | ("cli", "local" | "cli", "advisory_only")
+            )
+        {
+            bail!("llmadapter result violates lane policy or token contract");
+        }
+    }
     Ok(())
 }
 
-fn validate_usage(path: &Path) -> Result<()> {
-    let size = fs::metadata(path)
-        .context("llmadapter did not write the usage artifact")?
-        .len();
-    if size > MAX_USAGE_BYTES {
+fn validate_usage(
+    path: &Path,
+    embedded: &UsageOutput,
+    output: &AdapterOutput,
+    request: &EnsembleRequest<'_>,
+    capability: &AdapterCapability,
+    task_hash: &str,
+    task_bytes: usize,
+) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).context("llmadapter did not write the usage artifact")?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("llmadapter usage artifact is not a regular file");
+    }
+    if metadata.len() > MAX_USAGE_BYTES {
         bail!("llmadapter usage artifact exceeded {MAX_USAGE_BYTES} bytes");
     }
-    let file = File::open(path).context("llmadapter did not write the usage artifact")?;
-    let usage: UsageOutput =
-        serde_json::from_reader(file).context("llmadapter wrote invalid usage JSON")?;
-    if !usage.completed || usage.failed {
-        bail!(
-            "llmadapter usage is incomplete or failed (completed={}, failed={})",
-            usage.completed,
-            usage.failed
-        );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!("llmadapter usage artifact permissions are not private");
+        }
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            bail!("llmadapter usage artifact is not owned by the current user");
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(libc::O_NOFOLLOW);
+        let file = options
+            .open(path)
+            .context("llmadapter did not write the usage artifact")?;
+        let opened = file.metadata()?;
+        if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+            bail!("llmadapter usage artifact changed while opening");
+        }
+        validate_usage_file(
+            file, path, embedded, output, request, capability, task_hash, task_bytes,
+        )?;
+        Ok(())
     }
+    #[cfg(not(unix))]
+    {
+        let file = File::open(path).context("llmadapter did not write the usage artifact")?;
+        validate_usage_file(
+            file, path, embedded, output, request, capability, task_hash, task_bytes,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_usage_file(
+    file: File,
+    path: &Path,
+    embedded: &UsageOutput,
+    output: &AdapterOutput,
+    request: &EnsembleRequest<'_>,
+    capability: &AdapterCapability,
+    task_hash: &str,
+    task_bytes: usize,
+) -> Result<()> {
+    let usage: UsageOutput =
+        serde_json::from_reader(file).context("llmadapter wrote invalid or non-v2 usage JSON")?;
+    if usage != *embedded {
+        bail!("llmadapter usage/accounting mismatch");
+    }
+    let calls_started = output
+        .results
+        .iter()
+        .filter(|result| result.call_started)
+        .count();
+    let cache_hits = output
+        .results
+        .iter()
+        .filter(|result| result.cached.unwrap_or(false))
+        .count();
+    let input_tokens = expected_token_accounting(&output.results, true);
+    let output_tokens = expected_token_accounting(&output.results, false);
+    if usage.schema != "llmadapter.accounting"
+        || usage.schema_version != 2
+        || usage.status != "complete"
+        || !usage.terminal_records_complete
+        || usage.prompt_sha256 != task_hash
+        || usage.prompt_bytes != task_bytes
+        || usage.transport != "stdin"
+        || usage.stage != "worker"
+        || usage.requested_lane_spec != request.lanes
+        || usage.selected_lane_count != output.results.len()
+        || usage.selected_lane_count != output.lanes.selected
+        || usage.lane_cap != output.lanes.cap
+        || usage.selected_lane_count > usage.lane_cap
+        || !(1..=capability.max_workers).contains(&usage.lane_cap)
+        || usage.fanout
+        || usage.max_tokens != request.max_tokens
+        || usage.calls_started != calls_started
+        || usage.calls_completed != calls_started
+        || usage.cache_hits != cache_hits
+        || usage.input_tokens != input_tokens
+        || usage.output_tokens != output_tokens
+        || usage.cost_status != "unknown"
+        || !usage.completed
+        || usage.failed != (output.ok == 0)
+    {
+        bail!("llmadapter usage schema/hash/accounting is incomplete or inconsistent");
+    }
+    write_private_json(path, &usage).context("failed to canonicalize llmadapter usage artifact")?;
     Ok(())
+}
+
+fn expected_token_accounting(results: &[AdapterResult], input: bool) -> TokenAccounting {
+    let mut accounting = TokenAccounting {
+        reported: 0,
+        estimated: 0,
+        unknown_calls: 0,
+    };
+    for result in results {
+        if !result.call_started || result.cached.unwrap_or(false) {
+            continue;
+        }
+        let count = if input {
+            result.input_tokens
+        } else {
+            result.output_tokens
+        };
+        match (result.token_count_source.as_str(), count) {
+            ("provider_reported", Some(value)) => accounting.reported += value,
+            ("estimated", Some(value)) => accounting.estimated += value,
+            _ => accounting.unknown_calls += 1,
+        }
+    }
+    accounting
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -578,6 +1095,34 @@ fn create_private_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn private_stdin_file(dir: &Path, bytes: &[u8]) -> Result<File> {
+    let path = dir.join(format!(
+        ".task-stdin-{}",
+        uuid::Uuid::new_v4().as_hyphenated()
+    ));
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.seek(SeekFrom::Start(0))?;
+    #[cfg(unix)]
+    fs::remove_file(&path)?;
+    #[cfg(not(unix))]
+    {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        bail!("ensemble private stdin transport currently requires macOS or Linux");
+    }
+    #[cfg(unix)]
+    Ok(file)
+}
+
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -622,23 +1167,54 @@ fn run_bounded(
     timeout: Duration,
     stdout_limit: usize,
     stderr_limit: usize,
-    capture_dir: &Path,
+    _capture_dir: &Path,
 ) -> Result<Captured> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut stdout_file = private_capture_file(capture_dir, "stdout")?;
-    let mut stderr_file = private_capture_file(capture_dir, "stderr")?;
-    command
-        .stdout(Stdio::from(stdout_file.try_clone()?))
-        .stderr(Stdio::from(stderr_file.try_clone()?));
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().context("failed to start subprocess")?;
     let process_group = child.id();
+    let mut child_stdout = child
+        .stdout
+        .take()
+        .context("subprocess stdout pipe missing")?;
+    let mut child_stderr = child
+        .stderr
+        .take()
+        .context("subprocess stderr pipe missing")?;
+    if let Err(error) = set_nonblocking(&child_stdout).and_then(|_| set_nonblocking(&child_stderr))
+    {
+        kill_process_group(process_group);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let mut stdout = empty_capture(stdout_limit);
+    let mut stderr = empty_capture(stderr_limit);
 
     let start = Instant::now();
     let (status, timed_out) = loop {
+        let output_limited = match drain_capture(&mut child_stdout, &mut stdout, stdout_limit)
+            .and_then(|stdout_limited| {
+                drain_capture(&mut child_stderr, &mut stderr, stderr_limit)
+                    .map(|stderr_limited| stdout_limited | stderr_limited)
+            }) {
+            Ok(limited) => limited,
+            Err(error) => {
+                kill_process_group(process_group);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.into());
+            }
+        };
+        if output_limited {
+            kill_process_group(process_group);
+            let _ = child.kill();
+            break (child.wait()?, false);
+        }
         match child.try_wait() {
             Ok(Some(status)) => break (status, false),
             Ok(None) => {}
@@ -658,8 +1234,8 @@ fn run_bounded(
     };
 
     kill_process_group(process_group);
-    let stdout = read_capture(&mut stdout_file, stdout_limit)?;
-    let stderr = read_capture(&mut stderr_file, stderr_limit)?;
+    let _ = drain_capture(&mut child_stdout, &mut stdout, stdout_limit)?;
+    let _ = drain_capture(&mut child_stderr, &mut stderr, stderr_limit)?;
     Ok(Captured {
         status,
         stdout,
@@ -668,29 +1244,55 @@ fn run_bounded(
     })
 }
 
-fn private_capture_file(dir: &Path, label: &str) -> Result<File> {
-    let path = dir.join(format!(
-        ".capture-{label}-{}",
-        uuid::Uuid::new_v4().as_hyphenated()
-    ));
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+fn empty_capture(limit: usize) -> CapturedStream {
+    CapturedStream {
+        bytes: Vec::with_capacity(limit.min(8_192)),
+        total: 0,
+        truncated: false,
     }
-    let file = options.open(&path)?;
-    #[cfg(unix)]
-    fs::remove_file(&path)?;
-    #[cfg(not(unix))]
+}
+
+#[cfg(unix)]
+fn set_nonblocking(stream: &impl std::os::fd::AsRawFd) -> Result<()> {
+    let descriptor = stream.as_raw_fd();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
     {
-        drop(file);
-        let _ = fs::remove_file(&path);
-        bail!("ensemble subprocess capture currently requires macOS or Linux");
+        return Err(std::io::Error::last_os_error().into());
     }
-    #[cfg(unix)]
-    Ok(file)
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_nonblocking<T>(_stream: &T) -> Result<()> {
+    bail!("ensemble subprocess capture currently requires macOS or Linux")
+}
+
+fn drain_capture(
+    reader: &mut impl Read,
+    capture: &mut CapturedStream,
+    limit: usize,
+) -> std::io::Result<bool> {
+    let mut chunk = [0_u8; 8_192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(capture.truncated),
+            Ok(count) => {
+                capture.total = capture.total.saturating_add(count);
+                let retained = limit.saturating_sub(capture.bytes.len()).min(count);
+                capture.bytes.extend_from_slice(&chunk[..retained]);
+                if retained < count {
+                    capture.truncated = true;
+                    return Ok(true);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(capture.truncated);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn kill_process_group(process_group: u32) {
@@ -704,18 +1306,6 @@ fn kill_process_group(process_group: u32) {
             let _ = kill(-(process_group as i32), 9);
         }
     }
-}
-
-fn read_capture(file: &mut File, limit: usize) -> std::io::Result<CapturedStream> {
-    let total = file.metadata()?.len().min(usize::MAX as u64) as usize;
-    file.seek(SeekFrom::Start(0))?;
-    let mut bytes = Vec::with_capacity(total.min(limit));
-    file.take(limit as u64).read_to_end(&mut bytes)?;
-    Ok(CapturedStream {
-        truncated: total > limit,
-        bytes,
-        total,
-    })
 }
 
 fn truncation_note(output: &Captured) -> &'static str {
@@ -802,29 +1392,184 @@ mod tests {
         path
     }
 
+    fn accounting(task: &str, lanes: &str, completed: bool) -> serde_json::Value {
+        serde_json::json!({
+            "schema": "llmadapter.accounting",
+            "schema_version": 2,
+            "status": "complete",
+            "terminal_records_complete": completed,
+            "prompt_sha256": sha256_hex(task.as_bytes()),
+            "prompt_bytes": task.len(),
+            "transport": "stdin",
+            "stage": "worker",
+            "requested_lane_spec": lanes,
+            "selected_lane_count": 3,
+            "lane_cap": 3,
+            "fanout": false,
+            "max_tokens": 500,
+            "calls_started": 3,
+            "calls_completed": 3,
+            "cache_hits": 0,
+            "input_tokens": {"reported": 0, "estimated": 3, "unknown_calls": 0},
+            "output_tokens": {"reported": 0, "estimated": 3, "unknown_calls": 0},
+            "estimated_cost_usd": null,
+            "cost_status": "unknown",
+            "completed": true,
+            "failed": false
+        })
+    }
+
+    fn adapter_result(task: &str, lanes: &str, accounting: serde_json::Value) -> String {
+        let result = |lane: &str, answer: &str| {
+            let local = lanes == "local";
+            serde_json::json!({
+                "lane": lane,
+                "kind": if local { "ollama" } else { "cli" },
+                "class": if local { "local" } else { "cli" },
+                "ok": true,
+                "terminal": "succeeded",
+                "ms": 1,
+                "answer": answer,
+                "call_started": true,
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "token_count_source": "estimated",
+                "max_tokens": 500,
+                "cap_mode": if local { "local_native" } else { "advisory_only" }
+            })
+        };
+        serde_json::to_string(&serde_json::json!({
+            "schema": "llmadapter.result",
+            "schema_version": 2,
+            "status": "ok",
+            "exit_code": 0,
+            "prompt": {
+                "sha256": sha256_hex(task.as_bytes()),
+                "bytes": task.len(),
+                "transport": "stdin"
+            },
+            "stage": "worker",
+            "lanes": {"requested": lanes, "selected": 3, "cap": 3, "fanout": false},
+            "ok": 3,
+            "total": 3,
+            "results": [
+                result("one", "loser"),
+                result("two", "winner"),
+                result("three", "unused")
+            ],
+            "accounting": accounting
+        }))
+        .unwrap()
+    }
+
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+
     #[cfg(unix)]
-    fn fake_adapter(root: &Path, lane: &str, usage: &str, extra_checks: &str) -> PathBuf {
+    fn fake_adapter(root: &Path, lane: &str, usage_complete: bool, extra_checks: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
         let path = root.join("llmadapter");
+        let embedded = accounting("fixture task", lane, true);
+        let usage =
+            serde_json::to_string(&accounting("fixture task", lane, usage_complete)).unwrap();
+        let result = adapter_result("fixture task", lane, embedded);
         let script = format!(
             r#"#!/bin/sh
 set -eu
-[ "$1" = ask ]
-[ "$2" = "fixture task" ]
-[ "$3" = --swarm ]
-[ "$4" = --lanes ]
-[ "$5" = "{lane}" ]
-[ "$6" = --max-tokens ]
-[ "$7" = 500 ]
-[ "$8" = --timeout ]
-[ "$9" = 2 ]
-[ "${{10}}" = --json ]
-[ "${{11}}" = --usage-out ]
+if [ "$1" = contract ]; then
+  [ "$#" = 2 ]
+  [ "$2" = "agentmaster capability probe" ]
+  printf '%s' '{{"schema_version":2,"ask_v2":true,"max_workers":3,"max_result_tokens":500,"max_prompt_bytes":1800}}'
+  exit 0
+fi
+[ "$1" = ask-v2 ]
+case " $* " in *"fixture task"*) exit 91;; esac
+all_args=$*
+shift
+stdin=0
+swarm=0
+lanes=
+usage_path=
+max_tokens=
+deadline=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --stdin) stdin=1; shift ;;
+    --swarm) swarm=1; shift ;;
+    --lanes) lanes=$2; shift 2 ;;
+    --max-tokens) max_tokens=$2; shift 2 ;;
+    --deadline-secs) deadline=$2; shift 2 ;;
+    --usage-out) usage_path=$2; shift 2 ;;
+    --allow-remote|--allow-paid|--no-cache) shift ;;
+    *) exit 92 ;;
+  esac
+done
+[ "$stdin" = 1 ]
+[ "$swarm" = 1 ]
+[ "$lanes" = "{lane}" ]
+[ "$max_tokens" = 500 ]
+[ "$deadline" = 2 ]
+[ -n "$usage_path" ]
+[ -f /dev/stdin ]
+[ "$(cat)" = "fixture task" ]
 {extra_checks}
-printf '%s' '{usage}' > "${{12}}"
-printf '%s' '{{"ok":3,"results":[{{"lane":"one","ok":true,"answer":"loser"}},{{"lane":"two","ok":true,"answer":"winner"}},{{"lane":"three","ok":true,"answer":"unused"}}]}}'
-"#
+printf '%s' {usage} > "$usage_path"
+chmod 600 "$usage_path"
+printf '%s' {result}
+"#,
+            usage = shell_quote(&usage),
+            result = shell_quote(&result),
+        );
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn protocol_adapter(
+        root: &Path,
+        capability: &str,
+        result: &str,
+        usage: &str,
+        exit_code: i32,
+        ask_marker: Option<&Path>,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = root.join("llmadapter");
+        let marker = ask_marker
+            .map(|path| format!("touch {}", shell_quote(&path.display().to_string())))
+            .unwrap_or_default();
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+if [ "$1" = contract ]; then
+  printf '%s' {capability}
+  exit 0
+fi
+[ "$1" = ask-v2 ]
+{marker}
+case " $* " in *"fixture task"*) exit 91;; esac
+usage_path=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --usage-out ]; then
+    usage_path=$2
+    shift 2
+  else
+    shift
+  fi
+done
+[ "$(cat)" = "fixture task" ]
+printf '%s' {usage} > "$usage_path"
+chmod 600 "$usage_path"
+printf '%s' {result}
+exit {exit_code}
+"#,
+            capability = shell_quote(capability),
+            result = shell_quote(result),
+            usage = shell_quote(usage),
         );
         fs::write(&path, script).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -860,16 +1605,86 @@ printf '%s' '{{"ok":3,"results":[{{"lane":"one","ok":true,"answer":"loser"}},{{"
 
     #[cfg(unix)]
     #[test]
+    fn dry_run_probes_v2_but_never_starts_a_provider() {
+        let root = temp_dir();
+        let program = fake_adapter(&root, "local", true, "");
+        let mut req = request("fixture task", "true");
+        req.go = false;
+        req.dry_run = true;
+        run_with_program(req, &root, &program).unwrap();
+        assert!(!root.join("ensembles").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn old_adapter_fails_closed_before_ask_v2() {
+        let root = temp_dir();
+        let ask_marker = root.join("ask-was-called");
+        let program = protocol_adapter(
+            &root,
+            r#"{"max_workers":3,"max_result_tokens":500}"#,
+            "{}",
+            "{}",
+            0,
+            Some(&ask_marker),
+        );
+        let error = run_with_program(request("fixture task", "true"), &root, &program)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("capability"));
+        assert!(!ask_marker.exists());
+        assert!(!root.join("ensembles").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_wrong_capability_version_before_ask_v2() {
+        let root = temp_dir();
+        let ask_marker = root.join("ask-was-called");
+        let program = protocol_adapter(
+            &root,
+            r#"{"schema_version":3,"ask_v2":true,"max_workers":3,"max_result_tokens":500,"max_prompt_bytes":1800}"#,
+            "{}",
+            "{}",
+            0,
+            Some(&ask_marker),
+        );
+        let error = run_with_program(request("fixture task", "true"), &root, &program)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("capability"));
+        assert!(!ask_marker.exists());
+        assert!(!root.join("ensembles").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_oversized_prompt_before_ask_v2() {
+        let root = temp_dir();
+        let ask_marker = root.join("ask-was-called");
+        let program = protocol_adapter(
+            &root,
+            r#"{"schema_version":2,"ask_v2":true,"max_workers":3,"max_result_tokens":500,"max_prompt_bytes":4}"#,
+            "{}",
+            "{}",
+            0,
+            Some(&ask_marker),
+        );
+        let error = run_with_program(request("fixture task", "true"), &root, &program)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("allows at most 4"));
+        assert!(!ask_marker.exists());
+        assert!(!root.join("ensembles").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn runs_exact_bounded_contract_and_stops_at_first_oracle_pass() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = temp_dir();
-        let program = fake_adapter(
-            &root,
-            "local",
-            r#"{"completed":true,"failed":false}"#,
-            r#"[ "$#" = 12 ]"#,
-        );
+        let program = fake_adapter(&root, "local", true, "");
         run_with_program(
             request(
                 "fixture task",
@@ -910,7 +1725,15 @@ printf '%s' '{{"ok":3,"results":[{{"lane":"one","ok":true,"answer":"loser"}},{{"
         }
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(run_dir.join("manifest.json")).unwrap()).unwrap();
-        assert_eq!(manifest["task_transport"], "argv");
+        assert_eq!(manifest["schema_version"], 2);
+        assert_eq!(manifest["task_transport"], "stdin");
+        assert_eq!(manifest["task_bytes"], 12);
+        assert_eq!(manifest["llmadapter_schema_version"], 2);
+        assert_eq!(manifest["adapter_result_status"], "ok");
+        assert_eq!(manifest["adapter_result_exit_code"], 0);
+        assert_eq!(manifest["adapter_lanes"].as_array().unwrap().len(), 3);
+        assert_eq!(manifest["adapter_lanes"][0]["cap_mode"], "local_native");
+        assert_eq!(manifest["adapter_lanes"][0]["max_tokens"], 500);
         assert_eq!(manifest["requested_max_tokens"], 500);
         assert_eq!(
             manifest["token_limit_status"],
@@ -933,25 +1756,241 @@ printf '%s' '{{"ok":3,"results":[{{"lane":"one","ok":true,"answer":"loser"}},{{"
 
     #[cfg(unix)]
     #[test]
-    fn rejects_incomplete_usage_before_oracle() {
+    fn rejects_result_schema_mismatch_before_oracle() {
         let root = temp_dir();
-        let program = fake_adapter(
+        let oracle_marker = root.join("oracle-was-called");
+        let embedded = accounting("fixture task", "local", true);
+        let mut result: serde_json::Value =
+            serde_json::from_str(&adapter_result("fixture task", "local", embedded.clone()))
+                .unwrap();
+        result["schema_version"] = serde_json::json!(1);
+        let program = protocol_adapter(
             &root,
-            "local",
-            r#"{"completed":false,"failed":false}"#,
-            r#"[ "$#" = 12 ]"#,
+            r#"{"schema_version":2,"ask_v2":true,"max_workers":3,"max_result_tokens":500,"max_prompt_bytes":1800}"#,
+            &serde_json::to_string(&result).unwrap(),
+            &serde_json::to_string(&embedded).unwrap(),
+            0,
+            None,
+        );
+        let oracle = format!(
+            "touch {}",
+            shell_quote(&oracle_marker.display().to_string())
+        );
+        let error = run_with_program(request("fixture task", &oracle), &root, &program)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("schema mismatch"));
+        assert!(!oracle_marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_empty_lane_name_before_oracle() {
+        let root = temp_dir();
+        let oracle_marker = root.join("oracle-was-called");
+        let embedded = accounting("fixture task", "local", true);
+        let mut result: serde_json::Value =
+            serde_json::from_str(&adapter_result("fixture task", "local", embedded.clone()))
+                .unwrap();
+        result["results"][0]["lane"] = serde_json::json!("");
+        let program = protocol_adapter(
+            &root,
+            r#"{"schema_version":2,"ask_v2":true,"max_workers":3,"max_result_tokens":500,"max_prompt_bytes":1800}"#,
+            &serde_json::to_string(&result).unwrap(),
+            &serde_json::to_string(&embedded).unwrap(),
+            0,
+            None,
+        );
+        let oracle = format!(
+            "touch {}",
+            shell_quote(&oracle_marker.display().to_string())
+        );
+        let error = run_with_program(request("fixture task", &oracle), &root, &program)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid lane status"));
+        assert!(!oracle_marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_usage_mismatch_before_oracle() {
+        let root = temp_dir();
+        let oracle_marker = root.join("oracle-was-called");
+        let embedded = accounting("fixture task", "local", true);
+        let mut usage = embedded.clone();
+        usage["prompt_sha256"] = serde_json::json!("wrong");
+        let program = protocol_adapter(
+            &root,
+            r#"{"schema_version":2,"ask_v2":true,"max_workers":3,"max_result_tokens":500,"max_prompt_bytes":1800}"#,
+            &adapter_result("fixture task", "local", embedded),
+            &serde_json::to_string(&usage).unwrap(),
+            0,
+            None,
+        );
+        let oracle = format!(
+            "touch {}",
+            shell_quote(&oracle_marker.display().to_string())
+        );
+        let error = run_with_program(request("fixture task", &oracle), &root, &program)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("usage/accounting mismatch"));
+        assert!(!oracle_marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_unknown_accounting_fields_and_removes_untrusted_usage() {
+        let root = temp_dir();
+        let mut embedded = accounting("fixture task", "local", true);
+        embedded["unexpected"] = serde_json::json!("must not persist");
+        let program = protocol_adapter(
+            &root,
+            r#"{"schema_version":2,"ask_v2":true,"max_workers":3,"max_result_tokens":500,"max_prompt_bytes":1800}"#,
+            &adapter_result("fixture task", "local", embedded.clone()),
+            &serde_json::to_string(&embedded).unwrap(),
+            0,
+            None,
         );
         let error = run_with_program(request("fixture task", "true"), &root, &program)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("usage is incomplete"));
+        assert!(error.contains("invalid JSON"));
         let run_dir = fs::read_dir(root.join("ensembles").join("proof-run"))
             .unwrap()
             .next()
             .unwrap()
             .unwrap()
             .path();
-        assert_eq!(fs::read_dir(&run_dir).unwrap().count(), 2);
+        assert!(!run_dir.join("usage.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_fabricated_accounting_derived_from_lane_results() {
+        let root = temp_dir();
+        let mut embedded = accounting("fixture task", "local", true);
+        embedded["calls_started"] = serde_json::json!(2);
+        embedded["calls_completed"] = serde_json::json!(2);
+        let program = protocol_adapter(
+            &root,
+            r#"{"schema_version":2,"ask_v2":true,"max_workers":3,"max_result_tokens":500,"max_prompt_bytes":1800}"#,
+            &adapter_result("fixture task", "local", embedded.clone()),
+            &serde_json::to_string(&embedded).unwrap(),
+            0,
+            None,
+        );
+        let error = run_with_program(request("fixture task", "true"), &root, &program)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("incomplete or inconsistent"));
+        let run_dir = fs::read_dir(root.join("ensembles").join("proof-run"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(!run_dir.join("usage.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_nonzero_structured_failure_before_returning_error() {
+        let root = temp_dir();
+        let oracle_marker = root.join("oracle-was-called");
+        let mut usage = accounting("fixture task", "local", true);
+        usage["selected_lane_count"] = serde_json::json!(1);
+        usage["calls_started"] = serde_json::json!(1);
+        usage["calls_completed"] = serde_json::json!(1);
+        usage["failed"] = serde_json::json!(true);
+        let mut result = serde_json::json!({
+            "schema": "llmadapter.result",
+            "schema_version": 2,
+            "status": "failed",
+            "exit_code": 1,
+            "prompt": {
+                "sha256": sha256_hex(b"fixture task"),
+                "bytes": 12,
+                "transport": "stdin"
+            },
+            "stage": "worker",
+            "lanes": {"requested": "local", "selected": 1, "cap": 3, "fanout": false},
+            "ok": 0,
+            "total": 1,
+            "results": [{
+                "lane": "one",
+                "kind": "ollama",
+                "class": "local",
+                "ok": false,
+                "terminal": "failed",
+                "ms": 1,
+                "error": "provider unavailable",
+                "call_started": true,
+                "input_tokens": null,
+                "output_tokens": null,
+                "token_count_source": "unknown",
+                "max_tokens": 500,
+                "cap_mode": "local_native"
+            }],
+            "accounting": usage
+        });
+        usage["input_tokens"] =
+            serde_json::json!({"reported": 0, "estimated": 0, "unknown_calls": 1});
+        usage["output_tokens"] =
+            serde_json::json!({"reported": 0, "estimated": 0, "unknown_calls": 1});
+        result["accounting"] = usage;
+        let result_string = serde_json::to_string(&result).unwrap();
+        let usage_string = serde_json::to_string(&result["accounting"]).unwrap();
+        let program = protocol_adapter(
+            &root,
+            r#"{"schema_version":2,"ask_v2":true,"max_workers":3,"max_result_tokens":500,"max_prompt_bytes":1800}"#,
+            &result_string,
+            &usage_string,
+            1,
+            None,
+        );
+        let oracle = format!(
+            "touch {}",
+            shell_quote(&oracle_marker.display().to_string())
+        );
+        let error = run_with_program(request("fixture task", &oracle), &root, &program)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("structured failure: status=failed exit_code=1"));
+        assert!(!oracle_marker.exists());
+        let run_dir = fs::read_dir(root.join("ensembles").join("proof-run"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(run_dir.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["adapter_result_status"], "failed");
+        assert_eq!(manifest["adapter_result_exit_code"], 1);
+        assert_eq!(manifest["usage_status"], "COMPLETE");
+        assert_eq!(manifest["adapter_lanes"][0]["terminal"], "failed");
+        assert_eq!(manifest["candidates"].as_array().unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_incomplete_usage_before_oracle() {
+        let root = temp_dir();
+        let program = fake_adapter(&root, "local", false, "");
+        let error = run_with_program(request("fixture task", "true"), &root, &program)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("usage/accounting mismatch"));
+        let run_dir = fs::read_dir(root.join("ensembles").join("proof-run"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(fs::read_dir(&run_dir).unwrap().count(), 1);
+        assert!(!run_dir.join("usage.json").exists());
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(run_dir.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest["final_status"], "ERROR");
@@ -965,9 +2004,9 @@ printf '%s' '{{"ok":3,"results":[{{"lane":"one","ok":true,"answer":"loser"}},{{"
         let program = fake_adapter(
             &root,
             "free",
-            r#"{"completed":true,"failed":false}"#,
-            r#"[ "$#" = 13 ]
-[ "${13}" = --no-cache ]
+            true,
+            r#"case " $all_args " in *" --allow-remote "*) ;; *) exit 93;; esac
+case " $all_args " in *" --no-cache "*) ;; *) exit 94;; esac
 [ "$ATS_PII_SHIELD" = 1 ]"#,
         );
         let mut req = request("fixture task", "true");
@@ -979,9 +2018,8 @@ printf '%s' '{{"ok":3,"results":[{{"lane":"one","ok":true,"answer":"loser"}},{{"
         let fresh_program = fake_adapter(
             &fresh_root,
             "local",
-            r#"{"completed":true,"failed":false}"#,
-            r#"[ "$#" = 13 ]
-[ "${13}" = --no-cache ]"#,
+            true,
+            r#"case " $all_args " in *" --no-cache "*) ;; *) exit 94;; esac"#,
         );
         let mut fresh = request("fixture task", "true");
         fresh.fresh = true;
@@ -995,7 +2033,18 @@ printf '%s' '{{"ok":3,"results":[{{"lane":"one","ok":true,"answer":"loser"}},{{"
 
         let root = temp_dir();
         let program = root.join("slow-llmadapter");
-        fs::write(&program, "#!/bin/sh\nsleep 10 &\nwait\n").unwrap();
+        fs::write(
+            &program,
+            r#"#!/bin/sh
+if [ "$1" = contract ]; then
+  printf '%s' '{"schema_version":2,"ask_v2":true,"max_workers":3,"max_result_tokens":500,"max_prompt_bytes":1800}'
+  exit 0
+fi
+sleep 10 &
+wait
+"#,
+        )
+        .unwrap();
         fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
         let mut req = request("fixture task", "true");
         req.deadline_secs = 1;
@@ -1026,5 +2075,37 @@ printf '%s' '{{"ok":3,"results":[{{"lane":"one","ok":true,"answer":"loser"}},{{"
         assert!(!output.timed_out);
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(fs::read_dir(root).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pipe_capture_retains_only_the_configured_limit() {
+        let root = temp_dir();
+        let mut command = Command::new("sh");
+        command.args(["-c", "dd if=/dev/zero bs=1048576 count=1 2>/dev/null"]);
+        let output = run_bounded(command, Duration::from_secs(2), 4_096, 1_024, &root).unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.truncated);
+        assert_eq!(output.stdout.bytes.len(), 4_096);
+        assert!(output.stdout.total > 4_096);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pipe_capture_does_not_limit_child_artifacts() {
+        let root = temp_dir();
+        let artifact = root.join("large-artifact.bin");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            &format!(
+                "dd if=/dev/zero of={} bs=1048576 count=2 2>/dev/null; printf ok",
+                shell_quote(&artifact.display().to_string())
+            ),
+        ]);
+        let output = run_bounded(command, Duration::from_secs(2), 4_096, 1_024, &root).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.bytes, b"ok");
+        assert_eq!(fs::metadata(artifact).unwrap().len(), 2 * 1_048_576);
     }
 }

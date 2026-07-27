@@ -9,14 +9,17 @@ All notable changes to agentmaster are documented here. Newest first.
   a requested output ceiling of at most 500 tokens, bounded process/oracle
   deadlines, private answer/usage artifacts, and first-oracle-PASS selection.
   Provider enforcement varies, so this is not described as a hard token or
-  cost budget; a separate 1 MiB adapter-JSON limit is enforced locally.
+  cost budget; bounded nonblocking pipes cap retained subprocess output without
+  imposing a file-size limit on unrelated child artifacts.
 - The bridge invokes llmadapter without aggregate, verify, race, fanout, or
-  pretend token budgets. It validates both result JSON and completed usage,
-  keeps the prompt/raw JSON out of durable files and SQLite, and records only
-  status, SHA-256 fingerprints, bounded timings, oracle exits, and artifact
-  paths in a private manifest. Because current llmadapter lacks stdin/file
-  prompt input, the task is passed through argv with an explicit privacy
-  warning.
+  pretend token budgets. It now requires the providerless v2 capability probe
+  and `ask-v2`; older adapters fail closed without a provider call. Tasks move
+  through stdin from an immediately unlinked private file, never child argv.
+  Exact schema v2, the advertised 1,800-byte prompt cap, prompt hash/size,
+  worker cap, terminal accounting, and the private usage artifact must agree
+  before an oracle can run. AgentMaster derives calls/cache/token coverage from
+  lane records, deletes rejected usage, and canonically rewrites accepted usage.
+  Raw prompts and adapter JSON stay out of durable files and SQLite.
 
 ### Fixed — headless swarm execution
 - Parallel lanes now use verified non-interactive CLI contracts, probe cmux

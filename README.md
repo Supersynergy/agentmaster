@@ -90,8 +90,10 @@ agentmaster batch tasks.md --yes
 the controller: it gives every lane the same bounded task, saves each answer as
 a private artifact, runs your oracle against answers one by one, and stops at
 the first PASS. It does not aggregate, self-verify, or claim provider cost.
-`llmadapter` must be executable on `PATH`; AgentMaster looks it up only when
-this command is used.
+`llmadapter` must be executable on `PATH` and advertise the v2 capability
+contract (`schema_version = 2`, `ask_v2`, at most three workers, at most 500
+result tokens, at most 1,800 prompt bytes). AgentMaster probes it before both
+dry-run and execution. Older adapters fail closed; there is no v1 fallback.
 
 Start with a dry-run. Local lanes are the default:
 
@@ -113,28 +115,32 @@ agentmaster ensemble answer-check \
 
 Answers and usage stay under
 `~/.agentmaster/ensembles/<name>/<run-id>/` with private permissions. The task
-and llmadapter's raw JSON are never written there by the controller; a model
-answer can still quote its input. A private `manifest.json` records only task
-and answer hashes, policy, byte/deadline bounds, timings, oracle exit status,
-artifact names, and final status. SQLite receives only status, SHA-256
+is fed to `llmadapter ask-v2 --stdin` through an immediately unlinked private
+regular file, so it is absent from child argv and durable controller artifacts.
+The raw adapter JSON is not persisted; a model answer can still quote its input.
+A private `manifest.json` records only task and answer hashes, task byte count,
+v2 capability, lane cap evidence, byte/deadline bounds, timings, oracle exit
+status, artifact names, and final status. SQLite receives only status, SHA-256
 fingerprints, and artifact paths.
 
 `--max-tokens` accepts at most 500, but it is a requested output ceiling:
 provider enforcement varies, especially for Ollama and CLI lanes. This is not a
-hard token or cost budget. Independently, AgentMaster rejects adapter JSON over
-1 MiB and the wall deadline defaults to 120 seconds. `--fresh` disables the
-llmadapter cache.
+hard token or cost budget. Independently, nonblocking pipes retain at most the
+configured stdout/stderr bytes and kill the process group on overflow without
+restricting unrelated child artifacts. The adapter JSON ceiling is 1 MiB and
+the wall deadline defaults to 120 seconds. `--fresh` disables the cache.
 
-Current llmadapter accepts the task only as a positional command-line argument,
-not through stdin or a prompt file. The task can therefore be visible briefly
-to same-host process inspection. Do not put secrets or PII in an ensemble task;
-use a non-sensitive reference instead until llmadapter offers a private input
-transport. `ATS_PII_SHIELD=1` is still forced for remote lanes, but it cannot
-hide the local argv.
+Before any oracle runs, AgentMaster requires a v2 result envelope whose prompt
+hash and byte count match stdin, whose worker counts respect the advertised cap,
+and whose embedded accounting exactly matches a private, complete v2 usage
+artifact. It recomputes calls, cache hits, and token coverage from strict lane
+records; rejected usage is deleted and accepted usage is rewritten canonically.
+Structured nonzero results remain failure evidence but never reach
+the oracle. `ATS_PII_SHIELD=1` and `--no-cache` are forced for remote lanes.
 
 Remote selectors (`free`, `cli`) need `--allow-remote`. `paid` needs both
 `--allow-remote` and `--allow-paid`. Named lanes and `all` require both flags
-because v1 cannot prove a named lane's billing class:
+because the capability probe does not classify an arbitrary named lane:
 
 ```bash
 agentmaster ensemble compare \

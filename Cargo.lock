@@ -10,6 +10,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "libc",
  "portable-pty",
  "ratatui",
  "rusqlite",
