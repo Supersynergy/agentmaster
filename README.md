@@ -96,19 +96,19 @@ this command is used.
 Start with a dry-run. Local lanes are the default:
 
 ```bash
-agentmaster ensemble fix-parser \
-  --oracle 'cargo test -q parser_tests' \
+agentmaster ensemble answer-check \
+  --oracle 'grep -qi sqlite "$AGENTMASTER_ANSWER_PATH"' \
   --dry-run \
-  fix the parser regression
+  "Name AgentMaster's embedded database in one line"
 ```
 
 Execute only after checking that plan:
 
 ```bash
-agentmaster ensemble fix-parser \
-  --oracle 'cargo test -q parser_tests' \
+agentmaster ensemble answer-check \
+  --oracle 'grep -qi sqlite "$AGENTMASTER_ANSWER_PATH"' \
   --go \
-  fix the parser regression
+  "Name AgentMaster's embedded database in one line"
 ```
 
 Answers and usage stay under
