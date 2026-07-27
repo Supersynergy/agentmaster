@@ -146,14 +146,27 @@ fn display_title(a: &Agent) -> String {
     clean_title(&a.name).to_string()
 }
 
-/// Agent kind (claude / codex / …) parsed from a cmux-style title prefix, for a
-/// compact badge that replaces the redundant `cmux` runtime label.
+/// Agent kind (claude / codex / hermes / ggcoder / aider / opencode / gemini /
+/// cline / …) parsed from a cmux-style title prefix, for a compact badge that
+/// replaces the redundant `cmux` runtime label.
 fn agent_kind(a: &Agent) -> &str {
     let head = a.name.split(" · ").next().unwrap_or("").to_lowercase();
     if head.contains("codex") {
         "codex"
     } else if head.contains("claude") {
         "claude"
+    } else if head.contains("hermes") {
+        "hermes"
+    } else if head.contains("ggcoder") || head.contains("gg-") {
+        "ggcoder"
+    } else if head.contains("aider") {
+        "aider"
+    } else if head.contains("opencode") {
+        "opencode"
+    } else if head.contains("gemini") {
+        "gemini"
+    } else if head.contains("cline") {
+        "cline"
     } else {
         a.runtime.as_str()
     }
@@ -565,13 +578,21 @@ fn project_icon(project: &str) -> &'static str {
     }
 }
 
-/// Claude vs Codex (vs any other runtime) as a short colored word — replaces the
-/// old 🟣/🧠 emoji. Color carries the identity; the word stays readable in a
-/// screenshot or logfile. Claude = warm amber, Codex = cool blue.
+/// Agent identity as a short colored word — replaces the old 🟣/🧠 emoji.
+/// Color carries the identity; the word stays readable in a screenshot or
+/// logfile. Each agent gets a distinct 256-color hue so the fleet reads at a
+/// glance: Claude = warm amber, Codex = cool blue, Hermes = cyan, ggcoder =
+/// green, Aider = magenta, OpenCode = violet, Gemini = orange, Cline = rose.
 fn agent_tag(a: &Agent) -> (String, Color) {
     match agent_kind(a) {
         "claude" => ("Claude".to_string(), Color::Indexed(215)),
         "codex" => ("Codex".to_string(), Color::Indexed(75)),
+        "hermes" => ("Hermes".to_string(), Color::Indexed(81)),
+        "ggcoder" => ("GGcoder".to_string(), Color::Indexed(114)),
+        "aider" => ("Aider".to_string(), Color::Indexed(177)),
+        "opencode" => ("OpenCode".to_string(), Color::Indexed(141)),
+        "gemini" => ("Gemini".to_string(), Color::Indexed(208)),
+        "cline" => ("Cline".to_string(), Color::Indexed(204)),
         other => (other.to_string(), C_DIM),
     }
 }
@@ -1387,7 +1408,9 @@ fn help(f: &mut Frame, area: Rect) {
         ),
         Line::from(""),
         head("Act"),
-        Line::from("  n   new agent   <runtime> [task]   e.g.  'shell'   or  'claude fix the bug'"),
+        Line::from(
+            "  n   new agent   <runtime> [task]   claude · codex · hermes · ggcoder · aider · opencode · gemini · cline · shell",
+        ),
         Line::from(
             "  s   send a line to selected        K   kill/untrack          /   filter    H hide noise",
         ),

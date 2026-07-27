@@ -12,6 +12,19 @@ pub struct Store {
     conn: Connection,
 }
 
+pub type OmniGoalRecord = (
+    String,
+    Option<String>,
+    u8,
+    Option<String>,
+    u64,
+    Option<String>,
+    u32,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -41,7 +54,15 @@ impl Store {
               goal     TEXT NOT NULL,
               dod      TEXT,
               progress INTEGER NOT NULL DEFAULT 0,
-              updated  TEXT NOT NULL
+              updated  TEXT NOT NULL,
+              oracle       TEXT,
+              budget_tokens INTEGER NOT NULL DEFAULT 0,
+              deadline     TEXT,
+              tries        INTEGER NOT NULL DEFAULT 0,
+              status       TEXT NOT NULL DEFAULT 'active',
+              bottleneck   TEXT,
+              summary      TEXT,
+              closed_ts    TEXT
             );
             -- Time-in-state, keyed by a STABLE source ref (cmux:workspace:NN /
             -- tmux:target / native:name) so "blocked 2h" survives an agentmaster
@@ -53,9 +74,36 @@ impl Store {
               since  INTEGER NOT NULL,
               last   INTEGER NOT NULL
             );
+            -- Omnigoal lifecycle columns on legacy DBs: the CREATE TABLE above
+            -- already has them on fresh DBs, so the ALTERs below must be tolerant.
+            -- SQLite has no IF NOT EXISTS for ADD COLUMN, so we guard via pragma.
             "#,
         )?;
-        Ok(Store { conn })
+        // Tolerant migration: add omnigoal columns only if missing on legacy DBs.
+        let existing: std::collections::HashSet<String> = {
+            let mut set = std::collections::HashSet::new();
+            let mut stmt = conn.prepare("PRAGMA table_info(goals)")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            for r in rows.flatten() {
+                set.insert(r);
+            }
+            set
+        };
+        for (col, ty) in [
+            ("oracle", "TEXT"),
+            ("budget_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("deadline", "TEXT"),
+            ("tries", "INTEGER NOT NULL DEFAULT 0"),
+            ("status", "TEXT NOT NULL DEFAULT 'active'"),
+            ("bottleneck", "TEXT"),
+            ("summary", "TEXT"),
+            ("closed_ts", "TEXT"),
+        ] {
+            if !existing.contains(col) {
+                let _ = conn.execute(&format!("ALTER TABLE goals ADD COLUMN {col} {ty}"), []);
+            }
+        }
+        Ok(Self { conn })
     }
 
     /// Record an observed status for a stable ref. On a real transition (status
@@ -94,6 +142,112 @@ impl Store {
              ON CONFLICT(name) DO UPDATE SET goal=?2, dod=?3, progress=0, updated=?4",
             params![name, goal, dod, ts],
         );
+    }
+
+    /// Omnigoal lifecycle: persist a goal with machine-checkable oracle, token
+    /// budget cap, deadline, and 3-try counter. Replaces `set_goal` for the
+    /// `goal init` path. Status starts `active`, tries=0.
+    pub fn set_goal_omni(
+        &self,
+        name: &str,
+        goal: &str,
+        dod: Option<&str>,
+        oracle: Option<&str>,
+        budget_tokens: u64,
+        deadline: Option<&str>,
+    ) {
+        let ts = chrono::Local::now().to_rfc3339();
+        let _ = self.conn.execute(
+            "INSERT INTO goals(name, goal, dod, progress, updated, oracle, budget_tokens, deadline, tries, status)
+             VALUES(?1,?2,?3,0,?4,?5,?6,?7,0,'active')
+             ON CONFLICT(name) DO UPDATE SET
+               goal=?2, dod=?3, progress=0, updated=?4,
+               oracle=?5, budget_tokens=?6, deadline=?7,
+               tries=0, status='active', bottleneck=NULL,
+               summary=NULL, closed_ts=NULL",
+            params![name, goal, dod, ts, oracle, budget_tokens as i64, deadline],
+        );
+    }
+
+    /// Load the full omnigoal record for a goal: (goal, dod, progress, oracle,
+    /// budget, deadline, tries, status, bottleneck, summary). Returns None if
+    /// the goal doesn't exist.
+    pub fn load_goal_omni(&self, name: &str) -> Option<OmniGoalRecord> {
+        self.conn
+            .query_row(
+                "SELECT goal, dod, progress, oracle, budget_tokens, deadline, tries, status, bottleneck, summary
+                 FROM goals WHERE name=?1",
+                params![name],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, i64>(2)? as u8,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, i64>(4)? as u64,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, i64>(6)? as u32,
+                        r.get::<_, String>(7)?,
+                        r.get::<_, Option<String>>(8)?,
+                        r.get::<_, Option<String>>(9)?,
+                    ))
+                },
+            )
+            .ok()
+    }
+
+    /// Increment the try counter, persist a bottleneck string, return the new
+    /// try count. Called by `goal check` when the oracle fails.
+    pub fn goal_record_try(&self, name: &str, bottleneck: Option<&str>) -> u32 {
+        let ts = chrono::Local::now().to_rfc3339();
+        let _ = self.conn.execute(
+            "UPDATE goals SET tries = tries + 1, bottleneck = ?2, updated = ?3 WHERE name = ?1",
+            params![name, bottleneck, ts],
+        );
+        self.conn
+            .query_row(
+                "SELECT tries FROM goals WHERE name = ?1",
+                params![name],
+                |r| r.get::<_, i64>(0).map(|v| v as u32),
+            )
+            .unwrap_or(0)
+    }
+
+    /// Mark a goal done with a closing summary. Persisted to the row + logged
+    /// to the event stream so `agentmaster events` shows the closure.
+    pub fn goal_close(&self, name: &str, summary: &str) {
+        let ts = chrono::Local::now().to_rfc3339();
+        let _ = self.conn.execute(
+            "UPDATE goals SET status='done', summary=?2, closed_ts=?3, progress=100, updated=?3
+             WHERE name = ?1",
+            params![name, summary, ts],
+        );
+        self.log(None, name, "goal-close", summary);
+    }
+
+    /// Abandon a goal (3-try cap hit, oracle still red). Distinct from `done`
+    /// so the audit trail separates convergence from giving up.
+    pub fn goal_abandon(&self, name: &str, reason: &str) {
+        let ts = chrono::Local::now().to_rfc3339();
+        let _ = self.conn.execute(
+            "UPDATE goals SET status='abandoned', summary=?2, closed_ts=?3, updated=?3
+             WHERE name = ?1",
+            params![name, reason, ts],
+        );
+        self.log(None, name, "goal-abandon", reason);
+    }
+
+    /// Append a `goal-spawn` event recording that a subagent was registered
+    /// with a bounded capsule + skill for this goal. Ponytail: we log the event
+    /// only — the actual capsule file lives on disk and is referenced by path.
+    pub fn goal_spawn(&self, name: &str, capsule: Option<&str>, skill: Option<&str>) {
+        let msg = match (capsule, skill) {
+            (Some(c), Some(s)) => format!("capsule={c} skill={s}"),
+            (Some(c), None) => format!("capsule={c}"),
+            (None, Some(s)) => format!("skill={s}"),
+            (None, None) => "(no capsule, no skill)".into(),
+        };
+        self.log(None, name, "goal-spawn", &msg);
     }
 
     /// Update only the derived progress for a goal (cheap, called on milestones).
@@ -162,11 +316,7 @@ mod tests {
 
     fn tmp_db() -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        p.push(format!("am-store-test-{n}.db"));
+        p.push(format!("am-store-test-{}.db", uuid::Uuid::new_v4()));
         p
     }
 

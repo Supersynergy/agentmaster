@@ -100,6 +100,28 @@ pub fn resolve(runtime: &str, task: Option<&str>) -> RuntimeSpec {
     }
 }
 
+/// Resolve a runtime and place a verified model selector before its prompt.
+/// Keeping this at the command boundary prevents model names from becoming
+/// accidental natural-language task text.
+pub fn resolve_with_model(runtime: &str, task: Option<&str>, model: Option<&str>) -> RuntimeSpec {
+    let mut spec = resolve(runtime, task);
+    let Some(model) = model else {
+        return spec;
+    };
+    match runtime {
+        // Verified locally against each installed CLI's `--help` on 2026-07-27.
+        "claude" | "codex" | "gemini" | "hermes" | "ggcoder" => {
+            spec.args
+                .splice(0..0, ["--model".to_string(), model.to_string()]);
+        }
+        // The lean worker's registry entry is fixed to `kimi-k3`; its wrapper
+        // accepts alternate aliases only via KIMI_WORKER_MODEL, not argv.
+        "kimi-worker" => {}
+        _ => {}
+    }
+    spec
+}
+
 /// All runtimes agentmaster knows how to launch. Used by `doctor` for the
 /// runtime-availability check and by the TUI's new-agent completer.
 pub const KNOWN_RUNTIMES: &[&str] = &[
@@ -142,6 +164,14 @@ mod tests {
         for alias in ["cursor", "cursor-agent", "composer"] {
             assert_eq!(resolve(alias, None).program, "cursor-agent");
         }
+    }
+
+    #[test]
+    fn model_flag_precedes_the_prompt_for_supported_runtimes() {
+        let spec = resolve_with_model("codex", Some("fix tests"), Some("gpt-5.6"));
+        assert_eq!(spec.args, ["--model", "gpt-5.6", "fix tests"]);
+        let worker = resolve_with_model("kimi-worker", Some("fix tests"), Some("kimi-k3"));
+        assert_eq!(worker.args, ["fix tests"]);
     }
 
     #[test]

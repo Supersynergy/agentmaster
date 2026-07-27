@@ -1111,7 +1111,7 @@ impl App {
         self.mode = Mode::Input;
         self.status_msg = match kind {
             InputKind::NewAgent => {
-                "new agent: <runtime> [task]  — e.g. 'shell'  or  'claude fix the bug'".into()
+                "new agent: <runtime> [task]  — e.g. 'shell'  or  'claude fix the bug'  |  runtimes: claude codex hermes ggcoder aider opencode gemini cline shell".into()
             }
             InputKind::Send => "send a line to the selected agent".into(),
             InputKind::Filter => "filter (substring of name / last line)".into(),
@@ -1276,6 +1276,27 @@ impl App {
                     self.input.clear();
                     self.mode = Mode::Normal;
                     self.input_kind = InputKind::None;
+                }
+                KeyCode::Tab => {
+                    // Runtime-name completion in NewAgent mode: typing `cl<Tab>`
+                    // expands to `claude `; bare Tab on empty input cycles through
+                    // KNOWN_RUNTIMES. Saves typing and discovers the registry.
+                    if matches!(self.input_kind, InputKind::NewAgent) {
+                        let prefix = self.input.trim();
+                        let cand = runtime::KNOWN_RUNTIMES
+                            .iter()
+                            .copied()
+                            .find(|r| r.starts_with(prefix));
+                        let next = match cand {
+                            Some(r) if r != prefix => r,
+                            _ => runtime::KNOWN_RUNTIMES
+                                .iter()
+                                .copied()
+                                .find(|r| *r != prefix)
+                                .unwrap_or("shell"),
+                        };
+                        self.input = format!("{next} ");
+                    }
                 }
                 KeyCode::Backspace => {
                     self.input.pop();
@@ -1758,15 +1779,9 @@ mod tests {
     use super::*;
 
     fn test_app() -> App {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "agentmaster-app-test-{}-{}.db",
-            std::process::id(),
-            chrono::Local::now()
-                .timestamp_nanos_opt()
-                .unwrap_or_default()
-        ));
-        let store = Store::open(&p).unwrap();
+        // Every test gets a private connection; a timestamp-named shared temp
+        // file can collide under the parallel Rust harness and leave a WAL lock.
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
         let (tx, rx) = channel();
         App::new(store, tx, rx)
     }

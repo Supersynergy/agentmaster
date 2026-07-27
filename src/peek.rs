@@ -121,6 +121,41 @@ pub fn digest(path: &Path, n: usize) -> Digest {
     d
 }
 
+/// Raw tail of the last `n` transcript lines — undigested, just the text content
+/// of each event in order. Useful for `agentmaster peek <id> --tail N` when you
+/// want to see what the agent is actually doing right now (stream-of-thought)
+/// rather than a structural digest. Empty lines skipped, hook blocks stripped.
+pub fn tail(path: &Path, n: usize) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    let mut out = Vec::new();
+    for line in &lines[start..] {
+        let Ok(ev) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let typ = ev.get("type").and_then(Value::as_str).unwrap_or("");
+        let content = ev.pointer("/message/content").unwrap_or(&Value::Null);
+        let text = extract_text(content);
+        if text.is_empty() {
+            continue;
+        }
+        // Skip injected hook/system blocks (same filter as `digest`).
+        if typ == "user" && text.trim_start().starts_with('<') {
+            continue;
+        }
+        let tag = match typ {
+            "user" => "🧑",
+            "assistant" => "🤖",
+            _ => "·",
+        };
+        out.push(format!("{tag} {text}"));
+    }
+    out
+}
+
 /// Exact session link for EVERY cmux workspace — live, idle, OR hibernated —
 /// from the `resume_binding` cmux persists so it can resume an agent (the engine
 /// behind cmux Agent Hibernation). For each workspace we read its

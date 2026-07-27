@@ -1,6 +1,6 @@
 [package]
 name = "agentmaster"
-version = "0.18.0"
+version = "0.19.0"
 edition = "2024"
 rust-version = "1.95"
 description = "See and steer every agent from one session — Kanban TUI, zero orchestration tax"
@@ -21,3 +21,5 @@ tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 unicode-width = "0.2.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync"] }
+uuid = { version = "1", features = ["v4"] }

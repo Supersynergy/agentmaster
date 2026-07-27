@@ -4,6 +4,49 @@ All notable changes to agentmaster are documented here. Newest first.
 
 ## [Unreleased]
 
+### Deferred — Cursor SDK adapter
+- `cursor-sdk/` remains an experimental, unshipped adapter. It is deliberately
+  excluded from v0.19.0 until its pinned TypeScript dependencies are installed
+  from a clean lockfile and the adapter has passed its own type-check and MCP
+  smoke test. The native AgentMaster CLI remains the release surface.
+
+## [0.19.0] — 2026-07-27
+
+### Fixed — bounded ATS swarm bridge
+- **Hard execution boundaries:** `swarm` now defaults to at most three lanes;
+  `--n > 3` requires explicit `--fanout`. Every parallel and legacy capsule is
+  UTF-8-safe and capped at 2,800 bytes, and asks for a result of at most 500
+  tokens. On PASS, deadline, or a measured overrun, AgentMaster sends a
+  targeted message plus Ctrl-C only to the workspace it created; it never
+  calls cmux `close-workspace`.
+- **No pretend budget gates:** token budgets run only with the canonical
+  `agent-token-ledger` available and complete provider usage for every chosen
+  lane. A budget request routes to the metered `kimi-worker` subset (currently
+  one lane); unsupported fan-out, sequential mode, and non-invoice static
+  `--budget-cost` fail closed with an actionable error instead of silently
+  measuring zero tokens. Only a budgeted `kimi-worker` atomically refreshes
+  its cumulative wire ledger every two seconds, so the controller can poll an
+  in-flight lane; unbudgeted workers retain final-only ledger I/O. A total
+  token budget is divided conservatively across the selected lanes.
+- **Private by default:** Synapse prime/recall and result persistence are now
+  off unless the operator passes `--recall`; this prevents unrelated prior
+  swarm context from being injected into normal project work.
+- **Model binding is real:** `auto`, batch, sequential swarm and parallel
+  swarm put a locally verified runtime `--model` selector before the prompt;
+  they no longer leak `--model <name>` into natural-language task text.
+- Swarm lanes now receive an explicit bounded-capsule path instead of only the
+  bare task, so the generated oracle, evidence contract and one deterministic
+  tool route are actually available to each runtime. Results use compact
+  `STATUS/EVIDENCE/HANDOFF` fields; the controller owns any targeted follow-up.
+- The one verified `si route` skill is now also passed by path inside each
+  lane capsule. Workers read only that relevant skill instead of receiving a
+  copied global catalog or an inert controller-only routing result.
+- `si route` now runs once against the real task with `--strict --json`, accepts
+  at most one existing skill path and never prints router JSON per lane. Synapse
+  recall preview is single-line and capped at 360 characters.
+- Updated existing `anyhow` from `1.0.102` to `1.0.104` after the RustSec scan;
+  the release was nine days old at the update check and clears RUSTSEC-2026-0190.
+
 ### Added — New lane runtimes: kimi, cursor-agent, devin
 - `kimi` (positional prompt), `cursor-agent` with aliases `cursor`/`composer`
   (positional prompt), and `devin` (prompt after `--`; in-session `/model`
@@ -32,8 +75,9 @@ All notable changes to agentmaster are documented here. Newest first.
   doesn't block convergence. Each lane gets a bounded capsule (300-700
   tokens) written to `~/.agentmaster/capsules/<name>-lane<i>-<model>.md`
   — the agent-token-saver contract. The swarm auto-inits an omnigoal so
-  `goal-check <name>` gates all lanes. First PASS wins; kill the rest with
-  `focus <lane>` + Ctrl-C.
+  `goal-check <name>` gates all lanes. First PASS wins; the controller signals
+  only the known losing lane processes and retains their workspaces for
+  inspection.
 - **`src/router.rs`** — new module: `ModelSpec`, `TaskType`, `Tier`, `REGISTRY`,
   `classify()`, `pick()`, `pick_swarm()`. 11 unit tests covering classification,
   cheapest-passing pick, swarm diversity (no duplicate runtimes), cost sorting.
@@ -74,37 +118,6 @@ All notable changes to agentmaster are documented here. Newest first.
   legacy DBs get `ALTER TABLE` only for missing columns.
 - Verified: `cargo test` 44/44 green; live smoke test exercises init → check
   (try 1/3 fail with bottleneck) → check (try 2/3 fail) → spawn → close.
-
-### Added — Cursor 3 Agents Window integration (the missing UI layer)
-- **`cursor-sdk/`** — TypeScript SDK adapter that turns Cursor 3's Agents
-  Window into the GUI for the agentmaster fleet. Zero frontend code: ~80 lines
-  of TS + the official `@cursor/sdk` + `@modelcontextprotocol/sdk`. Cursor's
-  Agents Window becomes a polished multi-workspace Kanban for agentmaster's
-  fleet — every `am_assign` spawn shows up as a card, every `am_handoff` is a
-  watchable conversation. The Rust CLI stays the source of truth; the adapter
-  is just call sites.
-- **`.cursor/agents/agentmaster.md`** — Cursor subagent definition. Cursor
-  auto-discovers it on session start. The subagent orchestrates the external
-  fleet via `am_*` tools, never writes code itself, reports a 5-line digest.
-- **`.cursor/skills/am/SKILL.md`** — drop-in skill doc for the `am` ponytail
-  router. Cursor auto-loads it; the supervisor agent can call `am_skill
-  <runtime>` to discover any runtime's control-skill doc dynamically.
-- **`.cursor/hooks.json`** — bridges Cursor's `PostToolUse` / `UserPromptSubmit`
-  / `Stop` lifecycle into agentmaster's audit log. `agentmaster events`
-  becomes a cross-tool timeline (Cursor actions + fleet actions in one stream).
-- **`.cursor/mcp.json`** — exposes `am_ls`, `am_peek`, `am_assign`, `am_handoff`,
-  `am_skill`, `am_doctor` as MCP tools. Works in Cursor, Cline, Claude Code,
-  and Devin Desktop via ACP — one adapter, every MCP host.
-- **`src/index.ts`** — async wrappers (`amLs`, `amPeek`, `amAssign`, `amHandoff`,
-  `amSkill`, `amDoctor`) + `createAgentmasterTools()` returning Cursor SDK
-  tool descriptors + `waitForStatus()` polling helper.
-- **`src/mcp-server.ts`** — stdio MCP server (~60 lines) exposed via the
-  `agentmaster-mcp` bin entry.
-- **`install-cursor-sdk.sh`** — one-command drop-in for any project:
-  `./install-cursor-sdk.sh /path/to/project` copies `.cursor/` files.
-- Verified: `npx tsc` clean, `node dist/demo.js` exercises `am_ls` +
-  `am_doctor --costs` + `am_skill claude` + lists all 6 registered tools,
-  MCP server starts and waits on stdio.
 
 ### Added — Advanced orchestration levers (CAO-class primitives, ponytail-style)
 - **Runtime-agnostic `batch()`**: tasks can now carry a `runtime` field
