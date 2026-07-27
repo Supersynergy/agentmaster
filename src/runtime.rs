@@ -133,7 +133,6 @@ pub fn resolve_headless_with_model(
     task: &str,
     model: Option<&str>,
     usage_file: Option<&Path>,
-    hermes_accept_hooks: bool,
 ) -> RuntimeSpec {
     let mut args = Vec::new();
     match runtime {
@@ -166,9 +165,6 @@ pub fn resolve_headless_with_model(
         "hermes" => {
             push_model(&mut args, model);
             args.extend(["-z".to_string(), task.to_string(), "--cli".to_string()]);
-            if hermes_accept_hooks {
-                args.push("--accept-hooks".to_string());
-            }
             if let Some(path) = usage_file {
                 args.extend([
                     "--usage-file".to_string(),
@@ -252,11 +248,10 @@ mod tests {
 
     #[test]
     fn headless_resolver_uses_help_verified_argv_contracts() {
-        let codex = resolve_headless_with_model("codex", "fix tests", Some("gpt-5.6"), None, false);
+        let codex = resolve_headless_with_model("codex", "fix tests", Some("gpt-5.6"), None);
         assert_eq!(codex.args, ["exec", "--model", "gpt-5.6", "fix tests"]);
 
-        let gemini =
-            resolve_headless_with_model("gemini", "fix tests", Some("gemini-flash"), None, false);
+        let gemini = resolve_headless_with_model("gemini", "fix tests", Some("gemini-flash"), None);
         assert_eq!(
             gemini.args,
             ["--model", "gemini-flash", "--prompt", "fix tests"]
@@ -264,7 +259,7 @@ mod tests {
 
         let usage = Path::new("/tmp/hermes usage.json");
         let hermes =
-            resolve_headless_with_model("hermes", "fix tests", Some("kimi-k3"), Some(usage), false);
+            resolve_headless_with_model("hermes", "fix tests", Some("kimi-k3"), Some(usage));
         assert_eq!(
             hermes.args,
             [
@@ -281,22 +276,17 @@ mod tests {
 
     #[test]
     fn headless_claude_and_ggcoder_disable_interactive_ui() {
-        let claude =
-            resolve_headless_with_model("claude", "fix tests", Some("sonnet"), None, false);
+        let claude = resolve_headless_with_model("claude", "fix tests", Some("sonnet"), None);
         assert_eq!(claude.args, ["--print", "--model", "sonnet", "fix tests"]);
 
-        let ggcoder =
-            resolve_headless_with_model("ggcoder", "fix tests", Some("qwen"), None, false);
+        let ggcoder = resolve_headless_with_model("ggcoder", "fix tests", Some("qwen"), None);
         assert_eq!(ggcoder.args, ["--model", "qwen", "--json", "fix tests"]);
     }
 
     #[test]
-    fn hermes_hook_acceptance_requires_explicit_resolver_opt_in() {
-        let default = resolve_headless_with_model("hermes", "task", None, None, false);
-        assert!(!default.args.iter().any(|arg| arg == "--accept-hooks"));
-
-        let opted_in = resolve_headless_with_model("hermes", "task", None, None, true);
-        assert!(opted_in.args.iter().any(|arg| arg == "--accept-hooks"));
+    fn headless_hermes_never_blanket_accepts_hooks() {
+        let spec = resolve_headless_with_model("hermes", "task", None, None);
+        assert!(!spec.args.iter().any(|arg| arg == "--accept-hooks"));
     }
 
     #[test]

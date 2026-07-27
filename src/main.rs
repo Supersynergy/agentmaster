@@ -8,6 +8,7 @@ mod ats;
 mod backend;
 mod cli;
 mod fleet;
+mod llmadapter;
 mod obs;
 mod orch;
 mod peek;
@@ -253,6 +254,39 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Lean llmadapter ensemble: bounded workers, controller-side oracle, first
+    /// PASS wins. Local-only by default; remote and paid lanes require explicit
+    /// consent. Exactly one of --dry-run or --go is required.
+    #[command(group(
+        clap::ArgGroup::new("execution")
+            .required(true)
+            .multiple(false)
+            .args(["dry_run", "go"])
+    ))]
+    Ensemble {
+        name: String,
+        #[arg(long)]
+        oracle: String,
+        #[arg(long, default_value = "local")]
+        lanes: String,
+        #[arg(long, default_value_t = 120)]
+        deadline_secs: u64,
+        #[arg(long, default_value_t = 500)]
+        max_tokens: u32,
+        #[arg(long)]
+        fresh: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        go: bool,
+        #[arg(long)]
+        allow_remote: bool,
+        #[arg(long)]
+        allow_paid: bool,
+        /// the task (remaining words are joined)
+        #[arg(trailing_var_arg = true, required = true)]
+        task: Vec<String>,
+    },
 }
 
 fn home() -> PathBuf {
@@ -421,6 +455,37 @@ fn main() -> anyhow::Result<()> {
                     no_parallel,
                     recall,
                     dry_run,
+                },
+                &dir,
+            )?;
+        }
+        Cmd::Ensemble {
+            name,
+            oracle,
+            lanes,
+            deadline_secs,
+            max_tokens,
+            fresh,
+            dry_run,
+            go,
+            allow_remote,
+            allow_paid,
+            task,
+        } => {
+            let task = task.join(" ");
+            llmadapter::run(
+                llmadapter::EnsembleRequest {
+                    name: &name,
+                    task: &task,
+                    oracle: &oracle,
+                    lanes: &lanes,
+                    deadline_secs,
+                    max_tokens,
+                    fresh,
+                    dry_run,
+                    go,
+                    allow_remote,
+                    allow_paid,
                 },
                 &dir,
             )?;

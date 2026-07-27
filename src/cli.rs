@@ -806,19 +806,7 @@ pub fn swarm_spawn(request: SwarmRequest<'_>, dir: &Path) -> Result<()> {
     if deadline_secs > 0 {
         println!("   deadline: {deadline_secs}s");
     }
-    let hermes_accept_hooks = explicit_env_opt_in(
-        std::env::var("AGENTMASTER_HERMES_ACCEPT_HOOKS")
-            .ok()
-            .as_deref(),
-    );
-    println!(
-        "   Hermes hook trust: {}",
-        if hermes_accept_hooks {
-            "ENABLED by AGENTMASTER_HERMES_ACCEPT_HOOKS=1 (headless Hermes lanes)"
-        } else {
-            "off (default; unseen hooks are not auto-approved)"
-        }
-    );
+    println!("   Hermes hook trust: off (swarm never auto-approves unseen hooks)");
     // Skill choice belongs to the task, not to a model name. Route once, keep
     // at most one verified path, and never relay the router's raw JSON.
     let routed_skill = ats::route_skill(task);
@@ -848,7 +836,7 @@ pub fn swarm_spawn(request: SwarmRequest<'_>, dir: &Path) -> Result<()> {
         name,
         "swarm-init",
         &format!(
-            "n={n} type={task_type} oracle={oracle} parallel={parallel} per_lane_cap={lane_budget:?} deadline={deadline_secs} recall={recall} hermes_accept_hooks={hermes_accept_hooks}",
+            "n={n} type={task_type} oracle={oracle} parallel={parallel} per_lane_cap={lane_budget:?} deadline={deadline_secs} recall={recall} hermes_accept_hooks=false",
             parallel = if no_parallel { "off" } else { "on" },
         ),
     );
@@ -888,7 +876,6 @@ pub fn swarm_spawn(request: SwarmRequest<'_>, dir: &Path) -> Result<()> {
             oracle: oracle.to_string(),
             skill_path: routed_skill.clone(),
             budget_tokens: lane_budget,
-            hermes_accept_hooks,
             workdir: workdir.clone(),
         };
         lanes.push(lane);
@@ -1013,10 +1000,6 @@ fn lane_outcome(outcome: &crate::swarm::LaneOutcome) -> String {
     }
 }
 
-fn explicit_env_opt_in(value: Option<&str>) -> bool {
-    value == Some("1")
-}
-
 fn effective_lane_budget(total: u64, per_lane: u64, lanes: usize) -> Option<usize> {
     let from_total = (total > 0 && lanes > 0)
         .then(|| total / lanes as u64)
@@ -1061,7 +1044,6 @@ fn swarm_spawn_sequential(
             oracle: oracle.to_string(),
             skill_path: skill_path.map(str::to_string),
             budget_tokens: None,
-            hermes_accept_hooks: false,
             workdir: dir.to_path_buf(),
         };
         let capsule = crate::swarm::build_capsule(&lane);
@@ -1124,14 +1106,6 @@ mod tests {
             )),
             "SPAWN-FAILED: binary missing"
         );
-    }
-
-    #[test]
-    fn hermes_hook_trust_env_requires_exact_one() {
-        assert!(!explicit_env_opt_in(None));
-        assert!(!explicit_env_opt_in(Some("0")));
-        assert!(!explicit_env_opt_in(Some("true")));
-        assert!(explicit_env_opt_in(Some("1")));
     }
 
     #[test]

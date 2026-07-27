@@ -4,6 +4,20 @@ All notable changes to agentmaster are documented here. Newest first.
 
 ## [Unreleased]
 
+### Added — lean llmadapter ensemble
+- Added opt-in `ensemble`: local lanes by default, explicit remote/paid consent,
+  a requested output ceiling of at most 500 tokens, bounded process/oracle
+  deadlines, private answer/usage artifacts, and first-oracle-PASS selection.
+  Provider enforcement varies, so this is not described as a hard token or
+  cost budget; a separate 1 MiB adapter-JSON limit is enforced locally.
+- The bridge invokes llmadapter without aggregate, verify, race, fanout, or
+  pretend token budgets. It validates both result JSON and completed usage,
+  keeps the prompt/raw JSON out of durable files and SQLite, and records only
+  status, SHA-256 fingerprints, bounded timings, oracle exits, and artifact
+  paths in a private manifest. Because current llmadapter lacks stdin/file
+  prompt input, the task is passed through argv with an explicit privacy
+  warning.
+
 ### Fixed — headless swarm execution
 - Parallel lanes now use verified non-interactive CLI contracts, probe cmux
   before workspace spawn, and fall back to a directly managed Tokio child when

@@ -84,6 +84,76 @@ agentmaster goal payments-api ship checkout :: all e2e tests green
 agentmaster batch tasks.md --yes
 ```
 
+## Lean llmadapter ensembles
+
+`ensemble` is an opt-in bridge for a small llmadapter swarm. AgentMaster stays
+the controller: it gives every lane the same bounded task, saves each answer as
+a private artifact, runs your oracle against answers one by one, and stops at
+the first PASS. It does not aggregate, self-verify, or claim provider cost.
+`llmadapter` must be executable on `PATH`; AgentMaster looks it up only when
+this command is used.
+
+Start with a dry-run. Local lanes are the default:
+
+```bash
+agentmaster ensemble fix-parser \
+  --oracle 'cargo test -q parser_tests' \
+  --dry-run \
+  fix the parser regression
+```
+
+Execute only after checking that plan:
+
+```bash
+agentmaster ensemble fix-parser \
+  --oracle 'cargo test -q parser_tests' \
+  --go \
+  fix the parser regression
+```
+
+Answers and usage stay under
+`~/.agentmaster/ensembles/<name>/<run-id>/` with private permissions. The task
+and llmadapter's raw JSON are never written there by the controller; a model
+answer can still quote its input. A private `manifest.json` records only task
+and answer hashes, policy, byte/deadline bounds, timings, oracle exit status,
+artifact names, and final status. SQLite receives only status, SHA-256
+fingerprints, and artifact paths.
+
+`--max-tokens` accepts at most 500, but it is a requested output ceiling:
+provider enforcement varies, especially for Ollama and CLI lanes. This is not a
+hard token or cost budget. Independently, AgentMaster rejects adapter JSON over
+1 MiB and the wall deadline defaults to 120 seconds. `--fresh` disables the
+llmadapter cache.
+
+Current llmadapter accepts the task only as a positional command-line argument,
+not through stdin or a prompt file. The task can therefore be visible briefly
+to same-host process inspection. Do not put secrets or PII in an ensemble task;
+use a non-sensitive reference instead until llmadapter offers a private input
+transport. `ATS_PII_SHIELD=1` is still forced for remote lanes, but it cannot
+hide the local argv.
+
+Remote selectors (`free`, `cli`) need `--allow-remote`. `paid` needs both
+`--allow-remote` and `--allow-paid`. Named lanes and `all` require both flags
+because v1 cannot prove a named lane's billing class:
+
+```bash
+agentmaster ensemble compare \
+  --lanes free --allow-remote --fresh \
+  --oracle './scripts/check-answer "$AGENTMASTER_ANSWER_PATH"' \
+  --go \
+  propose the smallest compatible patch
+```
+
+The oracle receives `AGENTMASTER_RUN_DIR`, `AGENTMASTER_ANSWER_PATH`, and
+`AGENTMASTER_USAGE_PATH`. Its exit code is the decision: zero is PASS.
+
+Reproducible zero-provider proof: the
+[llmadapter payload benchmark](docs/LLMADAPTER-BENCHMARK.md) reduces a
+constructed 4,000-line log payload from 184,497 to 852 bytes (99.5382%) after
+local projection while preserving the executable oracle inputs. This is a
+payload-capacity case study, not a provider-token, cost, quality, or end-to-end
+latency claim.
+
 ## Keys
 
 | Key | Action |
