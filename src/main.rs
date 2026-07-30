@@ -13,6 +13,7 @@ mod obs;
 mod orch;
 mod peek;
 mod pty;
+mod research;
 mod router;
 mod runtime;
 mod state;
@@ -283,9 +284,60 @@ enum Cmd {
         allow_remote: bool,
         #[arg(long)]
         allow_paid: bool,
+        /// Start every lane at once and let the adapter run the same oracle as
+        /// each answer lands: the first PASS prunes its peers mid-flight, which
+        /// is where the provider tokens are actually saved
+        #[arg(long)]
+        first_pass: bool,
+        /// Hard per-lane token ceiling enforced inside the adapter (0 = off).
+        /// Unlike --max-tokens this does not depend on provider cooperation
+        #[arg(long, default_value_t = 0)]
+        budget_tokens: u32,
+        /// Gather one primary-source artifact before the workers start and put
+        /// it in every capsule, instead of paying N lanes to look it up
+        #[arg(long)]
+        evidence: bool,
+        #[arg(long, default_value = "research")]
+        evidence_mode: String,
+        #[arg(long)]
+        evidence_target: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        evidence_bytes: u32,
+        /// Let the adapter's skill router name one skill for the capsule
+        #[arg(long)]
+        skill_route: bool,
         /// the task (remaining words are joined)
         #[arg(trailing_var_arg = true, required = true)]
         task: Vec<String>,
+    },
+    /// Gather evidence once, spend zero model tokens, and hand the artifact to
+    /// a fleet by path. This is the cheapest primitive here: N workers reading
+    /// one local file cost a fraction of N workers each researching the same
+    /// fact. Sources are detected, never installed: the adapter's evidence
+    /// provider for the web, plus `ghmax` and `superweb gitstars` when present.
+    Research {
+        name: String,
+        /// Evidence mode handed to the adapter: research, mega or fetch
+        #[arg(long, default_value = "research")]
+        mode: String,
+        /// Projected artifact size in bytes
+        #[arg(long, default_value_t = 1200)]
+        bytes: u32,
+        /// Also run a bounded code search (`ghmax`) into its own artifact
+        #[arg(long)]
+        code: bool,
+        /// Also run a bounded trend scan (`superweb gitstars`) into its own artifact
+        #[arg(long)]
+        trends: bool,
+        /// Seconds before each source is killed
+        #[arg(long, default_value_t = 300)]
+        deadline_secs: u64,
+        /// Print the plan without running a source
+        #[arg(long)]
+        dry_run: bool,
+        /// the query (remaining words are joined)
+        #[arg(trailing_var_arg = true, required = true)]
+        query: Vec<String>,
     },
 }
 
@@ -470,6 +522,13 @@ fn main() -> anyhow::Result<()> {
             go,
             allow_remote,
             allow_paid,
+            first_pass,
+            budget_tokens,
+            evidence,
+            evidence_mode,
+            evidence_target,
+            evidence_bytes,
+            skill_route,
             task,
         } => {
             let task = task.join(" ");
@@ -486,6 +545,38 @@ fn main() -> anyhow::Result<()> {
                     go,
                     allow_remote,
                     allow_paid,
+                    first_pass,
+                    budget_tokens,
+                    evidence,
+                    evidence_mode: &evidence_mode,
+                    evidence_target: evidence_target.as_deref(),
+                    evidence_bytes,
+                    skill_route,
+                },
+                &dir,
+            )?;
+        }
+        Cmd::Research {
+            name,
+            mode,
+            bytes,
+            code,
+            trends,
+            deadline_secs,
+            dry_run,
+            query,
+        } => {
+            let query = query.join(" ");
+            research::run(
+                research::ResearchRequest {
+                    name: &name,
+                    query: &query,
+                    mode: &mode,
+                    bytes,
+                    code,
+                    trends,
+                    deadline_secs,
+                    dry_run,
                 },
                 &dir,
             )?;

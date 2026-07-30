@@ -31,6 +31,19 @@ pub struct EnsembleRequest<'a> {
     pub go: bool,
     pub allow_remote: bool,
     pub allow_paid: bool,
+    /// Start every lane, let the adapter run the same oracle as each answer
+    /// lands, and prune the peers at the first PASS. This is where the token
+    /// saving is: a pruned remote lane stops generating mid-flight.
+    pub first_pass: bool,
+    /// Hard per-lane token ceiling enforced inside the adapter (0 = off).
+    pub budget_tokens: u32,
+    /// Gather one primary-source artifact once and inject it into every
+    /// capsule, instead of paying N workers to look the same fact up.
+    pub evidence: bool,
+    pub evidence_mode: &'a str,
+    pub evidence_target: Option<&'a str>,
+    pub evidence_bytes: u32,
+    pub skill_route: bool,
 }
 
 #[derive(Debug)]
@@ -79,6 +92,45 @@ struct AdapterOutput {
     total: usize,
     results: Vec<AdapterResult>,
     accounting: UsageOutput,
+    /// Present only when this controller asked for the matching extension.
+    #[serde(default)]
+    first_pass: Option<AdapterFirstPass>,
+    #[serde(default)]
+    evidence: Option<AdapterEvidence>,
+    #[serde(default)]
+    skill_route: Option<AdapterSkillRoute>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AdapterFirstPass {
+    oracle: bool,
+    oracle_runs: u64,
+    winner: Option<String>,
+    winner_oracle_exit: Option<i32>,
+    pruned: u64,
+    run_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AdapterEvidence {
+    mode: String,
+    target_sha256: String,
+    usable: bool,
+    cached: bool,
+    bytes: u64,
+    source: String,
+    sha256: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AdapterSkillRoute {
+    name: String,
+    path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -224,6 +276,12 @@ struct RunManifest {
     adapter_result_exit_code: Option<i32>,
     adapter_lanes: Vec<LaneEvidence>,
     candidates: Vec<CandidateEvidence>,
+    /// Exactly the extension flags this run handed to the adapter, plus what
+    /// came back. Absent flags mean the strict default protocol was used.
+    extension_args: Vec<String>,
+    adapter_first_pass: Option<AdapterFirstPass>,
+    adapter_evidence: Option<AdapterEvidence>,
+    adapter_skill_route: Option<AdapterSkillRoute>,
     final_status: &'static str,
     total_elapsed_ms: u64,
 }
@@ -358,14 +416,22 @@ fn run_with_program(request: EnsembleRequest<'_>, data_dir: &Path, program: &Pat
             request.max_tokens
         );
         println!(
-            "  command     : {} ask-v2 --stdin --swarm --lanes {} --max-tokens {} --deadline-secs {} --usage-out <private-path>{}{}{}",
+            "  command     : {} ask-v2 --stdin --swarm --lanes {} --max-tokens {} --deadline-secs {} --usage-out <private-path>{}{}{}{}",
             program.display(),
             request.lanes,
             request.max_tokens,
             request.deadline_secs,
             if policy.remote { " --allow-remote" } else { "" },
             if policy.paid { " --allow-paid" } else { "" },
-            if no_cache { " --no-cache" } else { "" }
+            if no_cache { " --no-cache" } else { "" },
+            {
+                let extensions = extension_args(&request);
+                if extensions.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", extensions.join(" "))
+                }
+            }
         );
         return Ok(());
     }
@@ -404,6 +470,10 @@ fn run_with_program(request: EnsembleRequest<'_>, data_dir: &Path, program: &Pat
             adapter_result_exit_code: None,
             adapter_lanes: Vec::new(),
             candidates: Vec::new(),
+            extension_args: extension_args(&request),
+            adapter_first_pass: None,
+            adapter_evidence: None,
+            adapter_skill_route: None,
             final_status: "RUNNING",
             total_elapsed_ms: 0,
         },
@@ -441,6 +511,9 @@ fn run_with_program(request: EnsembleRequest<'_>, data_dir: &Path, program: &Pat
     }
     if no_cache {
         command.arg("--no-cache");
+    }
+    for arg in extension_args(&request) {
+        command.arg(arg);
     }
     if policy.remote {
         command.env("ATS_PII_SHIELD", "1");
@@ -484,7 +557,7 @@ fn run_with_program(request: EnsembleRequest<'_>, data_dir: &Path, program: &Pat
         );
     }
 
-    let parsed: AdapterOutput =
+    let mut parsed: AdapterOutput =
         serde_json::from_slice(&output.stdout.bytes).context("llmadapter returned invalid JSON")?;
     validate_adapter_output(
         &parsed,
@@ -497,6 +570,9 @@ fn run_with_program(request: EnsembleRequest<'_>, data_dir: &Path, program: &Pat
     )?;
     evidence.document.adapter_result_status = Some(parsed.status.clone());
     evidence.document.adapter_result_exit_code = Some(parsed.exit_code);
+    evidence.document.adapter_first_pass = parsed.first_pass.take();
+    evidence.document.adapter_evidence = parsed.evidence.take();
+    evidence.document.adapter_skill_route = parsed.skill_route.take();
     evidence.document.adapter_lanes = parsed
         .results
         .iter()
@@ -626,11 +702,25 @@ fn run_with_program(request: EnsembleRequest<'_>, data_dir: &Path, program: &Pat
             &answer_path,
         );
         if passed {
+            // A controller PASS while the adapter-side oracle found no winner
+            // means the two runs of the same command disagreed. Nothing is
+            // wrong with this answer, but no peer was pruned, so the run cost
+            // full price: say so instead of reporting a saving that never was.
+            let adapter_disagreed = evidence
+                .document
+                .adapter_first_pass
+                .as_ref()
+                .is_some_and(|first_pass| first_pass.oracle && first_pass.winner.is_none());
             evidence.finish("PASS")?;
             println!("ensemble PASS");
             println!("  answer sha256: {answer_hash}");
             println!("  artifact     : {}", answer_path.display());
             println!("  usage        : {}", usage_path.display());
+            if adapter_disagreed {
+                println!(
+                    "  note         : the adapter-side oracle passed no lane, so nothing was pruned; check that your oracle works with AGENTMASTER_ANSWER_PATH"
+                );
+            }
             return Ok(());
         }
     }
@@ -651,6 +741,47 @@ fn run_with_program(request: EnsembleRequest<'_>, data_dir: &Path, program: &Pat
     )
 }
 
+/// Adapter flags for the opt-in extensions. Empty unless this controller asked
+/// for them, which keeps the default invocation byte-identical to the strict v2
+/// protocol every older adapter understands.
+fn extension_args(request: &EnsembleRequest<'_>) -> Vec<String> {
+    let mut args = Vec::new();
+    if request.first_pass {
+        args.push("--first-pass".to_string());
+        // The same oracle runs inside the adapter so peers can be pruned the
+        // moment one answer passes; the controller still re-runs it on the
+        // winner, so the manifest evidence stays controller-side.
+        args.push("--oracle".to_string());
+        args.push(request.oracle.to_string());
+        // Our oracles are written against AGENTMASTER_ANSWER_PATH. Without this
+        // alias the adapter-side run reads an empty path, never passes, and
+        // --first-pass silently degrades into a full-price run with no pruning.
+        args.push("--oracle-env-prefix".to_string());
+        args.push("AGENTMASTER".to_string());
+    }
+    if request.budget_tokens > 0 {
+        args.push("--budget-tokens".to_string());
+        args.push(request.budget_tokens.to_string());
+    }
+    if request.evidence {
+        args.push("--evidence".to_string());
+        args.push("--evidence-mode".to_string());
+        args.push(request.evidence_mode.to_string());
+        if let Some(target) = request.evidence_target {
+            args.push("--evidence-target".to_string());
+            args.push(target.to_string());
+        }
+        if request.evidence_bytes > 0 {
+            args.push("--evidence-bytes".to_string());
+            args.push(request.evidence_bytes.to_string());
+        }
+    }
+    if request.skill_route {
+        args.push("--skill-route".to_string());
+    }
+    args
+}
+
 fn validate(request: &EnsembleRequest<'_>) -> Result<LanePolicy> {
     if request.dry_run == request.go {
         bail!("exactly one of --dry-run or --go is required");
@@ -666,6 +797,36 @@ fn validate(request: &EnsembleRequest<'_>) -> Result<LanePolicy> {
     }
     if !(1..=500).contains(&request.max_tokens) {
         bail!("--max-tokens must be between 1 and 500");
+    }
+    // The adapter's value parser rejects a value that starts with `--`, so an
+    // oracle we cannot hand down must fail loudly instead of silently turning
+    // --first-pass into "the first answer wins regardless of the oracle".
+    if request.first_pass && request.oracle.trim_start().starts_with("--") {
+        bail!("--first-pass cannot pass an oracle that starts with `--` down to the adapter");
+    }
+    if request.budget_tokens > 0 && request.budget_tokens < request.max_tokens {
+        bail!(
+            "--budget-tokens {} is below --max-tokens {}; the capsule input alone would exceed it",
+            request.budget_tokens,
+            request.max_tokens
+        );
+    }
+    if request.evidence && !matches!(request.evidence_mode, "research" | "mega" | "fetch") {
+        bail!("--evidence-mode must be research, mega or fetch");
+    }
+    if request.evidence && request.evidence_mode == "fetch" && request.evidence_target.is_none() {
+        bail!("--evidence-mode fetch requires --evidence-target <url>");
+    }
+    if !request.evidence && (request.evidence_target.is_some() || request.evidence_bytes > 0) {
+        bail!("--evidence-target/--evidence-bytes require --evidence");
+    }
+    if request.evidence_bytes > 4000 {
+        bail!("--evidence-bytes must not exceed 4000");
+    }
+    if let Some(target) = request.evidence_target
+        && (target.trim().is_empty() || target.trim_start().starts_with("--"))
+    {
+        bail!("--evidence-target must be a non-empty value that does not start with `--`");
     }
 
     let mut policy = LanePolicy {
@@ -831,6 +992,33 @@ fn validate_adapter_output(
     {
         bail!("llmadapter result count/cap contract mismatch");
     }
+    // An extension block we did not ask for means the adapter is not the one we
+    // probed. Fail closed rather than parse an unexpected surface.
+    if (output.first_pass.is_some() && !request.first_pass)
+        || (output.first_pass.is_none() && request.first_pass)
+        || (output.evidence.is_some() && !request.evidence)
+        || (output.skill_route.is_some() && !request.skill_route)
+    {
+        bail!("llmadapter emitted extension blocks that do not match the requested flags");
+    }
+    if let Some(first_pass) = &output.first_pass {
+        let pruned = output
+            .results
+            .iter()
+            .filter(|result| result.terminal == "pruned")
+            .count() as u64;
+        if first_pass.pruned != pruned || first_pass.oracle != request.first_pass {
+            bail!("llmadapter first-pass summary contradicts its lane records");
+        }
+        if let Some(winner) = &first_pass.winner
+            && !output
+                .results
+                .iter()
+                .any(|result| &result.lane == winner && result.ok)
+        {
+            bail!("llmadapter named a first-pass winner without a matching ok lane");
+        }
+    }
 
     let valid = output
         .results
@@ -853,10 +1041,12 @@ fn validate_adapter_output(
         if result.lane.is_empty()
             || !matches!(result.kind.as_str(), "openrouter" | "ollama" | "cli")
             || !matches!(result.class.as_str(), "free" | "paid" | "local" | "cli")
-            || !matches!(
+            // `pruned` is only legal when this controller asked for
+            // --first-pass; an adapter that emits it unasked is not trusted.
+            || !(matches!(
                 result.terminal.as_str(),
                 "succeeded" | "failed" | "timeout" | "output_limit" | "cached"
-            )
+            ) || (request.first_pass && result.terminal == "pruned"))
             || !matches!(
                 result.token_count_source.as_str(),
                 "provider_reported" | "estimated" | "unknown"
@@ -1382,6 +1572,13 @@ mod tests {
             go: true,
             allow_remote: false,
             allow_paid: false,
+            first_pass: false,
+            budget_tokens: 0,
+            evidence: false,
+            evidence_mode: "research",
+            evidence_target: None,
+            evidence_bytes: 0,
+            skill_route: false,
         }
     }
 
@@ -1390,6 +1587,95 @@ mod tests {
             std::env::temp_dir().join(format!("agentmaster-ensemble-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn a_default_run_hands_the_adapter_no_extension_flags() {
+        // The strict v2 invocation must stay byte-identical, otherwise an older
+        // adapter that never learned these flags starts failing.
+        assert!(extension_args(&request("task", "true")).is_empty());
+    }
+
+    #[test]
+    fn first_pass_hands_the_same_oracle_down_so_peers_can_be_pruned() {
+        let mut req = request("task", "grep -q ok \"$LLMADAPTER_ANSWER_PATH\"");
+        req.first_pass = true;
+        let args = extension_args(&req);
+        assert_eq!(
+            args,
+            vec![
+                "--first-pass".to_string(),
+                "--oracle".to_string(),
+                "grep -q ok \"$LLMADAPTER_ANSWER_PATH\"".to_string(),
+                "--oracle-env-prefix".to_string(),
+                "AGENTMASTER".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn first_pass_refuses_an_oracle_the_adapter_would_read_as_a_flag() {
+        let mut req = request("task", "--not-an-oracle");
+        req.first_pass = true;
+        assert!(validate(&req).is_err());
+    }
+
+    #[test]
+    fn a_budget_below_the_output_ceiling_is_refused_instead_of_failing_every_lane() {
+        let mut req = request("task", "true");
+        req.max_tokens = 500;
+        req.budget_tokens = 200;
+        assert!(validate(&req).is_err());
+        req.budget_tokens = 4000;
+        assert!(validate(&req).is_ok());
+    }
+
+    #[test]
+    fn evidence_side_flags_require_the_evidence_flag() {
+        let mut req = request("task", "true");
+        req.evidence_bytes = 600;
+        assert!(validate(&req).is_err());
+
+        let mut fetch_without_target = request("task", "true");
+        fetch_without_target.evidence = true;
+        fetch_without_target.evidence_mode = "fetch";
+        assert!(validate(&fetch_without_target).is_err());
+
+        let mut bad_mode = request("task", "true");
+        bad_mode.evidence = true;
+        bad_mode.evidence_mode = "browse";
+        assert!(validate(&bad_mode).is_err());
+    }
+
+    #[test]
+    fn evidence_args_carry_mode_target_and_budget() {
+        let mut req = request("task", "true");
+        req.evidence = true;
+        req.evidence_mode = "fetch";
+        req.evidence_target = Some("https://example.com");
+        req.evidence_bytes = 600;
+        req.skill_route = true;
+        assert_eq!(
+            extension_args(&req),
+            vec![
+                "--evidence".to_string(),
+                "--evidence-mode".to_string(),
+                "fetch".to_string(),
+                "--evidence-target".to_string(),
+                "https://example.com".to_string(),
+                "--evidence-bytes".to_string(),
+                "600".to_string(),
+                "--skill-route".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_evidence_target_cannot_impersonate_a_flag() {
+        let mut req = request("task", "true");
+        req.evidence = true;
+        req.evidence_target = Some("--allow-paid");
+        assert!(validate(&req).is_err());
     }
 
     fn accounting(task: &str, lanes: &str, completed: bool) -> serde_json::Value {

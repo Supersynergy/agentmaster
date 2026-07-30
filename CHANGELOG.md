@@ -4,6 +4,49 @@ All notable changes to agentmaster are documented here. Newest first.
 
 ## [Unreleased]
 
+### Added — research: gather once, reference N times
+- Added `research <name> <query>`: one controller-side gather into private
+  `0600` artifacts under `~/.agentmaster/research/`, then a capsule line that
+  hands workers a **path instead of a payload**. A fleet that each looks the
+  same fact up pays N times for one answer and drags the raw page through N
+  transcripts; this pays once and keeps the bytes out of every transcript.
+- Gathering spends **zero model tokens**: the web source is `llmadapter
+  evidence`, which caches, projects and reports without running a lane.
+  `--code` adds a bounded `ghmax` search and `--trends` a bounded
+  `superweb gitstars` scan. Sources are detected, never installed; a missing
+  one is recorded as `skipped`, not an error.
+- Each source streams stdout straight into its artifact file, so a large page
+  never passes through agentmaster's memory, and each is killed at
+  `--deadline-secs`. Artifacts are capped at 512 KiB and truncated on a UTF-8
+  boundary with `truncated: true` in the manifest. A query that starts with
+  `--` is refused before it can become a flag for a program we do not control.
+
+### Added — ensemble uses the adapter's bounded extensions
+- `ensemble --first-pass` starts every lane at once and hands the same oracle
+  down, so the first PASS prunes its peers **mid-flight**. Measured on three
+  free lanes: one oracle run instead of three, one lane pruned while still
+  generating. Without it the controller waits for every lane, then judges.
+- `--first-pass` also passes `--oracle-env-prefix AGENTMASTER`, so an oracle
+  written against `AGENTMASTER_ANSWER_PATH` keeps working inside the adapter.
+  Without that alias the adapter-side oracle reads an empty path, never passes,
+  and the mode silently degrades into a full-price run: when the controller
+  passes but the adapter found no winner, the run now says so.
+- Added `--budget-tokens` (hard per-lane ceiling, refused when below
+  `--max-tokens` since the capsule alone would breach it), `--evidence`
+  (+ `--evidence-mode/--evidence-target/--evidence-bytes`) and `--skill-route`.
+  An `--evidence-target` that starts with `--` is refused.
+- The result validator accepts the adapter's `pruned` terminal **only** when
+  this controller asked for `--first-pass`, cross-checks the first-pass summary
+  against the lane records, and rejects extension blocks that were not
+  requested. The manifest records the exact extension flags used.
+
+### Fixed
+- `.config/nextest.toml` gives the two wall-clock swarm tests the machine to
+  themselves. They assert that a lane ends on its child-exit sentinel rather
+  than on the deadline, which a busy suite can flip with nothing wrong in the
+  code; widening the deadline to 20s did not help, so the load was the problem,
+  not the timing budget. No assertion was loosened.
+
 ### Added — lean llmadapter ensemble
 - Added opt-in `ensemble`: local lanes by default, explicit remote/paid consent,
   a requested output ceiling of at most 500 tokens, bounded process/oracle

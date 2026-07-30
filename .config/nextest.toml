@@ -1,0 +1,16 @@
+# Two swarm tests measure how a lane ENDS: on its child-exit sentinel rather
+# than on the deadline. That is a wall-clock property, so a busy machine can
+# flip the outcome with nothing wrong in the code. Give them the machine to
+# themselves instead of loosening what they assert.
+#
+# Reproduction that motivated this: on a 133-test suite these failed in roughly
+# half of full runs, always passed in isolation, and still failed with the
+# deadline widened to 20s — the deadline was never the tight part, the load was.
+
+[[profile.default.overrides]]
+filter = 'test(/cmux_runtime_exit_sentinel/) + test(/oracle_timeout_is_bounded/)'
+threads-required = 'num-cpus'
+
+[[profile.ci.overrides]]
+filter = 'test(/cmux_runtime_exit_sentinel/) + test(/oracle_timeout_is_bounded/)'
+threads-required = 'num-cpus'

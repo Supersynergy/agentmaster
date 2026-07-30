@@ -153,6 +153,45 @@ agentmaster ensemble compare \
 The oracle receives `AGENTMASTER_RUN_DIR`, `AGENTMASTER_ANSWER_PATH`, and
 `AGENTMASTER_USAGE_PATH`. Its exit code is the decision: zero is PASS.
 
+`--first-pass` starts every lane at once and hands the same oracle down to the
+adapter, so the first PASS prunes its peers while they are still generating.
+The oracle string keeps working unchanged: agentmaster also passes
+`--oracle-env-prefix AGENTMASTER`, so `AGENTMASTER_ANSWER_PATH` is defined on
+both sides. If the controller passes while the adapter found no winner, the run
+says so — that combination means nothing was pruned and the run cost full price.
+
+```bash
+agentmaster ensemble answer-check \
+  --oracle 'grep -qi sqlite "$AGENTMASTER_ANSWER_PATH"' \
+  --first-pass --budget-tokens 4000 --go \
+  "Name AgentMaster's embedded database in one line"
+```
+
+`--budget-tokens` is a hard per-lane ceiling enforced inside the adapter, unlike
+`--max-tokens` which only requests one. `--evidence` gathers one primary-source
+artifact before the lanes start and puts it in every capsule. `--skill-route`
+lets the adapter's router name one skill.
+
+## Research: gather once, reference N times
+
+A fleet that needs the same fresh fact usually pays for it once per worker, and
+drags the raw page through every transcript. `research` does the lookup once, on
+the controller side, and hands workers a path:
+
+```bash
+agentmaster research pricing --code --trends "vector database pricing 2026"
+```
+
+Artifacts land under `~/.agentmaster/research/<name>/<run>/` with `0600`
+permissions, and the command prints a capsule line you can paste into a swarm or
+an `assign`. Gathering spends **zero model tokens** — the web source is
+`llmadapter evidence`, which caches, projects and reports without running a
+lane. `--code` adds a bounded `ghmax` search, `--trends` a bounded
+`superweb gitstars` scan. Every source is detected rather than installed, is
+killed at `--deadline-secs`, and streams its stdout straight into its artifact
+file, so a large page never passes through agentmaster's memory. Use `--dry-run`
+to see which sources would run and where they resolve on `PATH`.
+
 Reproducible zero-provider proof: the
 [llmadapter payload benchmark](docs/LLMADAPTER-BENCHMARK.md) reduces a
 constructed 4,000-line log payload from 184,497 to 852 bytes (99.5382%) after
