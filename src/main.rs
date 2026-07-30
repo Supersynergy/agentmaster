@@ -14,6 +14,7 @@ mod orch;
 mod peek;
 mod pty;
 mod research;
+mod route;
 mod router;
 mod runtime;
 mod state;
@@ -153,6 +154,27 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Route a task to an agent that is already warm instead of cold-starting
+    /// one. `assign` always spawns fresh, which throws away the repo context the
+    /// agent already read and the provider's prompt cache for that conversation.
+    /// Ranks live agents by directory affinity, topic overlap and how recently
+    /// they spoke; `--send` delivers to the winner.
+    Route {
+        /// the task (remaining words are joined)
+        #[arg(trailing_var_arg = true, required = true)]
+        task: Vec<String>,
+        /// Deliver to the top candidate instead of printing the send command
+        #[arg(long)]
+        send: bool,
+        /// Also consider agents that look busy (sending interrupts them)
+        #[arg(long)]
+        include_busy: bool,
+        /// Below this score a cold start is the better bet
+        #[arg(long, default_value_t = route::default_min_score())]
+        min_score: i32,
+        #[arg(long)]
+        json: bool,
+    },
     /// List every stored goal + its progress
     Goals {
         #[arg(long)]
@@ -249,6 +271,13 @@ enum Cmd {
         /// Opt into Synapse recall and persistence for this swarm.
         #[arg(long)]
         recall: bool,
+        /// Give every lane the same controller-gathered evidence file, so the
+        /// fetch is paid for once instead of once per lane
+        #[arg(long)]
+        evidence_file: Option<String>,
+        /// Same, but resolve the newest `research <name>` run automatically
+        #[arg(long)]
+        research: Option<String>,
         /// the task (remaining words are joined)
         #[arg(trailing_var_arg = true, required = true)]
         task: Vec<String>,
@@ -329,6 +358,17 @@ enum Cmd {
         /// Also run a bounded trend scan (`superweb gitstars`) into its own artifact
         #[arg(long)]
         trends: bool,
+        /// Ask for official primary sources first; a version, price or policy
+        /// claim should cite whoever owns the fact
+        #[arg(long)]
+        primary: bool,
+        /// How long a completed gather stays reusable. Paying twice for the
+        /// same fetch is the thing this command exists to prevent
+        #[arg(long, default_value_t = 86_400)]
+        ttl_secs: u64,
+        /// Bypass the cache and re-gather, provider included
+        #[arg(long)]
+        refresh: bool,
         /// Seconds before each source is killed
         #[arg(long, default_value_t = 300)]
         deadline_secs: u64,
@@ -456,6 +496,25 @@ fn main() -> anyhow::Result<()> {
                 cli::goal_set(&name, g, dod, &dir)?
             }
         }
+        Cmd::Route {
+            task,
+            send,
+            include_busy,
+            min_score,
+            json,
+        } => {
+            let task = task.join(" ");
+            route::run(
+                route::RouteRequest {
+                    task: &task,
+                    send,
+                    include_busy,
+                    min_score,
+                    json,
+                },
+                &dir,
+            )?;
+        }
         Cmd::Goals { json } => cli::goals_list(json, &dir)?,
         Cmd::GoalCheck { name } => cli::goal_check(&name, &dir)?,
         Cmd::GoalClose {
@@ -489,6 +548,8 @@ fn main() -> anyhow::Result<()> {
             deadline_secs,
             no_parallel,
             recall,
+            evidence_file,
+            research,
             task,
             dry_run,
         } => {
@@ -506,6 +567,8 @@ fn main() -> anyhow::Result<()> {
                     deadline_secs,
                     no_parallel,
                     recall,
+                    evidence_file: evidence_file.as_deref(),
+                    research: research.as_deref(),
                     dry_run,
                 },
                 &dir,
@@ -562,6 +625,9 @@ fn main() -> anyhow::Result<()> {
             bytes,
             code,
             trends,
+            primary,
+            ttl_secs,
+            refresh,
             deadline_secs,
             dry_run,
             query,
@@ -575,7 +641,10 @@ fn main() -> anyhow::Result<()> {
                     bytes,
                     code,
                     trends,
+                    primary,
                     deadline_secs,
+                    ttl_secs,
+                    refresh,
                     dry_run,
                 },
                 &dir,

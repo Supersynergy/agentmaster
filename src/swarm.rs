@@ -66,6 +66,9 @@ pub struct LaneSpec {
     pub skill_path: Option<String>,
     /// Optional budget cap in tokens. Lane is killed if it exceeds this.
     pub budget_tokens: Option<usize>,
+    /// One controller-gathered evidence line, referenced by path. Every lane
+    /// gets the same one: the fetch was paid for once, before the swarm began.
+    pub evidence_line: Option<String>,
     /// Working directory for the lane's cmux workspace.
     pub workdir: PathBuf,
 }
@@ -989,16 +992,32 @@ async fn signal_lane_stop(cmux_bin: &str, workspace_ref: &str, reason: &str) {
 const MAX_CAPSULE_BYTES: usize = 2_800;
 
 pub(crate) fn build_capsule(lane: &LaneSpec) -> String {
+    // An evidence reference is a path, not a payload, and it carries its own
+    // budget: adding it must never shrink the task the worker is given. The
+    // extra is measured against the same capsule without evidence, because the
+    // no-evidence branch already prints a sentence of its own.
     let fixed = render_capsule(lane, "");
-    let task_budget = MAX_CAPSULE_BYTES.saturating_sub(fixed.len());
+    let evidence_extra = if lane.evidence_line.is_some() {
+        let mut bare = lane.clone();
+        bare.evidence_line = None;
+        fixed.len().saturating_sub(render_capsule(&bare, "").len())
+    } else {
+        0
+    };
+    let cap = MAX_CAPSULE_BYTES + evidence_extra;
+    let task_budget = cap.saturating_sub(fixed.len());
     let task = truncate_utf8(&lane.task, task_budget);
-    truncate_utf8(&render_capsule(lane, task), MAX_CAPSULE_BYTES).to_string()
+    truncate_utf8(&render_capsule(lane, task), cap).to_string()
 }
 
 fn render_capsule(lane: &LaneSpec, task: &str) -> String {
     let model = lane.model;
     let task_type = router::classify(&lane.task);
     let tool_route = tool_route(&lane.task);
+    let evidence_route = lane
+        .evidence_line
+        .as_deref()
+        .unwrap_or("No controller evidence was gathered for this task.");
     let skill_route = lane
         .skill_path
         .as_deref()
@@ -1034,6 +1053,9 @@ fn render_capsule(lane: &LaneSpec, task: &str) -> String {
          ## Tool route\n\
          {tool_route}\n\
          \n\
+         ## Evidence\n\
+         {evidence_route}\n\
+         \n\
          ## Skill route\n\
          {skill_route}\n\
          \n\
@@ -1054,6 +1076,7 @@ fn render_capsule(lane: &LaneSpec, task: &str) -> String {
         ctx = model.context_window,
         task_type = task_type,
         tool_route = tool_route,
+        evidence_route = evidence_route,
         skill_route = skill_route,
         strengths = model.strengths.join(", "),
         weaknesses = model.weaknesses.join(", "),
@@ -1171,6 +1194,7 @@ mod tests {
             model,
             task: "run cargo test".into(),
             oracle: "true".into(),
+            evidence_line: None,
             skill_path: None,
             budget_tokens: None,
             workdir: std::env::temp_dir(),
@@ -1303,6 +1327,36 @@ mod tests {
         let _ = std::fs::remove_file(marker);
         assert_eq!(result.outcome, LaneOutcome::Passed);
         assert!(result.workspace_ref.is_none());
+    }
+
+    #[test]
+    fn evidence_reaches_the_capsule_by_path_and_never_shrinks_the_task() {
+        let mut lane = make_lane(0, &FAKE_FAIL_MODEL);
+        lane.task = "x".repeat(4_000);
+        let without = build_capsule(&lane);
+        lane.evidence_line = Some("Read `/tmp/run/web.txt` before any fresh-fact claim.".into());
+        let with = build_capsule(&lane);
+
+        assert!(with.contains("/tmp/run/web.txt"));
+        assert!(with.contains("## Evidence"));
+        // The evidence carries its own budget: the task keeps every byte it had.
+        // (Not byte-equal: the no-evidence branch prints its own sentence, so
+        // the two fixed headers differ by a byte or two.)
+        let task_bytes = |capsule: &str| capsule.matches('x').count();
+        assert!(
+            task_bytes(&with) >= task_bytes(&without),
+            "evidence shrank the task: {} < {}",
+            task_bytes(&with),
+            task_bytes(&without)
+        );
+        assert!(with.len() <= MAX_CAPSULE_BYTES + lane.evidence_line.as_ref().unwrap().len() + 32);
+    }
+
+    #[test]
+    fn a_lane_without_evidence_is_told_so_instead_of_guessing() {
+        let lane = make_lane(0, &FAKE_FAIL_MODEL);
+        let capsule = build_capsule(&lane);
+        assert!(capsule.contains("No controller evidence was gathered"));
     }
 
     #[cfg(unix)]

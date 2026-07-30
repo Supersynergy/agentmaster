@@ -11,7 +11,7 @@
 //! large is ever held in memory here.
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -32,15 +32,22 @@ pub struct ResearchRequest<'a> {
     pub bytes: u32,
     pub code: bool,
     pub trends: bool,
+    /// Ask the provider for official primary sources before the general web.
+    pub primary: bool,
     pub deadline_secs: u64,
+    /// How long a completed gather stays reusable. The whole point of research
+    /// is to pay once; re-fetching the same query an hour later throws that
+    /// away.
+    pub ttl_secs: u64,
+    pub refresh: bool,
     pub dry_run: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct SourceRecord {
-    source: &'static str,
+    source: String,
     program: String,
-    status: &'static str,
+    status: String,
     exit_code: Option<i32>,
     elapsed_ms: u64,
     artifact: Option<String>,
@@ -51,9 +58,9 @@ struct SourceRecord {
     detail: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct ResearchManifest {
-    schema: &'static str,
+    schema: String,
     schema_version: u8,
     name: String,
     query_sha256: String,
@@ -61,14 +68,37 @@ struct ResearchManifest {
     mode: String,
     requested_bytes: u32,
     deadline_secs: u64,
+    /// Identifies the inputs that decide what the artifacts contain. Two runs
+    /// with the same key would fetch the same thing, so the second one does
+    /// not run at all.
+    cache_key: String,
+    created_ms: u128,
     sources: Vec<SourceRecord>,
     model_tokens_spent: u64,
     capsule_line: Option<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct CachePointer {
+    schema: String,
+    schema_version: u8,
+    cache_key: String,
+    run_dir: String,
+    created_ms: u128,
+}
+
 pub fn run(request: ResearchRequest<'_>, data_dir: &Path) -> Result<()> {
     validate(&request)?;
     let query_hash = sha256_hex(request.query.as_bytes());
+
+    let cache_key = cache_key(&request);
+    // Cache first: a completed gather is the artifact, so an identical request
+    // inside the TTL must not touch the network at all.
+    let cached = if request.refresh {
+        None
+    } else {
+        lookup_cached(data_dir, &cache_key, request.ttl_secs)
+    };
 
     let mut planned: Vec<(&'static str, String)> = Vec::new();
     let adapter = find_on_path("llmadapter");
@@ -79,6 +109,15 @@ pub fn run(request: ResearchRequest<'_>, data_dir: &Path) -> Result<()> {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "llmadapter (missing)".to_string()),
     ));
+    if request.primary {
+        planned.push((
+            "primary",
+            adapter
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "llmadapter (missing)".to_string()),
+        ));
+    }
     if request.code {
         planned.push((
             "code",
@@ -104,10 +143,24 @@ pub fn run(request: ResearchRequest<'_>, data_dir: &Path) -> Result<()> {
         println!("  mode        : {}", request.mode);
         println!("  bytes       : {}", request.bytes);
         println!("  deadline    : {}s per source", request.deadline_secs);
+        println!("  cache key   : {cache_key}");
+        println!(
+            "  cache       : {}",
+            match cached.as_ref() {
+                _ if request.refresh => "bypassed (--refresh)".to_string(),
+                Some(hit) => format!("hit, {}s old — no source would run", hit.age_secs),
+                None => "miss — every source would run".to_string(),
+            }
+        );
         for (source, program) in &planned {
             println!("  source      : {source} -> {program}");
         }
         println!("  model tokens: 0 (gathering never calls a model)");
+        return Ok(());
+    }
+
+    if let Some(hit) = cached {
+        report(&hit.manifest, &hit.run_dir, Some(hit.age_secs));
         return Ok(());
     }
 
@@ -116,6 +169,9 @@ pub fn run(request: ResearchRequest<'_>, data_dir: &Path) -> Result<()> {
     let run_dir = create_run_dir(data_dir, &slug(request.name))?;
     let mut sources = Vec::new();
 
+    if request.primary {
+        sources.push(run_primary(&adapter, &request, &run_dir)?);
+    }
     sources.push(run_web(&adapter, &request, &run_dir)?);
     if request.code {
         sources.push(run_code(&request, &run_dir)?);
@@ -136,7 +192,7 @@ pub fn run(request: ResearchRequest<'_>, data_dir: &Path) -> Result<()> {
         });
 
     let manifest = ResearchManifest {
-        schema: "agentmaster.research",
+        schema: "agentmaster.research".to_string(),
         schema_version: 1,
         name: request.name.to_string(),
         query_sha256: query_hash.clone(),
@@ -144,17 +200,71 @@ pub fn run(request: ResearchRequest<'_>, data_dir: &Path) -> Result<()> {
         mode: request.mode.to_string(),
         requested_bytes: request.bytes,
         deadline_secs: request.deadline_secs,
+        cache_key: cache_key.clone(),
+        created_ms: now_ms(),
         model_tokens_spent: sources.iter().map(|record| record.model_tokens_spent).sum(),
         capsule_line: capsule_line.clone(),
         sources,
     };
     let manifest_path = run_dir.join("index.json");
     write_private_json(&manifest_path, &manifest)?;
+    // Only a run with at least one usable artifact is worth pointing at.
+    if manifest.sources.iter().any(|record| record.status == "ok") {
+        store_pointer(data_dir, &cache_key, &run_dir, manifest.created_ms)?;
+    }
+    report(&manifest, &run_dir, None);
+    Ok(())
+}
 
+/// Newest usable gather for a research name, as (run dir, capsule line).
+/// Used by the swarm so N lanes reference one artifact instead of each looking
+/// the same fact up.
+pub fn latest_run(data_dir: &Path, name: &str) -> Option<(PathBuf, String)> {
+    let dir = data_dir.join("research").join(slug(name));
+    let mut runs: Vec<PathBuf> = fs::read_dir(&dir)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect();
+    // Run directories are named "<millis>-<pid>", so lexical order is age order
+    // for any run this millennium.
+    runs.sort();
+    for run in runs.into_iter().rev() {
+        let Ok(bytes) = fs::read(run.join("index.json")) else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_slice::<ResearchManifest>(&bytes) else {
+            continue;
+        };
+        let Some(line) = manifest.capsule_line.clone() else {
+            continue;
+        };
+        let artifacts_present = manifest
+            .sources
+            .iter()
+            .filter(|record| record.status == "ok")
+            .all(|record| {
+                record
+                    .artifact
+                    .as_ref()
+                    .is_some_and(|path| Path::new(path).is_file())
+            });
+        if artifacts_present {
+            return Some((run, line));
+        }
+    }
+    None
+}
+
+fn report(manifest: &ResearchManifest, run_dir: &Path, cache_age_secs: Option<u64>) {
     println!("research {}", manifest.name);
     println!("  run dir : {}", run_dir.display());
+    match cache_age_secs {
+        Some(age) => println!("  cache   : HIT ({age}s old) — no source ran, nothing fetched"),
+        None => println!("  cache   : miss — sources ran once, reusable from now on"),
+    }
     for record in &manifest.sources {
-        match record.status {
+        match record.status.as_str() {
             "ok" => println!(
                 "  {:<7}: ok {} bytes{} -> {}",
                 record.source,
@@ -177,19 +287,115 @@ pub fn run(request: ResearchRequest<'_>, data_dir: &Path) -> Result<()> {
         "  tokens  : {} model tokens spent",
         manifest.model_tokens_spent
     );
-    println!("  manifest: {}", manifest_path.display());
-    if let Some(line) = capsule_line {
+    println!("  manifest: {}", run_dir.join("index.json").display());
+    if let Some(line) = &manifest.capsule_line {
         println!("  capsule : {line}");
     }
-    Ok(())
+}
+
+/// Everything that decides what the artifacts contain. The name is deliberately
+/// absent: the same query gathered under two names is the same fetch.
+fn cache_key(request: &ResearchRequest<'_>) -> String {
+    sha256_hex(
+        format!(
+            "v1|{}|{}|{}|{}|{}|{}",
+            request.query.trim(),
+            request.mode,
+            request.bytes,
+            request.primary,
+            request.code,
+            request.trends,
+        )
+        .as_bytes(),
+    )
+}
+
+struct CacheHit {
+    manifest: ResearchManifest,
+    run_dir: PathBuf,
+    age_secs: u64,
+}
+
+/// A pointer is a hint, never an authority: the run directory has to sit under
+/// this data dir, still exist, and carry a manifest whose key matches.
+fn lookup_cached(data_dir: &Path, key: &str, ttl_secs: u64) -> Option<CacheHit> {
+    let pointer_path = pointer_path(data_dir, key);
+    let pointer: CachePointer = serde_json::from_slice(&fs::read(&pointer_path).ok()?).ok()?;
+    if pointer.cache_key != key {
+        return None;
+    }
+    let run_dir = PathBuf::from(&pointer.run_dir);
+    let root = data_dir.join("research");
+    if !run_dir.starts_with(&root) || !run_dir.is_dir() {
+        return None;
+    }
+    let manifest: ResearchManifest =
+        serde_json::from_slice(&fs::read(run_dir.join("index.json")).ok()?).ok()?;
+    if manifest.cache_key != key {
+        return None;
+    }
+    let age_ms = now_ms().saturating_sub(manifest.created_ms);
+    let age_secs = (age_ms / 1000) as u64;
+    if age_secs > ttl_secs {
+        return None;
+    }
+    // A manifest that points at artifacts somebody deleted is not a hit.
+    if !manifest
+        .sources
+        .iter()
+        .filter(|record| record.status == "ok")
+        .all(|record| {
+            record
+                .artifact
+                .as_ref()
+                .is_some_and(|path| Path::new(path).is_file())
+        })
+    {
+        return None;
+    }
+    Some(CacheHit {
+        manifest,
+        run_dir,
+        age_secs,
+    })
+}
+
+fn store_pointer(data_dir: &Path, key: &str, run_dir: &Path, created_ms: u128) -> Result<()> {
+    write_private_json(
+        &pointer_path(data_dir, key),
+        &CachePointer {
+            schema: "agentmaster.research.pointer".to_string(),
+            schema_version: 1,
+            cache_key: key.to_string(),
+            run_dir: run_dir.display().to_string(),
+            created_ms,
+        },
+    )
+}
+
+fn pointer_path(data_dir: &Path, key: &str) -> PathBuf {
+    data_dir
+        .join("research")
+        .join(".index")
+        .join(format!("{key}.json"))
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default()
 }
 
 fn validate(request: &ResearchRequest<'_>) -> Result<()> {
     if request.name.trim().is_empty() || request.query.trim().is_empty() {
         bail!("research name and query must not be empty");
     }
-    if !matches!(request.mode, "research" | "mega" | "fetch") {
-        bail!("--mode must be research, mega or fetch");
+    if !matches!(request.mode, "research" | "mega" | "fetch" | "primary") {
+        bail!("--mode must be research, mega, fetch or primary");
+    }
+    if request.ttl_secs == 0 && !request.refresh {
+        bail!("--ttl-secs must be greater than zero; pass --refresh to bypass the cache");
     }
     if !(1..=4000).contains(&request.bytes) {
         bail!("--bytes must be between 1 and 4000");
@@ -205,23 +411,47 @@ fn validate(request: &ResearchRequest<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Official sources before general web results. A version, price or policy
+/// claim should cite whoever owns the fact, not the best-ranked blog about it.
+fn run_primary(
+    adapter: &Path,
+    request: &ResearchRequest<'_>,
+    run_dir: &Path,
+) -> Result<SourceRecord> {
+    run_adapter_evidence(adapter, request, run_dir, "primary")
+}
+
 /// The web source is `llmadapter evidence`: it caches, projects and reports,
 /// and it runs no lane, so it costs zero model tokens.
 fn run_web(adapter: &Path, request: &ResearchRequest<'_>, run_dir: &Path) -> Result<SourceRecord> {
-    let artifact = run_dir.join("web.txt");
-    let report_path = run_dir.join("web-report.json");
+    run_adapter_evidence(adapter, request, run_dir, request.mode)
+}
+
+fn run_adapter_evidence(
+    adapter: &Path,
+    request: &ResearchRequest<'_>,
+    run_dir: &Path,
+    mode: &str,
+) -> Result<SourceRecord> {
+    let label = if mode == "primary" { "primary" } else { "web" };
+    let artifact = run_dir.join(format!("{label}.txt"));
+    let report_path = run_dir.join(format!("{label}-report.json"));
     let started = Instant::now();
     let mut command = Command::new(adapter);
     command
         .arg("evidence")
         .arg("--mode")
-        .arg(request.mode)
+        .arg(mode)
         .arg("--target")
         .arg(request.query)
         .arg("--bytes")
         .arg(request.bytes.to_string())
         .arg("--out")
         .arg(&artifact);
+    if request.refresh {
+        // A forced refresh must reach the provider, not the adapter's cache.
+        command.arg("--no-cache");
+    }
     let outcome = run_bounded(
         command,
         &report_path,
@@ -230,7 +460,7 @@ fn run_web(adapter: &Path, request: &ResearchRequest<'_>, run_dir: &Path) -> Res
     let (bytes, sha, truncated) = artifact_facts(&artifact)?;
     let ok = outcome.exit_code == Some(0) && bytes > 0;
     Ok(SourceRecord {
-        source: "web",
+        source: label.to_string(),
         program: adapter.display().to_string(),
         status: if ok {
             "ok"
@@ -238,7 +468,8 @@ fn run_web(adapter: &Path, request: &ResearchRequest<'_>, run_dir: &Path) -> Res
             "timeout"
         } else {
             "failed"
-        },
+        }
+        .to_string(),
         exit_code: outcome.exit_code,
         elapsed_ms: started.elapsed().as_millis() as u64,
         artifact: ok.then(|| artifact.display().to_string()),
@@ -271,7 +502,7 @@ fn run_code(request: &ResearchRequest<'_>, run_dir: &Path) -> Result<SourceRecor
     let (bytes, sha, truncated) = artifact_facts(&artifact)?;
     let ok = outcome.exit_code == Some(0) && bytes > 0;
     Ok(SourceRecord {
-        source: "code",
+        source: "code".to_string(),
         program: program.display().to_string(),
         status: if ok {
             "ok"
@@ -279,7 +510,8 @@ fn run_code(request: &ResearchRequest<'_>, run_dir: &Path) -> Result<SourceRecor
             "timeout"
         } else {
             "failed"
-        },
+        }
+        .to_string(),
         exit_code: outcome.exit_code,
         elapsed_ms: started.elapsed().as_millis() as u64,
         artifact: ok.then(|| artifact.display().to_string()),
@@ -315,7 +547,7 @@ fn run_trends(request: &ResearchRequest<'_>, run_dir: &Path) -> Result<SourceRec
     let (bytes, sha, truncated) = artifact_facts(&artifact)?;
     let ok = outcome.exit_code == Some(0) && bytes > 0;
     Ok(SourceRecord {
-        source: "trends",
+        source: "trends".to_string(),
         program: program.display().to_string(),
         status: if ok {
             "ok"
@@ -323,7 +555,8 @@ fn run_trends(request: &ResearchRequest<'_>, run_dir: &Path) -> Result<SourceRec
             "timeout"
         } else {
             "failed"
-        },
+        }
+        .to_string(),
         exit_code: outcome.exit_code,
         elapsed_ms: started.elapsed().as_millis() as u64,
         artifact: ok.then(|| artifact.display().to_string()),
@@ -335,11 +568,11 @@ fn run_trends(request: &ResearchRequest<'_>, run_dir: &Path) -> Result<SourceRec
     })
 }
 
-fn missing_source(source: &'static str, program: &str) -> SourceRecord {
+fn missing_source(source: &str, program: &str) -> SourceRecord {
     SourceRecord {
-        source,
+        source: source.to_string(),
         program: program.to_string(),
-        status: "skipped",
+        status: "skipped".to_string(),
         exit_code: None,
         elapsed_ms: 0,
         artifact: None,
@@ -489,7 +722,10 @@ mod tests {
             bytes: 1200,
             code: false,
             trends: false,
+            primary: false,
             deadline_secs: 30,
+            ttl_secs: 86_400,
+            refresh: false,
             dry_run: false,
         }
     }
@@ -513,6 +749,127 @@ mod tests {
         let mut oversized = request("name", "query");
         oversized.bytes = 9000;
         assert!(validate(&oversized).is_err());
+    }
+
+    fn write_run(data_dir: &Path, name: &str, key: &str, created_ms: u128) -> PathBuf {
+        let run_dir = data_dir.join("research").join(name).join("run");
+        fs::create_dir_all(&run_dir).unwrap();
+        let artifact = run_dir.join("web.txt");
+        fs::write(&artifact, "evidence body").unwrap();
+        let manifest = ResearchManifest {
+            schema: "agentmaster.research".to_string(),
+            schema_version: 1,
+            name: name.to_string(),
+            query_sha256: sha256_hex(b"query"),
+            query_bytes: 5,
+            mode: "research".to_string(),
+            requested_bytes: 1200,
+            deadline_secs: 300,
+            cache_key: key.to_string(),
+            created_ms,
+            sources: vec![SourceRecord {
+                source: "web".to_string(),
+                program: "llmadapter".to_string(),
+                status: "ok".to_string(),
+                exit_code: Some(0),
+                elapsed_ms: 1,
+                artifact: Some(artifact.display().to_string()),
+                artifact_bytes: 13,
+                artifact_sha256: Some(sha256_hex(b"evidence body")),
+                truncated: false,
+                model_tokens_spent: 0,
+                detail: None,
+            }],
+            model_tokens_spent: 0,
+            capsule_line: Some("Read `web.txt`".to_string()),
+        };
+        write_private_json(&run_dir.join("index.json"), &manifest).unwrap();
+        store_pointer(data_dir, key, &run_dir, created_ms).unwrap();
+        run_dir
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("am-research-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_cache_key_ignores_the_name_but_not_the_sources() {
+        let mut a = request("alpha", "same query");
+        let mut b = request("beta", "same query");
+        assert_eq!(cache_key(&a), cache_key(&b), "a name is not a fetch input");
+        b.code = true;
+        assert_ne!(cache_key(&a), cache_key(&b));
+        a.code = true;
+        a.bytes = 900;
+        assert_ne!(cache_key(&a), cache_key(&b));
+    }
+
+    #[test]
+    fn a_fresh_run_is_reused_and_an_expired_one_is_not() {
+        let data_dir = scratch("ttl");
+        let key = "k1";
+        write_run(&data_dir, "alpha", key, now_ms());
+        assert!(lookup_cached(&data_dir, key, 86_400).is_some());
+
+        // The same run, stamped an hour ago, is past a ten-minute TTL.
+        let aged = scratch("ttl-aged");
+        write_run(&aged, "alpha", key, now_ms().saturating_sub(3_600_000));
+        assert!(lookup_cached(&aged, key, 600).is_none());
+        assert!(lookup_cached(&aged, key, 7_200).is_some());
+        let _ = fs::remove_dir_all(&data_dir);
+        let _ = fs::remove_dir_all(&aged);
+    }
+
+    #[test]
+    fn a_hit_needs_its_artifacts_to_still_exist() {
+        let data_dir = scratch("artifacts");
+        let key = "k2";
+        let run_dir = write_run(&data_dir, "alpha", key, now_ms());
+        fs::remove_file(run_dir.join("web.txt")).unwrap();
+        assert!(lookup_cached(&data_dir, key, 86_400).is_none());
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn a_pointer_aimed_outside_the_data_dir_is_refused() {
+        let data_dir = scratch("escape");
+        let key = "k3";
+        write_run(&data_dir, "alpha", key, now_ms());
+        write_private_json(
+            &pointer_path(&data_dir, key),
+            &CachePointer {
+                schema: "agentmaster.research.pointer".to_string(),
+                schema_version: 1,
+                cache_key: key.to_string(),
+                run_dir: "/etc".to_string(),
+                created_ms: now_ms(),
+            },
+        )
+        .unwrap();
+        assert!(lookup_cached(&data_dir, key, 86_400).is_none());
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn latest_run_returns_the_newest_usable_capsule_line() {
+        let data_dir = scratch("latest");
+        write_run(&data_dir, "alpha", "k4", now_ms());
+        let (_, line) = latest_run(&data_dir, "alpha").expect("a usable run");
+        assert!(line.contains("web.txt"));
+        assert!(latest_run(&data_dir, "missing").is_none());
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn a_zero_ttl_without_refresh_is_refused() {
+        let mut req = request("alpha", "query");
+        req.ttl_secs = 0;
+        assert!(validate(&req).is_err());
+        req.refresh = true;
+        assert!(validate(&req).is_ok());
     }
 
     #[test]

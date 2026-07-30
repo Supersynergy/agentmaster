@@ -666,6 +666,10 @@ pub struct SwarmRequest<'a> {
     pub deadline_secs: u64,
     pub no_parallel: bool,
     pub recall: bool,
+    /// Reference a research artifact instead of paying N lanes to gather the
+    /// same fact. Either an explicit file or the newest run of a research name.
+    pub evidence_file: Option<&'a str>,
+    pub research: Option<&'a str>,
     pub dry_run: bool,
 }
 
@@ -673,6 +677,39 @@ pub struct SwarmRequest<'a> {
 /// swarm. The default is deliberately capped at three diverse lanes; a wider
 /// search requires explicit `--fanout`. Capsules contain bounded task context,
 /// not transcripts. Recall is opt-in to avoid cross-project leakage.
+/// Turn `--evidence-file` / `--research` into the one line every lane sees.
+/// A path that does not exist is refused: a capsule pointing at nothing teaches
+/// the worker to invent the fact instead of reading it.
+fn resolve_evidence(
+    evidence_file: Option<&str>,
+    research: Option<&str>,
+    dir: &Path,
+) -> Result<Option<String>> {
+    if evidence_file.is_some() && research.is_some() {
+        anyhow::bail!("pass either --evidence-file or --research, not both");
+    }
+    if let Some(path) = evidence_file {
+        let path = Path::new(path);
+        if !path.is_file() {
+            anyhow::bail!("--evidence-file {} is not a readable file", path.display());
+        }
+        return Ok(Some(format!(
+            "Read `{}` before any fresh-fact claim. Do not re-fetch; cite the file.",
+            path.display()
+        )));
+    }
+    if let Some(name) = research {
+        let Some((run_dir, line)) = crate::research::latest_run(dir, name) else {
+            anyhow::bail!(
+                "no usable research run for '{name}'; run `agentmaster research {name} \"<query>\"` first"
+            );
+        };
+        println!("   research: reusing {}", run_dir.display());
+        return Ok(Some(line));
+    }
+    Ok(None)
+}
+
 pub fn swarm_spawn(request: SwarmRequest<'_>, dir: &Path) -> Result<()> {
     use crate::{ats, router, swarm as swarm_engine};
     let SwarmRequest {
@@ -687,6 +724,8 @@ pub fn swarm_spawn(request: SwarmRequest<'_>, dir: &Path) -> Result<()> {
         deadline_secs,
         no_parallel,
         recall,
+        evidence_file,
+        research,
         dry_run,
     } = request;
     if n == 0 {
@@ -810,6 +849,13 @@ pub fn swarm_spawn(request: SwarmRequest<'_>, dir: &Path) -> Result<()> {
     // Skill choice belongs to the task, not to a model name. Route once, keep
     // at most one verified path, and never relay the router's raw JSON.
     let routed_skill = ats::route_skill(task);
+    let evidence_line = resolve_evidence(evidence_file, research, dir)?;
+    match evidence_line.as_deref() {
+        Some(line) => println!("   evidence: {line}"),
+        None => println!(
+            "   evidence: none (pass --evidence-file PATH or --research NAME so lanes cite one gather instead of N)"
+        ),
+    }
     println!("   lanes :");
     for (i, m) in swarm.iter().enumerate() {
         let skills_str = routed_skill.as_deref().unwrap_or("(none)");
@@ -845,11 +891,14 @@ pub fn swarm_spawn(request: SwarmRequest<'_>, dir: &Path) -> Result<()> {
     // debugging. Writes capsules + spawns via `assign`, no tokio.
     if no_parallel {
         return swarm_spawn_sequential(
-            name,
-            task,
-            oracle,
-            &swarm,
-            routed_skill.as_deref(),
+            SequentialSpawn {
+                name,
+                task,
+                oracle,
+                swarm: &swarm,
+                skill_path: routed_skill.as_deref(),
+                evidence_line: evidence_line.as_deref(),
+            },
             &s,
             dir,
         );
@@ -876,6 +925,7 @@ pub fn swarm_spawn(request: SwarmRequest<'_>, dir: &Path) -> Result<()> {
             oracle: oracle.to_string(),
             skill_path: routed_skill.clone(),
             budget_tokens: lane_budget,
+            evidence_line: evidence_line.clone(),
             workdir: workdir.clone(),
         };
         lanes.push(lane);
@@ -1023,15 +1073,26 @@ fn swarm_runtime() -> Result<tokio::runtime::Runtime> {
 }
 
 /// Legacy sequential spawn path. Kept for `--no-parallel` debugging.
-fn swarm_spawn_sequential(
-    name: &str,
-    task: &str,
-    oracle: &str,
-    swarm: &[&'static crate::router::ModelSpec],
-    skill_path: Option<&str>,
-    s: &Store,
-    dir: &Path,
-) -> Result<()> {
+/// Legacy sequential spawn. Bundled arguments so the lane inputs travel as one
+/// value instead of a widening positional list.
+struct SequentialSpawn<'a> {
+    name: &'a str,
+    task: &'a str,
+    oracle: &'a str,
+    swarm: &'a [&'static crate::router::ModelSpec],
+    skill_path: Option<&'a str>,
+    evidence_line: Option<&'a str>,
+}
+
+fn swarm_spawn_sequential(spawn: SequentialSpawn<'_>, s: &Store, dir: &Path) -> Result<()> {
+    let SequentialSpawn {
+        name,
+        task,
+        oracle,
+        swarm,
+        skill_path,
+        evidence_line,
+    } = spawn;
     let capsule_dir = dir.join("capsules");
     std::fs::create_dir_all(&capsule_dir).ok();
     for (i, m) in swarm.iter().enumerate() {
@@ -1043,6 +1104,7 @@ fn swarm_spawn_sequential(
             task: task.to_string(),
             oracle: oracle.to_string(),
             skill_path: skill_path.map(str::to_string),
+            evidence_line: evidence_line.map(str::to_string),
             budget_tokens: None,
             workdir: dir.to_path_buf(),
         };

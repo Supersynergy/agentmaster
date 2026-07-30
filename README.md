@@ -172,6 +172,25 @@ agentmaster ensemble answer-check \
 artifact before the lanes start and puts it in every capsule. `--skill-route`
 lets the adapter's router name one skill.
 
+## Route: reuse a warm agent instead of cold-starting one
+
+`assign` always spawns a fresh workspace. That discards the repo context the
+agent already read and the provider's prompt cache for that conversation prefix,
+which holds for roughly five minutes. `route` ranks the live fleet instead:
+
+```bash
+agentmaster route "continue the payment retry work"     # rank + print the send command
+agentmaster route --send "continue the payment retry work"
+```
+
+Ranking uses only observed state — working directory, title, cmux status and
+transcript mtime — so it costs no tokens and is unit-tested. Candidates inside
+the cache window are marked `warm`. Busy agents are skipped unless
+`--include-busy`, because sending to a working agent trades its context for
+yours, and this session is excluded via its own parent-pid chain so `route` can
+never hand the task back to itself. Below `--min-score` it recommends a cold
+start rather than forcing a bad reuse.
+
 ## Research: gather once, reference N times
 
 A fleet that needs the same fresh fact usually pays for it once per worker, and
@@ -181,6 +200,25 @@ the controller side, and hands workers a path:
 ```bash
 agentmaster research pricing --code --trends "vector database pricing 2026"
 ```
+
+Research is cache-first. An identical request inside `--ttl-secs` (default 24h)
+runs no source at all and re-reports the previous run; `--refresh` bypasses it
+and reaches the provider rather than its cache. The key covers query, mode, byte
+budget and the chosen sources — not the run name, since the same query gathered
+under two names is the same fetch. `--dry-run` prints the key and whether it
+would hit. `--primary` additionally asks the primary-source registry, so a
+version, price or policy claim can cite whoever owns the fact.
+
+Hand the result to a fleet instead of paying each lane to gather it again:
+
+```bash
+agentmaster swarm pricing --oracle './check.sh' --research pricing "update the pricing page"
+```
+
+`--evidence-file PATH` does the same with an explicit artifact. Every lane's
+capsule gets the same path, the reference carries its own capsule budget so the
+task never shrinks, and a path that does not exist is refused rather than
+handed to a worker who would then invent the fact.
 
 Artifacts land under `~/.agentmaster/research/<name>/<run>/` with `0600`
 permissions, and the command prints a capsule line you can paste into a swarm or

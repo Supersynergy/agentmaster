@@ -4,6 +4,45 @@ All notable changes to agentmaster are documented here. Newest first.
 
 ## [Unreleased]
 
+### Added — route: send work to an agent that is already warm
+- Added `route <task>`: ranks live agents by directory affinity, topic overlap
+  and how recently they spoke, then prints the send command (`--send` delivers).
+  `assign` always cold-starts, which throws away the repo context the agent
+  already read and the provider's prompt cache for that conversation prefix.
+  Candidates inside the ~5 minute cache window are marked `warm`.
+- Ranking is a pure function over observed state — cwd, title, cmux status,
+  transcript mtime — so it is unit-tested and costs no tokens. Below
+  `--min-score` it recommends a cold start instead of forcing a bad reuse.
+- Busy agents are excluded unless `--include-busy`: sending to a working agent
+  trades its context for yours. This session is excluded by walking our own
+  parent-pid chain, so `route` can never hand the task back to itself.
+
+### Added — research is cache-first
+- A completed gather is the artifact, so an identical request inside `--ttl-secs`
+  (default 24h) now runs no source at all and re-reports the previous run.
+  `--refresh` bypasses the cache and also passes `--no-cache` to the adapter, so
+  a forced refresh reaches the provider rather than its cache.
+- The cache key covers query, mode, byte budget and which sources were asked
+  for — deliberately not the run name, because the same query gathered under two
+  names is the same fetch. `--dry-run` prints the key and whether it would hit.
+- A pointer is a hint, never an authority: a hit requires the run directory to
+  sit under this data dir, the manifest key to match, the TTL to hold, and every
+  `ok` artifact to still exist on disk.
+- Added `--primary`: ask the provider's primary-source registry first, so a
+  version, price or policy claim can cite whoever owns the fact. It is additive
+  to the web source; the registry is domain-scoped, so a miss is reported rather
+  than papered over.
+
+### Added — the swarm cites one gather instead of N
+- `swarm --research <name>` resolves the newest usable research run and
+  `--evidence-file PATH` takes an explicit artifact; either way every lane's
+  capsule gets the same path. Previously N lanes each looked the same fact up.
+- The evidence reference carries its own capsule budget, measured against the
+  same capsule without it, so adding evidence never silently shrinks the task.
+  A lane without evidence is told so explicitly instead of being left to guess.
+- A `--evidence-file` that does not exist is refused: a capsule pointing at
+  nothing teaches the worker to invent the fact instead of reading it.
+
 ### Added — research: gather once, reference N times
 - Added `research <name> <query>`: one controller-side gather into private
   `0600` artifacts under `~/.agentmaster/research/`, then a capsule line that
