@@ -24,9 +24,34 @@ const CACHE_WINDOW_SECS: u64 = 300;
 /// Below this nothing is a better bet than a clean cold start.
 const DEFAULT_MIN_SCORE: i32 = 25;
 
+/// What routing decided to do. Split out so the policy is testable without a
+/// live fleet or a spawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    /// A warm agent won; send to it.
+    Reuse(String),
+    /// Nothing was warm enough; cold-start this runtime.
+    ColdStart(String),
+    /// Nothing was warm enough and no fallback was offered; report only.
+    Report,
+}
+
+pub fn decide(ranked: &[Scored], or_assign: Option<&str>, send: bool) -> Decision {
+    match (ranked.first(), or_assign) {
+        (Some(winner), _) if send || or_assign.is_some() => {
+            Decision::Reuse(winner.candidate.reference.clone())
+        }
+        (None, Some(runtime)) => Decision::ColdStart(runtime.to_string()),
+        _ => Decision::Report,
+    }
+}
+
 pub struct RouteRequest<'a> {
     pub task: &'a str,
     pub send: bool,
+    /// Cold-start this runtime when nothing is warm enough. Turns routing into
+    /// one command that always takes the cheapest available path.
+    pub or_assign: Option<&'a str>,
     /// Consider agents that look busy. Off by default: interrupting a working
     /// agent trades its context for yours.
     pub include_busy: bool,
@@ -96,6 +121,12 @@ pub fn run(request: RouteRequest<'_>, dir: &Path) -> Result<()> {
 
     if ranked.is_empty() {
         println!("no warm agent scored at least {}", request.min_score);
+        if let Decision::ColdStart(runtime) = decide(&ranked, request.or_assign, request.send) {
+            println!("  cold start: {runtime}");
+            let reference = crate::cli::assign_with_model(&runtime, None, request.task, None, dir)?;
+            println!("  spawned   : {reference}");
+            return Ok(());
+        }
         println!(
             "  cold start: agentmaster auto {}",
             shell_quote(request.task)
@@ -116,7 +147,7 @@ pub fn run(request: RouteRequest<'_>, dir: &Path) -> Result<()> {
     }
 
     let winner = &ranked[0];
-    if request.send {
+    if request.send || request.or_assign.is_some() {
         crate::cli::send(&winner.candidate.reference, request.task, dir)?;
         println!("sent to {}", winner.candidate.reference);
         return Ok(());
@@ -431,6 +462,28 @@ mod tests {
         assert_eq!(cache_window(Some(10)), "warm");
         assert_eq!(cache_window(Some(CACHE_WINDOW_SECS + 1)), "cold");
         assert_eq!(cache_window(None), "?");
+    }
+
+    #[test]
+    fn a_warm_winner_is_reused_and_an_empty_field_cold_starts() {
+        let warm = vec![Scored {
+            candidate: candidate("workspace:7", "same work", None, Some(10)),
+            score: 60,
+            why: vec!["warm".into()],
+        }];
+        assert_eq!(
+            decide(&warm, Some("claude"), false),
+            Decision::Reuse("workspace:7".into())
+        );
+        assert_eq!(
+            decide(&[], Some("claude"), false),
+            Decision::ColdStart("claude".into())
+        );
+        // Without a fallback runtime an empty field stays a report, never a
+        // surprise spawn.
+        assert_eq!(decide(&[], None, true), Decision::Report);
+        // And without --send or --or-assign we only ever print.
+        assert_eq!(decide(&warm, None, false), Decision::Report);
     }
 
     #[test]

@@ -272,6 +272,10 @@ fn report(manifest: &ResearchManifest, run_dir: &Path, cache_age_secs: Option<u6
                 if record.truncated { " (truncated)" } else { "" },
                 record.artifact.as_deref().unwrap_or("-")
             ),
+            "busy" => println!(
+                "  {:<7}: busy — the evidence provider is in use; retry, do not re-plan",
+                record.source
+            ),
             other => println!(
                 "  {:<7}: {other}{}",
                 record.source,
@@ -466,6 +470,10 @@ fn run_adapter_evidence(
             "ok"
         } else if outcome.timed_out {
             "timeout"
+        } else if outcome.exit_code == Some(1) && provider_was_busy(&report_path) {
+            // The provider was in use, not out of answers. Retrying later is
+            // the right move; re-planning the research is not.
+            "busy"
         } else {
             "failed"
         }
@@ -566,6 +574,14 @@ fn run_trends(request: &ResearchRequest<'_>, run_dir: &Path) -> Result<SourceRec
         model_tokens_spent: 0,
         detail: None,
     })
+}
+
+/// The adapter reports a busy provider in its evidence note. Reading it back is
+/// cheaper and more honest than guessing from the exit code alone.
+fn provider_was_busy(report_path: &Path) -> bool {
+    fs::read_to_string(report_path)
+        .map(|body| body.contains("evidence_provider_busy"))
+        .unwrap_or(false)
 }
 
 fn missing_source(source: &str, program: &str) -> SourceRecord {

@@ -166,6 +166,10 @@ enum Cmd {
         /// Deliver to the top candidate instead of printing the send command
         #[arg(long)]
         send: bool,
+        /// Cold-start this runtime when nothing is warm enough. Implies --send,
+        /// so one command always takes the cheapest available path
+        #[arg(long)]
+        or_assign: Option<String>,
         /// Also consider agents that look busy (sending interrupts them)
         #[arg(long)]
         include_busy: bool,
@@ -499,6 +503,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Route {
             task,
             send,
+            or_assign,
             include_busy,
             min_score,
             json,
@@ -508,6 +513,7 @@ fn main() -> anyhow::Result<()> {
                 route::RouteRequest {
                     task: &task,
                     send,
+                    or_assign: or_assign.as_deref(),
                     include_busy,
                     min_score,
                     json,

@@ -4,6 +4,25 @@ All notable changes to agentmaster are documented here. Newest first.
 
 ## [Unreleased]
 
+### Added — route can finish the job
+- `route --or-assign <runtime>` cold-starts that runtime when nothing is warm
+  enough, so one command always takes the cheapest available path instead of
+  handing the operator a decision. The decision itself is a pure function with
+  its own test: no fallback runtime means an empty field stays a report, never a
+  surprise spawn.
+
+### Fixed — a busy evidence provider is not a missing fact
+- `research` now reports a source as `busy` rather than `failed` when the
+  adapter says the provider was in use, and says what to do about it: retry, do
+  not re-plan. Collapsing the two states taught the operator that a query had no
+  sources when it had plenty.
+- Root cause found by reproduction: the web source came back empty because
+  another session held the search engine's single-flight guard while a second
+  source ran right behind the first. The host-side provider now retries inside
+  the caller's budget and falls back to ranked sources, which need no local
+  model, and it never emits a header without a body — an empty artifact with a
+  heading reads as evidence.
+
 ### Added — route: send work to an agent that is already warm
 - Added `route <task>`: ranks live agents by directory affinity, topic overlap
   and how recently they spoke, then prints the send command (`--send` delivers).

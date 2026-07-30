@@ -181,6 +181,7 @@ which holds for roughly five minutes. `route` ranks the live fleet instead:
 ```bash
 agentmaster route "continue the payment retry work"     # rank + print the send command
 agentmaster route --send "continue the payment retry work"
+agentmaster route --or-assign claude "…"                # reuse if warm, else cold-start
 ```
 
 Ranking uses only observed state — working directory, title, cmux status and
