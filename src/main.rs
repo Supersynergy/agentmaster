@@ -8,7 +8,9 @@ mod ats;
 mod backend;
 mod cli;
 mod fleet;
+mod integrations;
 mod llmadapter;
+mod native_control;
 mod obs;
 mod orch;
 mod peek;
@@ -58,6 +60,20 @@ enum Cmd {
         #[arg(long)]
         costs: bool,
     },
+    /// Print one cross-runtime snapshot: live fleet, runtimes, adapters, goals.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Forward an explicit command to a known local control surface.
+    /// Examples: `control ggadapter status`, `control llmadapter lanes`,
+    /// `control cmux list-workspaces`, `control hermes --help`.
+    Control {
+        target: String,
+        /// Forward all remaining tokens unchanged, including flags for the target CLI.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Search ALL sessions by content (passthrough to session-restore)
     Find { query: String },
     /// Grouped session dashboard (project → sessions, cost, topic)
@@ -89,7 +105,7 @@ enum Cmd {
         #[arg(long)]
         model: Option<String>,
     },
-    /// List every discoverable live agent (tmux panes + cmux workspaces)
+    /// List every discoverable live agent (native PTYs + tmux panes + cmux workspaces)
     Ls {
         #[arg(long)]
         json: bool,
@@ -98,7 +114,7 @@ enum Cmd {
     /// `--goal <name>` also pins a goal on that agent name (same as `goal` subcommand,
     /// but combined so you can steer + pin in one shot).
     Send {
-        /// agent ref: cmux `workspace:NN` or tmux `session:window.pane`
+        /// agent ref: native `native:ID`, cmux `workspace:NN`, or tmux `session:window.pane`
         target: String,
         /// the message (remaining words are joined)
         #[arg(trailing_var_arg = true, required = true)]
@@ -111,13 +127,15 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         wait: u64,
     },
-    /// Broadcast a line to every live agent (cmux always; tmux with --tmux)
+    /// Deliver Ctrl-C without closing a native PTY, cmux workspace, or tmux pane.
+    Interrupt { target: String },
+    /// Broadcast a line to every live agent (native/cmux always; tmux with --tmux)
     Broadcast {
         #[arg(trailing_var_arg = true, required = true)]
         message: Vec<String>,
         #[arg(long)]
         tmux: bool,
-        /// only cmux agents currently waiting on input
+        /// only status-aware agents currently waiting on input
         #[arg(long)]
         needs_input: bool,
     },
@@ -153,6 +171,9 @@ enum Cmd {
         /// explicit workspace name (default: slug from task text)
         #[arg(long)]
         name: Option<String>,
+        /// explicit runtime model, e.g. `gpt-5.6-luna` (never auto-selected)
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Route a task to an agent that is already warm instead of cold-starting
     /// one. `assign` always spawns fresh, which throws away the repo context the
@@ -208,7 +229,7 @@ enum Cmd {
         #[arg(long)]
         skill: Option<String>,
     },
-    /// Jump to an agent's live tab: switch the cmux UI / tmux client to it
+    /// Jump to an agent: select its native PTY in the TUI or switch cmux/tmux
     Focus {
         /// agent ref: cmux `workspace:NN` or tmux `session:window.pane`
         target: String,
@@ -413,36 +434,44 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Doctor { verbose, costs } => doctor(&dir, verbose, costs)?,
+        Cmd::Status { json } => integrations::status(json, &dir)?,
+        Cmd::Control { target, args } => integrations::control(&target, &args)?,
         Cmd::Find { query } => orch::find(&query)?,
         Cmd::Dash { all, query } => orch::dash(all, query.as_deref())?,
         Cmd::Start { id, here, focus } => orch::start(&id, here, focus)?,
-        Cmd::Peek { id_or_path, tail } => match peek::resolve(&id_or_path) {
-            Some(path) => {
-                if tail > 0 {
-                    for line in peek::tail(&path, tail) {
-                        println!("{line}");
+        Cmd::Peek { id_or_path, tail } => {
+            if id_or_path.starts_with("native:") {
+                cli::native_peek(&id_or_path, tail, &dir)?;
+            } else {
+                match peek::resolve(&id_or_path) {
+                    Some(path) => {
+                        if tail > 0 {
+                            for line in peek::tail(&path, tail) {
+                                println!("{line}");
+                            }
+                        } else {
+                            let d = peek::digest(&path, 220);
+                            println!("transcript: {}", path.display());
+                            if !d.last_user.is_empty() {
+                                println!("🧑 {}", d.last_user);
+                            }
+                            if !d.last_assistant.is_empty() {
+                                println!("🤖 {}", d.last_assistant);
+                            }
+                            if !d.next_action.is_empty() {
+                                println!("🎯 next: {}", d.next_action);
+                            }
+                        }
                     }
-                } else {
-                    let d = peek::digest(&path, 220);
-                    println!("transcript: {}", path.display());
-                    if !d.last_user.is_empty() {
-                        println!("🧑 {}", d.last_user);
-                    }
-                    if !d.last_assistant.is_empty() {
-                        println!("🤖 {}", d.last_assistant);
-                    }
-                    if !d.next_action.is_empty() {
-                        println!("🎯 next: {}", d.next_action);
-                    }
+                    None => eprintln!("no transcript found for: {id_or_path}"),
                 }
             }
-            None => eprintln!("no transcript found for: {id_or_path}"),
-        },
+        }
         Cmd::Batch { file, yes, model } => {
             let tasks = orch::load_tasks(&file)?;
             orch::batch(&tasks, model.as_deref(), yes)?;
         }
-        Cmd::Ls { json } => cli::list(json)?,
+        Cmd::Ls { json } => cli::list(json, &dir)?,
         Cmd::Send {
             target,
             message,
@@ -461,13 +490,19 @@ fn main() -> anyhow::Result<()> {
                 cli::goal_set(&name, &msg, dod_str.as_deref(), &dir)?;
             }
         }
+        Cmd::Interrupt { target } => cli::interrupt(&target, &dir)?,
         Cmd::Assign {
             runtime,
             task,
             name,
+            model,
         } => {
             let t = task.join(" ");
-            cli::assign(&runtime, &t, name.as_deref(), &dir)?;
+            if let Some(model) = model.as_deref() {
+                cli::assign_with_model(&runtime, Some(model), &t, name.as_deref(), &dir)?;
+            } else {
+                cli::assign(&runtime, &t, name.as_deref(), &dir)?;
+            }
         }
         Cmd::Broadcast {
             message,
@@ -533,7 +568,7 @@ fn main() -> anyhow::Result<()> {
             capsule,
             skill,
         } => cli::goal_spawn(&name, capsule.as_deref(), skill.as_deref(), &dir)?,
-        Cmd::Focus { target } => cli::focus(&target)?,
+        Cmd::Focus { target } => cli::focus(&target, &dir)?,
         Cmd::Models { tier, json } => cli::models_list(tier.as_deref(), json)?,
         Cmd::Auto {
             task,
@@ -681,53 +716,24 @@ fn doctor(dir: &Path, verbose: bool, costs: bool) -> anyhow::Result<()> {
         })
         .is_ok();
     println!("  pty           : {}", if pty_ok { "ok" } else { "FAIL" });
-    if backend::tmux_available() {
-        let n = backend::list_panes().len();
-        println!("  tmux          : ok ({n} pane(s) discoverable)");
-    } else {
-        println!("  tmux          : absent (native PTY still works)");
+    match backend::list_panes_checked() {
+        Ok(panes) => println!(
+            "  tmux          : ok ({} pane(s) discoverable)",
+            panes.len()
+        ),
+        Err(error) if backend::tmux_available() => println!("  tmux          : inactive ({error})"),
+        Err(_) => println!("  tmux          : absent (native PTY still works)"),
     }
-    if backend::cmux_available() {
-        let n = backend::list_cmux().len();
-        println!("  cmux          : ok ({n} workspace(s) discoverable)");
-    } else {
-        println!("  cmux          : absent (run agentmaster inside cmux to steer it)");
+    match backend::list_cmux_checked() {
+        Ok(workspaces) => println!(
+            "  cmux          : ok ({} workspace(s) discoverable)",
+            workspaces.len()
+        ),
+        Err(error) => println!(
+            "  cmux          : unavailable ({error}; run agentmaster inside cmux to steer it)"
+        ),
     }
-    for bin in runtime::KNOWN_RUNTIMES.iter().copied() {
-        let found = std::process::Command::new("which")
-            .arg(bin)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !found {
-            println!("  runtime {bin:<8}: absent",);
-            continue;
-        }
-        let label = if verbose {
-            // Probe `--version` then `-V` — different CLIs pick different flags.
-            let v = std::process::Command::new(bin)
-                .arg("--version")
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.lines().next().unwrap_or("").trim().to_string())
-                .or_else(|| {
-                    std::process::Command::new(bin)
-                        .arg("-V")
-                        .output()
-                        .ok()
-                        .filter(|o| o.status.success())
-                        .and_then(|o| String::from_utf8(o.stdout).ok())
-                        .map(|s| s.lines().next().unwrap_or("").trim().to_string())
-                })
-                .unwrap_or_else(|| "(no --version)".into());
-            format!("found  {v}")
-        } else {
-            "found".to_string()
-        };
-        println!("  runtime {bin:<8}: {label}");
-    }
+    integrations::runtime_doctor(verbose);
     if costs {
         println!("\n  costs         : per-runtime activity from audit log");
         if let Ok(s) = store::Store::open(&db) {
@@ -753,9 +759,29 @@ fn doctor(dir: &Path, verbose: bool, costs: bool) -> anyhow::Result<()> {
             }
         }
     }
+    integrations::doctor(dir);
     println!(
         "\n  logs          : {}/logs/agentmaster.jsonl",
         dir.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Cmd};
+    use clap::Parser;
+
+    #[test]
+    fn control_passes_target_cli_flags_through() {
+        let cli = Cli::try_parse_from(["agentmaster", "control", "codex", "--version"])
+            .expect("target flags should belong to the control command");
+        match cli.cmd {
+            Some(Cmd::Control { target, args }) => {
+                assert_eq!(target, "codex");
+                assert_eq!(args, ["--version"]);
+            }
+            _ => panic!("expected control command"),
+        }
+    }
 }

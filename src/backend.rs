@@ -3,7 +3,36 @@
 //! First adapter: tmux — discover panes, read their screen, send keys, kill.
 //! Pure `tmux` CLI calls, no extra dependency.
 
-use std::process::Command;
+use std::process::{Command, Output};
+
+use anyhow::{Context, Result, bail};
+
+fn command_detail(output: &Output) -> String {
+    let raw = if output.stderr.is_empty() {
+        &output.stdout
+    } else {
+        &output.stderr
+    };
+    let text = String::from_utf8_lossy(raw);
+    let compact = text
+        .split_whitespace()
+        .take(32)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.is_empty() {
+        format!("exit status {}", output.status)
+    } else {
+        compact.chars().take(500).collect()
+    }
+}
+
+fn checked_output(command: &mut Command, label: &str) -> Result<Output> {
+    let output = command.output().with_context(|| format!("start {label}"))?;
+    if !output.status.success() {
+        bail!("{label} failed: {}", command_detail(&output));
+    }
+    Ok(output)
+}
 
 /// A pane discovered in a running tmux server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,14 +54,17 @@ pub fn tmux_available() -> bool {
 
 /// All panes across every tmux session, or empty if tmux isn't running.
 pub fn list_panes() -> Vec<ExternalPane> {
+    list_panes_checked().unwrap_or_default()
+}
+
+/// Checked variant for headless callers that must distinguish an empty tmux
+/// server from an unavailable/stale backend.
+pub fn list_panes_checked() -> Result<Vec<ExternalPane>> {
     let fmt = "#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}\t#{pane_title}";
-    match Command::new("tmux")
-        .args(["list-panes", "-a", "-F", fmt])
-        .output()
-    {
-        Ok(o) if o.status.success() => parse_panes(&String::from_utf8_lossy(&o.stdout)),
-        _ => Vec::new(),
-    }
+    let mut command = Command::new("tmux");
+    command.args(["list-panes", "-a", "-F", fmt]);
+    let output = checked_output(&mut command, "tmux list-panes")?;
+    Ok(parse_panes(&String::from_utf8_lossy(&output.stdout)))
 }
 
 /// Parse `tmux list-panes -F` tab-delimited output. Separated out so it is
@@ -60,11 +92,20 @@ pub fn parse_panes(s: &str) -> Vec<ExternalPane> {
         .collect()
 }
 
-/// Type a line + Enter into a pane.
-pub fn send_keys(target: &str, text: &str) {
-    let _ = Command::new("tmux")
-        .args(["send-keys", "-t", target, text, "Enter"])
-        .output();
+/// Type a line + Enter into a pane and surface any stale-target/backend error.
+pub fn send_keys(target: &str, text: &str) -> Result<()> {
+    let mut command = Command::new("tmux");
+    command.args(["send-keys", "-t", target, text, "Enter"]);
+    checked_output(&mut command, &format!("tmux send-keys {target}"))?;
+    Ok(())
+}
+
+/// Deliver Ctrl-C to one tmux pane without destroying the pane/session.
+pub fn tmux_interrupt(target: &str) -> Result<()> {
+    let mut command = Command::new("tmux");
+    command.args(["send-keys", "-t", target, "C-c"]);
+    checked_output(&mut command, &format!("tmux interrupt {target}"))?;
+    Ok(())
 }
 
 /// Snapshot a pane's visible screen as plain text.
@@ -92,9 +133,10 @@ pub fn kill_pane(target: &str) {
 /// A cmux workspace = one agent surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CmuxWorkspace {
-    pub ws_ref: String, // workspace:NN — stable handle for send
-    pub title: String,  // the task
-    pub status: String, // raw status from tags (working/done/Needs input/…)
+    pub ws_ref: String,          // workspace:NN — stable handle for send
+    pub title: String,           // the task
+    pub runtime: Option<String>, // agent tag, e.g. codex/hermes/ggcoder
+    pub status: String,          // raw status from tags (working/done/Needs input/…)
     pub pid: Option<u32>,
     /// Repo state cmux now reports as a `git` tag: dirty / ahead / clean / none.
     pub git: Option<String>,
@@ -103,68 +145,83 @@ pub struct CmuxWorkspace {
 }
 
 pub fn cmux_available() -> bool {
-    Command::new("cmux")
-        .arg("ping")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    cmux_access().is_ok()
+}
+
+/// Confirm that cmux is both installed and reachable from this process. cmux
+/// intentionally rejects callers outside its process tree; callers need that
+/// error instead of a misleading empty fleet.
+pub fn cmux_access() -> Result<()> {
+    let mut command = Command::new("cmux");
+    command.arg("ping");
+    checked_output(&mut command, "cmux ping")?;
+    Ok(())
 }
 
 pub fn list_cmux() -> Vec<CmuxWorkspace> {
+    list_cmux_checked().unwrap_or_default()
+}
+
+/// Checked cmux inventory for headless callers that need an actionable error.
+pub fn list_cmux_checked() -> Result<Vec<CmuxWorkspace>> {
     // Prefer the stable structured surface (`--json`); the human-readable tree is
     // only kept as a fallback for older cmux builds that lack the flag.
-    if let Ok(o) = Command::new("cmux")
+    let structured = Command::new("cmux")
         .args(["top", "--all", "--json"])
-        .output()
-        && o.status.success()
-        && let Some(ws) = parse_cmux_top_json(&o.stdout)
+        .output();
+    if let Ok(output) = structured
+        && output.status.success()
+        && let Some(workspaces) = parse_cmux_top_json(&output.stdout)
     {
-        return ws;
+        return Ok(workspaces);
     }
-    match Command::new("cmux").args(["top", "--all"]).output() {
-        Ok(o) if o.status.success() => parse_cmux_top(&String::from_utf8_lossy(&o.stdout)),
-        _ => Vec::new(),
-    }
+    let mut fallback = Command::new("cmux");
+    fallback.args(["top", "--all"]);
+    let output = checked_output(&mut fallback, "cmux top --all")?;
+    Ok(parse_cmux_top(&String::from_utf8_lossy(&output.stdout)))
 }
 
 /// Send a line to a cmux workspace's agent (text, then Return to submit).
-pub fn cmux_send(ws_ref: &str, text: &str) {
-    let _ = Command::new("cmux")
-        .args(["send", "--workspace", ws_ref, text])
-        .output();
-    let _ = Command::new("cmux")
-        .args(["send-key", "--workspace", ws_ref, "Return"])
-        .output();
+pub fn cmux_send(ws_ref: &str, text: &str) -> Result<()> {
+    let mut send = Command::new("cmux");
+    send.args(["send", "--workspace", ws_ref, text]);
+    checked_output(&mut send, &format!("cmux send {ws_ref}"))?;
+    let mut enter = Command::new("cmux");
+    enter.args(["send-key", "--workspace", ws_ref, "enter"]);
+    checked_output(&mut enter, &format!("cmux send-key enter {ws_ref}"))?;
+    Ok(())
 }
 
-/// Switch the cmux UI to a workspace's tab — "jump to the live session". Uses the
-/// `workspace.select` RPC (accepts the short `workspace:NN` ref). Returns true if
-/// the call succeeded, so the caller can report a switch vs a stale ref.
-pub fn cmux_focus(ws_ref: &str) -> bool {
-    Command::new("cmux")
-        .args([
-            "rpc",
-            "workspace.select",
-            &format!("{{\"workspace_id\":\"{ws_ref}\"}}"),
-        ])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// Deliver Ctrl-C without closing a cmux workspace or its surrounding session.
+pub fn cmux_interrupt(ws_ref: &str) -> Result<()> {
+    let mut command = Command::new("cmux");
+    command.args(["send-key", "--workspace", ws_ref, "ctrl+c"]);
+    checked_output(&mut command, &format!("cmux interrupt {ws_ref}"))?;
+    Ok(())
+}
+
+/// Switch the cmux UI to a workspace's tab — "jump to the live session". Uses
+/// the `workspace.select` RPC (accepts the short `workspace:NN` ref).
+pub fn cmux_focus_checked(ws_ref: &str) -> Result<()> {
+    let payload = format!("{{\"workspace_id\":\"{ws_ref}\"}}");
+    let mut command = Command::new("cmux");
+    command.args(["rpc", "workspace.select", &payload]);
+    checked_output(&mut command, &format!("cmux focus {ws_ref}"))?;
+    Ok(())
 }
 
 /// Switch the tmux client's view to a pane's window + select the pane — the tmux
 /// equivalent of "jump to the live session". `target` = `session:window.pane`.
-pub fn tmux_focus(target: &str) -> bool {
+pub fn tmux_focus_checked(target: &str) -> Result<()> {
     // window target = everything before the trailing `.pane`.
     let window = target.rsplit_once('.').map(|(w, _)| w).unwrap_or(target);
-    let _ = Command::new("tmux")
-        .args(["select-window", "-t", window])
-        .output();
-    Command::new("tmux")
-        .args(["select-pane", "-t", target])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let mut select_window = Command::new("tmux");
+    select_window.args(["select-window", "-t", window]);
+    checked_output(&mut select_window, &format!("tmux focus window {window}"))?;
+    let mut select_pane = Command::new("tmux");
+    select_pane.args(["select-pane", "-t", target]);
+    checked_output(&mut select_pane, &format!("tmux focus pane {target}"))?;
+    Ok(())
 }
 
 fn extract_quoted(s: &str) -> String {
@@ -222,6 +279,7 @@ fn cmux_workspace_from_json(map: &serde_json::Map<String, serde_json::Value>) ->
             .and_then(|t| t.as_str())
             .unwrap_or("")
             .to_string(),
+        runtime: None,
         status: String::new(),
         pid: None,
         git: None,
@@ -246,7 +304,15 @@ fn cmux_workspace_from_json(map: &serde_json::Map<String, serde_json::Value>) ->
         match key.as_str() {
             "git" if ws.git.is_none() => ws.git = Some(value),
             "phase" if ws.phase.is_none() => ws.phase = Some(value),
-            "claude" | "codex" | "opencode" | "amp" if ws.status.is_empty() => ws.status = value,
+            "claude" | "codex" | "hermes" | "ggcoder" | "ggadapter" | "gemini" | "cline"
+            | "opencode" | "amp" => {
+                if ws.runtime.is_none() {
+                    ws.runtime = Some(key.clone());
+                }
+                if ws.status.is_empty() {
+                    ws.status = value;
+                }
+            }
             _ => {}
         }
     }
@@ -280,6 +346,7 @@ pub fn parse_cmux_top(s: &str) -> Vec<CmuxWorkspace> {
             cur = Some(CmuxWorkspace {
                 ws_ref,
                 title: extract_quoted(rest),
+                runtime: None,
                 status: String::new(),
                 pid: None,
                 git: None,
@@ -287,13 +354,25 @@ pub fn parse_cmux_top(s: &str) -> Vec<CmuxWorkspace> {
             });
         } else if let Some(w) = cur.as_mut() {
             // Agent-type status tag, e.g. `tag claude "working"`.
-            if (line.contains("tag claude ")
-                || line.contains("tag codex ")
-                || line.contains("tag opencode ")
-                || line.contains("tag amp "))
-                && w.status.is_empty()
-            {
-                w.status = extract_quoted(line);
+            for runtime in [
+                "claude",
+                "codex",
+                "hermes",
+                "ggcoder",
+                "ggadapter",
+                "gemini",
+                "cline",
+                "opencode",
+                "amp",
+            ] {
+                if line.contains(&format!("tag {runtime} ")) {
+                    if w.runtime.is_none() {
+                        w.runtime = Some(runtime.to_string());
+                    }
+                    if w.status.is_empty() {
+                        w.status = extract_quoted(line);
+                    }
+                }
             }
             // `tag claude_code "Needs input" pid=37706` — strongest signal. Let it
             // win outright; otherwise only fill an empty status.
@@ -371,11 +450,13 @@ mod tests {
         assert_eq!(w.len(), 2);
         assert_eq!(w[0].ws_ref, "workspace:96");
         assert_eq!(w[0].title, "🟣 Claude ▶ · kill dead code");
+        assert_eq!(w[0].runtime.as_deref(), Some("claude"));
         assert_eq!(w[0].status, "working");
         assert_eq!(w[0].pid, Some(96335));
         assert_eq!(w[0].git.as_deref(), Some("dirty"));
         assert_eq!(w[0].phase.as_deref(), Some("tests-pass"));
         // "Needs input" must win over the "done" agent tag.
+        assert_eq!(w[1].runtime.as_deref(), Some("claude"));
         assert_eq!(w[1].status.to_lowercase(), "needs input");
         assert_eq!(w[1].pid, Some(37706));
         assert_eq!(w[1].git, None);
@@ -416,11 +497,13 @@ mod tests {
         assert_eq!(w.len(), 3);
         assert_eq!(w[0].ws_ref, "workspace:96");
         assert_eq!(w[0].title, "🟣 Claude ▶ · kill dead code");
+        assert_eq!(w[0].runtime.as_deref(), Some("claude"));
         assert_eq!(w[0].status, "working");
         assert_eq!(w[0].pid, Some(96335));
         assert_eq!(w[0].git.as_deref(), Some("dirty"));
         assert_eq!(w[0].phase.as_deref(), Some("tests-pass"));
         // "Needs input" wins over "done" even though its tag comes first.
+        assert_eq!(w[1].runtime.as_deref(), Some("claude"));
         assert_eq!(w[1].status.to_lowercase(), "needs input");
         assert_eq!(w[1].pid, Some(37706));
         assert_eq!(w[1].git, None);
@@ -434,5 +517,23 @@ mod tests {
     #[test]
     fn cmux_top_json_rejects_garbage() {
         assert!(parse_cmux_top_json(b"not json").is_none());
+    }
+
+    #[test]
+    fn parses_hermes_and_ggadapter_runtime_tags() {
+        let s = r#"
+  0.0%  1 B  1  ├── workspace workspace:200 "hermes worker"
+  0.0%  1 B  1  │   ├── tag hermes "working"
+  0.0%  1 B  1  │   ├── tag hermes_code "Running" pid=2001
+  0.0%  1 B  1  ├── workspace workspace:201 "GGAdapter worker"
+  0.0%  1 B  1  │   ├── tag ggadapter "Needs input"
+  0.0%  1 B  1  │   ├── tag ggadapter_code "Needs input" pid=2002
+"#;
+        let workspaces = parse_cmux_top(s);
+        assert_eq!(workspaces.len(), 2);
+        assert_eq!(workspaces[0].runtime.as_deref(), Some("hermes"));
+        assert_eq!(workspaces[0].pid, Some(2001));
+        assert_eq!(workspaces[1].runtime.as_deref(), Some("ggadapter"));
+        assert_eq!(workspaces[1].status, "Needs input");
     }
 }

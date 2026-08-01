@@ -4,6 +4,26 @@ All notable changes to agentmaster are documented here. Newest first.
 
 ## [Unreleased]
 
+### Added — one CLI view for the local agent stack
+- Added `status [--json]`, a read-only snapshot of live tmux/cmux agents,
+  runtime availability, GGAdapter/LLMAdapter probes, and stored goals.
+- Native PTYs owned by a running AgentMaster TUI are now visible and steerable
+  from the headless CLI through a user-only local Unix socket: `ls`, `peek`,
+  `send`, `focus`, `broadcast`, and `interrupt` accept `native:<id>` refs.
+- Added `interrupt <ref>` for Ctrl-C delivery without deleting a cmux workspace,
+  tmux pane, or native PTY. `send`, `broadcast`, `assign`, and focus now surface
+  backend errors instead of claiming a command was delivered after a failure.
+- `status` and `doctor` report native/tmux/cmux reachability separately from an
+  empty fleet, so a cmux access-boundary is no longer hidden as zero agents.
+- Added `control <target> ...` as an allow-listed bridge to cmux, Codex, Hermes,
+  ggcoder, GGAdapter, LLMAdapter, cac, and callagent. Existing CLIs remain the
+  owners of their command semantics; AgentMaster does not turn this into a
+  shell evaluator.
+- cmux inventory now reports the runtime tag when one is present, including
+  Hermes, ggcoder, and GGAdapter.
+- `assign` accepts an explicit `--model` (including `gpt-5.6-luna`) while the
+  static auto-router remains conservative until model metadata is verified.
+
 ### Added — route can finish the job
 - `route --or-assign <runtime>` cold-starts that runtime when nothing is warm
   enough, so one command always takes the cheapest available path instead of

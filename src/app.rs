@@ -17,7 +17,7 @@ use ratatui::layout::Rect;
 use crate::fleet::{Agent, Fleet, Lane, Source, Status};
 use crate::obs::Metrics;
 use crate::store::Store;
-use crate::{backend, peek, pty, runtime, state, voice};
+use crate::{backend, native_control, peek, pty, runtime, state, voice};
 
 /// Shared layout geometry — single source of truth for both render (`ui.rs`) and
 /// mouse hit-testing here, so clicks always land where the cards are drawn.
@@ -116,6 +116,16 @@ pub enum AppEvent {
     VoiceText(String),
     /// A status-line notice from a worker thread.
     Notice(String),
+    /// Completion of an external backend action. The main loop owns the SQLite
+    /// audit log, so worker threads report success/failure back here instead of
+    /// claiming delivery optimistically.
+    CommandOutcome {
+        id: Option<u64>,
+        name: String,
+        kind: &'static str,
+        detail: String,
+        result: std::result::Result<(), String>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -186,6 +196,9 @@ pub struct App {
     pub metrics: Metrics,
     pub tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
+    /// Requests from the local native-PTY Unix socket. The TUI remains the sole
+    /// PTY owner; this queue only lets the headless CLI ask it to act.
+    native_control_rx: Receiver<native_control::ControlRequest>,
     pub view: View,
     pub mode: Mode,
     pub lane_idx: usize,
@@ -233,7 +246,9 @@ pub struct App {
 pub fn run(dir: PathBuf) -> Result<()> {
     let store = Store::open(&dir.join("agentmaster.db"))?;
     let (tx, rx) = channel();
-    let mut app = App::new(store, tx, rx);
+    let (native_control_tx, native_control_rx) = channel();
+    let mut app = App::new(store, tx, rx, native_control_rx);
+    let _native_control = native_control::NativeControlServer::start(&dir, native_control_tx)?;
     app.store
         .log(None, "system", "start", "agentmaster tui started");
     tracing::info!("agentmaster tui started");
@@ -268,13 +283,19 @@ pub fn run(dir: PathBuf) -> Result<()> {
 }
 
 impl App {
-    fn new(store: Store, tx: Sender<AppEvent>, rx: Receiver<AppEvent>) -> Self {
+    fn new(
+        store: Store,
+        tx: Sender<AppEvent>,
+        rx: Receiver<AppEvent>,
+        native_control_rx: Receiver<native_control::ControlRequest>,
+    ) -> Self {
         App {
             fleet: Fleet::new(),
             store,
             metrics: Metrics::new(),
             tx,
             rx,
+            native_control_rx,
             view: View::List, // dense list scales to the whole fleet
             mode: Mode::Normal,
             lane_idx: 1, // focus WORKING by default
@@ -343,6 +364,9 @@ impl App {
 
     fn main_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         loop {
+            while let Ok(request) = self.native_control_rx.try_recv() {
+                self.handle_native_control(request);
+            }
             while let Ok(ev) = self.rx.try_recv() {
                 self.handle_pty(ev);
             }
@@ -782,21 +806,227 @@ impl App {
         match source {
             Source::Cmux(ws) => {
                 let w = ws.clone();
-                std::thread::spawn(move || backend::cmux_focus(&w));
-                self.store.log(Some(id), &name, "focus", &ws);
-                self.status_msg = format!("→ jumped to {ws}  ({name})");
+                let tx = self.tx.clone();
+                let outcome_name = name.clone();
+                std::thread::spawn(move || {
+                    let result = backend::cmux_focus_checked(&w).map_err(|error| error.to_string());
+                    let _ = tx.send(AppEvent::CommandOutcome {
+                        id: Some(id),
+                        name: outcome_name,
+                        kind: "focus",
+                        detail: ws,
+                        result,
+                    });
+                });
+                self.status_msg = format!("focusing {name}…");
             }
             Source::Tmux(target) => {
                 let t = target.clone();
-                std::thread::spawn(move || backend::tmux_focus(&t));
-                self.store.log(Some(id), &name, "focus", &target);
-                self.status_msg = format!("→ switched to tmux {target}");
+                let tx = self.tx.clone();
+                let outcome_name = name.clone();
+                std::thread::spawn(move || {
+                    let result = backend::tmux_focus_checked(&t).map_err(|error| error.to_string());
+                    let _ = tx.send(AppEvent::CommandOutcome {
+                        id: Some(id),
+                        name: outcome_name,
+                        kind: "focus",
+                        detail: target,
+                        result,
+                    });
+                });
+                self.status_msg = format!("focusing {name}…");
             }
             Source::Native => {
                 self.status_msg =
                     format!("{name} is a native agent — open it inside (Enter), no external tab");
             }
         }
+    }
+
+    // ---- native headless control -----------------------------------------
+
+    /// Resolve the stable native CLI reference (`native:<id>`) or the exact
+    /// display name. Numeric IDs are preferred because names are user-chosen.
+    fn resolve_native_id(&self, target: &str) -> std::result::Result<u64, String> {
+        let key = target.strip_prefix("native:").unwrap_or(target);
+        if let Ok(id) = key.parse::<u64>()
+            && self
+                .fleet
+                .get(id)
+                .is_some_and(|agent| matches!(agent.source, Source::Native))
+        {
+            return Ok(id);
+        }
+        let matches = self
+            .fleet
+            .agents
+            .iter()
+            .filter(|agent| matches!(agent.source, Source::Native) && agent.name == key)
+            .map(|agent| agent.id)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [id] => Ok(*id),
+            [] => Err(format!("native agent '{target}' not found")),
+            _ => Err(format!(
+                "native agent name '{target}' is ambiguous; use native:<id>"
+            )),
+        }
+    }
+
+    fn native_snapshot(agent: &Agent, tail: usize) -> native_control::NativeAgent {
+        let mut output = agent
+            .output
+            .iter()
+            .rev()
+            .take(tail.min(160))
+            .cloned()
+            .collect::<Vec<_>>();
+        output.reverse();
+        native_control::NativeAgent {
+            reference: format!("native:{}", agent.id),
+            id: agent.id,
+            name: agent.name.clone(),
+            runtime: agent.runtime.clone(),
+            pid: agent.pid,
+            status: agent.status.label().to_string(),
+            cwd: agent.cwd.clone(),
+            goal: agent.goal.clone(),
+            progress: agent.progress,
+            last_line: agent.last_line.clone(),
+            lines_total: agent.lines_total,
+            output,
+        }
+    }
+
+    fn write_native(
+        &mut self,
+        id: u64,
+        bytes: &[u8],
+        event: &str,
+        detail: &str,
+    ) -> std::result::Result<native_control::NativeAgent, String> {
+        use std::io::Write;
+
+        let name = {
+            let agent = self
+                .fleet
+                .get_mut(id)
+                .ok_or_else(|| format!("native agent native:{id} disappeared"))?;
+            if !matches!(agent.source, Source::Native) {
+                return Err(format!("agent native:{id} is not a native PTY"));
+            }
+            let handle = agent
+                .pty
+                .as_mut()
+                .ok_or_else(|| format!("native agent native:{id} has no live PTY"))?;
+            handle
+                .writer
+                .write_all(bytes)
+                .map_err(|error| format!("write native:{id}: {error}"))?;
+            handle
+                .writer
+                .flush()
+                .map_err(|error| format!("flush native:{id}: {error}"))?;
+            if matches!(agent.status, Status::Blocked | Status::Idle) {
+                agent.status = Status::Working;
+            }
+            agent.name.clone()
+        };
+        self.store.log(Some(id), &name, event, detail);
+        self.status_msg = format!("{event} → {name}");
+        self.fleet
+            .get(id)
+            .map(|agent| Self::native_snapshot(agent, 0))
+            .ok_or_else(|| format!("native agent native:{id} disappeared"))
+    }
+
+    fn handle_native_control(&mut self, request: native_control::ControlRequest) {
+        use native_control::{NativeCommand, NativeResponse};
+
+        let response = match request.command {
+            NativeCommand::Ping => NativeResponse::ok("native TUI control active"),
+            NativeCommand::List => NativeResponse {
+                ok: true,
+                message: Some("native agents".into()),
+                agents: self
+                    .fleet
+                    .agents
+                    .iter()
+                    .filter(|agent| matches!(agent.source, Source::Native))
+                    .map(|agent| Self::native_snapshot(agent, 0))
+                    .collect(),
+                agent: None,
+            },
+            NativeCommand::Peek { target, tail } => match self.resolve_native_id(&target) {
+                Ok(id) => self
+                    .fleet
+                    .get(id)
+                    .map(|agent| NativeResponse {
+                        ok: true,
+                        message: Some(format!("peek native:{id}")),
+                        agents: Vec::new(),
+                        agent: Some(Self::native_snapshot(agent, tail)),
+                    })
+                    .unwrap_or_else(|| {
+                        NativeResponse::error(format!("native agent native:{id} disappeared"))
+                    }),
+                Err(error) => NativeResponse::error(error),
+            },
+            NativeCommand::Send { target, message } => {
+                if message.trim().is_empty() {
+                    NativeResponse::error("empty native message")
+                } else {
+                    match self.resolve_native_id(&target).and_then(|id| {
+                        let detail = message.clone();
+                        let mut bytes = message.into_bytes();
+                        bytes.push(b'\n');
+                        self.write_native(id, &bytes, "send", &detail)
+                    }) {
+                        Ok(agent) => NativeResponse {
+                            ok: true,
+                            message: Some(format!("sent → {}", agent.reference)),
+                            agents: Vec::new(),
+                            agent: Some(agent),
+                        },
+                        Err(error) => NativeResponse::error(error),
+                    }
+                }
+            }
+            NativeCommand::Interrupt { target } => {
+                match self.resolve_native_id(&target).and_then(|id| {
+                    self.write_native(id, b"\x03", "interrupt", "ctrl-c from native control")
+                }) {
+                    Ok(agent) => NativeResponse {
+                        ok: true,
+                        message: Some(format!("interrupted → {}", agent.reference)),
+                        agents: Vec::new(),
+                        agent: Some(agent),
+                    },
+                    Err(error) => NativeResponse::error(error),
+                }
+            }
+            NativeCommand::Focus { target } => match self.resolve_native_id(&target) {
+                Ok(id) => {
+                    let selection = self.sorted_agents().iter().position(|agent| agent.id == id);
+                    self.view = View::List;
+                    self.sel = selection.unwrap_or(0);
+                    self.peek_cache = None;
+                    match self.fleet.get(id) {
+                        Some(agent) => NativeResponse {
+                            ok: true,
+                            message: Some(format!("focused native:{id} in TUI")),
+                            agents: Vec::new(),
+                            agent: Some(Self::native_snapshot(agent, 0)),
+                        },
+                        None => {
+                            NativeResponse::error(format!("native agent native:{id} disappeared"))
+                        }
+                    }
+                }
+                Err(error) => NativeResponse::error(error),
+            },
+        };
+        let _ = request.reply.send(response);
     }
 
     // ---- pty events -------------------------------------------------------
@@ -925,6 +1155,29 @@ impl App {
                 self.status_msg = format!("🎙 “{preview}” — prefix #N, Enter to route");
             }
             AppEvent::Notice(msg) => self.status_msg = msg,
+            AppEvent::CommandOutcome {
+                id,
+                name,
+                kind,
+                detail,
+                result,
+            } => match result {
+                Ok(()) => {
+                    if let Some(id) = id
+                        && let Some(agent) = self.fleet.get_mut(id)
+                        && matches!(agent.status, Status::Blocked | Status::Idle)
+                    {
+                        agent.status = Status::Working;
+                    }
+                    self.store.log(id, &name, kind, &detail);
+                    self.status_msg = format!("{kind} → {name}");
+                }
+                Err(error) => {
+                    self.store
+                        .log(id, &name, "error", &format!("{kind}: {error}"));
+                    self.status_msg = format!("{kind} failed for {name}: {error}");
+                }
+            },
         }
     }
 
@@ -971,41 +1224,66 @@ impl App {
     }
 
     fn send_line(&mut self, id: u64, text: &str) {
-        use std::io::Write;
-        let mut ok = false;
-        let mut name = String::new();
-        if let Some(a) = self.fleet.get_mut(id) {
-            name = a.name.clone();
-            match &a.source {
-                Source::Native => {
-                    if let Some(h) = a.pty.as_mut() {
-                        let _ = h.writer.write_all(text.as_bytes());
-                        let _ = h.writer.write_all(b"\n");
-                        let _ = h.writer.flush();
-                        ok = true;
+        let Some((name, source)) = self
+            .fleet
+            .get(id)
+            .map(|agent| (agent.name.clone(), agent.source.clone()))
+        else {
+            self.status_msg = format!("send failed: unknown agent {id}");
+            return;
+        };
+        match source {
+            Source::Native => {
+                let mut bytes = text.as_bytes().to_vec();
+                bytes.push(b'\n');
+                match self.write_native(id, &bytes, "send", text) {
+                    Ok(_) => {
+                        tracing::info!(agent = id, "sent native line");
+                    }
+                    Err(error) => {
+                        self.store
+                            .log(Some(id), &name, "error", &format!("send: {error}"));
+                        self.status_msg = format!("send failed for {name}: {error}");
                     }
                 }
-                // External backends shell out — do it on a thread so the UI
-                // (and rapid #N routing) never blocks on subprocess latency.
-                Source::Tmux(target) => {
-                    let (t, msg) = (target.clone(), text.to_string());
-                    std::thread::spawn(move || backend::send_keys(&t, &msg));
-                    ok = true;
-                }
-                Source::Cmux(ws_ref) => {
-                    let (w, msg) = (ws_ref.clone(), text.to_string());
-                    std::thread::spawn(move || backend::cmux_send(&w, &msg));
-                    ok = true;
-                }
             }
-            if ok && matches!(a.status, Status::Blocked | Status::Idle) {
-                a.status = Status::Working;
+            // External backends shell out — do it on a thread so the UI stays
+            // responsive. The outcome returns through `AppEvent` before we log
+            // delivery or move a blocked agent back to working.
+            Source::Tmux(target) => {
+                let tx = self.tx.clone();
+                let detail = text.to_string();
+                let outcome_name = name.clone();
+                std::thread::spawn(move || {
+                    let result =
+                        backend::send_keys(&target, &detail).map_err(|error| error.to_string());
+                    let _ = tx.send(AppEvent::CommandOutcome {
+                        id: Some(id),
+                        name: outcome_name,
+                        kind: "send",
+                        detail,
+                        result,
+                    });
+                });
+                self.status_msg = format!("sending to {name}…");
             }
-        }
-        if ok {
-            self.store.log(Some(id), &name, "send", text);
-            tracing::info!(agent = id, "sent line");
-            self.status_msg = format!("sent to {name}");
+            Source::Cmux(ws_ref) => {
+                let tx = self.tx.clone();
+                let detail = text.to_string();
+                let outcome_name = name.clone();
+                std::thread::spawn(move || {
+                    let result =
+                        backend::cmux_send(&ws_ref, &detail).map_err(|error| error.to_string());
+                    let _ = tx.send(AppEvent::CommandOutcome {
+                        id: Some(id),
+                        name: outcome_name,
+                        kind: "send",
+                        detail,
+                        result,
+                    });
+                });
+                self.status_msg = format!("sending to {name}…");
+            }
         }
     }
 
@@ -1783,7 +2061,78 @@ mod tests {
         // file can collide under the parallel Rust harness and leave a WAL lock.
         let store = Store::open(std::path::Path::new(":memory:")).unwrap();
         let (tx, rx) = channel();
-        App::new(store, tx, rx)
+        let (_native_control_tx, native_control_rx) = channel();
+        App::new(store, tx, rx, native_control_rx)
+    }
+
+    #[test]
+    fn native_control_lists_only_ptys_owned_by_this_tui() {
+        let mut app = test_app();
+        let native = Agent::new(
+            7,
+            "codex-7".into(),
+            "codex".into(),
+            "codex".into(),
+            Vec::new(),
+            "/repo".into(),
+        );
+        let mut external = Agent::new(
+            8,
+            "external-8".into(),
+            "tmux".into(),
+            "tmux".into(),
+            Vec::new(),
+            "/repo".into(),
+        );
+        external.source = Source::Tmux("work:1.0".into());
+        app.fleet.agents.push(native);
+        app.fleet.agents.push(external);
+        let (reply, response) = channel();
+        app.handle_native_control(native_control::ControlRequest {
+            command: native_control::NativeCommand::List,
+            reply,
+        });
+        let response = response.recv().unwrap();
+        assert!(response.ok);
+        assert_eq!(response.agents.len(), 1);
+        assert_eq!(response.agents[0].reference, "native:7");
+        assert_eq!(response.agents[0].runtime, "codex");
+    }
+
+    #[test]
+    fn native_socket_request_reaches_the_tui_control_queue() {
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let (tx, rx) = channel();
+        let (control_tx, control_rx) = channel();
+        let mut app = App::new(store, tx, rx, control_rx);
+        app.fleet.agents.push(Agent::new(
+            3,
+            "hermes-3".into(),
+            "hermes".into(),
+            "hermes".into(),
+            Vec::new(),
+            "/repo".into(),
+        ));
+        let dir = std::env::temp_dir().join(format!(
+            "agentmaster-app-native-control-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = native_control::NativeControlServer::start(&dir, control_tx).unwrap();
+        let client_dir = dir.clone();
+        let client = std::thread::spawn(move || {
+            native_control::request(&client_dir, native_control::NativeCommand::List)
+        });
+        let request = app
+            .native_control_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("socket request must reach TUI queue");
+        app.handle_native_control(request);
+        let response = client.join().unwrap().unwrap();
+        assert!(response.ok);
+        assert_eq!(response.agents[0].reference, "native:3");
+        drop(server);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     fn area() -> Rect {

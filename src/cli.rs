@@ -1,7 +1,8 @@
-//! Headless orchestrator surface. Everything you can do to *external* agents
+//! Headless orchestrator surface. Everything you can do to external agents
 //! (tmux panes + cmux workspaces) without opening the TUI: list, steer one,
-//! broadcast to all, and set/inspect goals. Native PTYs live inside the TUI
-//! process, so they are intentionally not steerable from a separate CLI call.
+//! broadcast to all, and set/inspect goals. Native PTYs stay owned by the TUI,
+//! but a local user-only Unix socket lets this CLI observe and steer them while
+//! that TUI is running.
 //!
 //! `--json` is offered everywhere an agent might consume the output (the
 //! cli-anything contract). Zero token tax: status is read off `cmux top`/tmux,
@@ -9,9 +10,10 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::backend;
+use crate::native_control::{self, NativeCommand, NativeResponse};
 use crate::peek;
 use crate::store::Store;
 
@@ -42,20 +44,64 @@ fn json_escape(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
 }
 
-/// `ls` — every discoverable live agent across backends. Read-only.
-pub fn list(json: bool) -> Result<()> {
-    let panes = if backend::tmux_available() {
-        backend::list_panes()
-    } else {
-        Vec::new()
+fn native_request(dir: &Path, command: NativeCommand) -> Result<NativeResponse> {
+    let response = native_control::request(dir, command)?;
+    if !response.ok {
+        bail!(
+            "native AgentMaster control failed: {}",
+            response.message.unwrap_or_else(|| "unknown error".into())
+        );
+    }
+    Ok(response)
+}
+
+fn native_agents(dir: &Path) -> Result<Vec<native_control::NativeAgent>> {
+    match native_request(dir, NativeCommand::List) {
+        Ok(response) => Ok(response.agents),
+        Err(error) if native_control::is_inactive_error(&error) => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
+}
+
+fn visible_backend_error(error: &anyhow::Error) -> bool {
+    !error.to_string().contains("no server running")
+}
+
+/// `ls` — every discoverable live agent across backends, including native PTYs
+/// when an AgentMaster TUI currently owns them. Read-only.
+pub fn list(json: bool, dir: &Path) -> Result<()> {
+    let (panes, tmux_error) = match backend::list_panes_checked() {
+        Ok(panes) => (panes, None),
+        Err(error) => (Vec::new(), Some(error)),
     };
-    let ws = if backend::cmux_available() {
-        backend::list_cmux()
-    } else {
-        Vec::new()
+    let (ws, cmux_error) = match backend::list_cmux_checked() {
+        Ok(workspaces) => (workspaces, None),
+        Err(error) => (Vec::new(), Some(error)),
     };
+    let native = native_agents(dir)?;
+    for error in [tmux_error.as_ref(), cmux_error.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if visible_backend_error(error) {
+            eprintln!("warning: {error}");
+        }
+    }
     if json {
         let mut items: Vec<String> = Vec::new();
+        for agent in &native {
+            items.push(format!(
+                "{{\"backend\":\"native\",\"ref\":{},\"runtime\":{},\"status\":{},\"glyph\":{},\"pid\":{},\"cwd\":{},\"title\":{},\"last_line\":{}}}",
+                json_escape(&agent.reference),
+                json_escape(&agent.runtime),
+                json_escape(&agent.status),
+                json_escape(&glyph(&agent.status).to_string()),
+                agent.pid.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
+                json_escape(&agent.cwd),
+                json_escape(&agent.name),
+                json_escape(&agent.last_line)
+            ));
+        }
         for p in &panes {
             items.push(format!(
                 "{{\"backend\":\"tmux\",\"ref\":{},\"command\":{},\"pid\":{},\"title\":{}}}",
@@ -69,8 +115,12 @@ pub fn list(json: bool) -> Result<()> {
         }
         for w in &ws {
             items.push(format!(
-                "{{\"backend\":\"cmux\",\"ref\":{},\"status\":{},\"glyph\":{},\"pid\":{},\"title\":{}}}",
+                "{{\"backend\":\"cmux\",\"ref\":{},\"runtime\":{},\"status\":{},\"glyph\":{},\"pid\":{},\"title\":{}}}",
                 json_escape(&w.ws_ref),
+                w.runtime
+                    .as_deref()
+                    .map(json_escape)
+                    .unwrap_or_else(|| "null".into()),
                 json_escape(&w.status),
                 json_escape(&glyph(&w.status).to_string()),
                 w.pid.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
@@ -80,9 +130,26 @@ pub fn list(json: bool) -> Result<()> {
         println!("[{}]", items.join(","));
         return Ok(());
     }
-    if panes.is_empty() && ws.is_empty() {
-        println!("no live agents (tmux panes / cmux workspaces) discoverable");
+    if native.is_empty() && panes.is_empty() && ws.is_empty() {
+        println!("no live agents (native PTYs / tmux panes / cmux workspaces) discoverable");
         return Ok(());
+    }
+    for agent in &native {
+        println!(
+            "[native] {} {:<12} {:<10} pid {:<7} {}",
+            glyph(&agent.status),
+            agent.reference,
+            agent.runtime,
+            agent
+                .pid
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into()),
+            if agent.last_line.is_empty() {
+                &agent.name
+            } else {
+                &agent.last_line
+            }
+        );
     }
     for p in &panes {
         println!(
@@ -103,7 +170,8 @@ pub fn list(json: bool) -> Result<()> {
         );
     }
     println!(
-        "\n{} tmux · {} cmux   (⏸ blocked · ▶ working · ✓ done · · idle)",
+        "\n{} native · {} tmux · {} cmux   (⏸ blocked · ▶ working · ✓ done · · idle)",
+        native.len(),
         panes.len(),
         ws.len()
     );
@@ -112,18 +180,29 @@ pub fn list(json: bool) -> Result<()> {
 
 /// Jump to an agent's live tab. `workspace:NN` → cmux `workspace.select`,
 /// anything else → tmux `select-window`/`select-pane`.
-pub fn focus(reference: &str) -> Result<()> {
-    let ok = if reference.starts_with("workspace:") {
-        backend::cmux_focus(reference)
-    } else {
-        backend::tmux_focus(reference)
-    };
-    if ok {
-        println!("→ focused {reference}");
-        Ok(())
-    } else {
-        anyhow::bail!("could not focus {reference} (stale ref or backend unavailable)")
+pub fn focus(reference: &str, dir: &Path) -> Result<()> {
+    if reference.starts_with("native:") {
+        let response = native_request(
+            dir,
+            NativeCommand::Focus {
+                target: reference.to_string(),
+            },
+        )?;
+        println!(
+            "→ {}",
+            response
+                .message
+                .unwrap_or_else(|| format!("focused {reference}"))
+        );
+        return Ok(());
     }
+    if reference.starts_with("workspace:") {
+        backend::cmux_focus_checked(reference)?;
+    } else {
+        backend::tmux_focus_checked(reference)?;
+    }
+    println!("→ focused {reference}");
+    Ok(())
 }
 
 /// Resolve a ref to its backend and send a line. `workspace:NN` → cmux,
@@ -132,43 +211,96 @@ pub fn send(reference: &str, msg: &str, dir: &Path) -> Result<()> {
     if msg.trim().is_empty() {
         anyhow::bail!("empty message");
     }
-    if reference.starts_with("workspace:") {
-        backend::cmux_send(reference, msg);
+    if reference.starts_with("native:") {
+        let response = native_request(
+            dir,
+            NativeCommand::Send {
+                target: reference.to_string(),
+                message: msg.to_string(),
+            },
+        )?;
+        println!(
+            "{}",
+            response
+                .message
+                .unwrap_or_else(|| format!("sent → {reference}"))
+        );
+    } else if reference.starts_with("workspace:") {
+        backend::cmux_send(reference, msg)?;
+        println!("sent → {reference}");
     } else {
-        backend::send_keys(reference, msg);
+        backend::send_keys(reference, msg)?;
+        println!("sent → {reference}");
     }
     if let Ok(s) = Store::open(&dir.join("agentmaster.db")) {
         s.log(None, reference, "send", msg);
     }
-    println!("sent → {reference}");
     Ok(())
 }
 
-/// Broadcast a line to every live agent. cmux always; tmux when `include_tmux`.
-/// `needs_input` narrows cmux targets to those waiting on a human.
+/// Broadcast a line to every live agent. Native PTYs and cmux are included;
+/// tmux joins with `include_tmux`. `needs_input` narrows status-aware surfaces.
 pub fn broadcast(msg: &str, include_tmux: bool, needs_input: bool, dir: &Path) -> Result<()> {
     if msg.trim().is_empty() {
         anyhow::bail!("empty message");
     }
     let mut n = 0;
-    if backend::cmux_available() {
-        for w in backend::list_cmux() {
-            if needs_input && glyph(&w.status) != '⏸' {
-                continue;
+    let mut failures = Vec::new();
+    for agent in native_agents(dir)? {
+        if needs_input && glyph(&agent.status) != '⏸' {
+            continue;
+        }
+        match native_request(
+            dir,
+            NativeCommand::Send {
+                target: agent.reference.clone(),
+                message: msg.to_string(),
+            },
+        ) {
+            Ok(_) => {
+                println!("→ [native] {} {}", agent.reference, agent.name);
+                n += 1;
             }
-            backend::cmux_send(&w.ws_ref, msg);
-            println!("→ [cmux] {} {}", w.ws_ref, w.title);
-            n += 1;
+            Err(error) => failures.push(error.to_string()),
         }
     }
-    if include_tmux && backend::tmux_available() {
-        for p in backend::list_panes() {
-            if p.command.contains("agentmaster") {
-                continue; // never broadcast into our own pane
+    match backend::list_cmux_checked() {
+        Ok(workspaces) => {
+            for w in workspaces {
+                if needs_input && glyph(&w.status) != '⏸' {
+                    continue;
+                }
+                match backend::cmux_send(&w.ws_ref, msg) {
+                    Ok(()) => {
+                        println!("→ [cmux] {} {}", w.ws_ref, w.title);
+                        n += 1;
+                    }
+                    Err(error) => failures.push(error.to_string()),
+                }
             }
-            backend::send_keys(&p.target, msg);
-            println!("→ [tmux] {}", p.target);
-            n += 1;
+        }
+        Err(error) => failures.push(error.to_string()),
+    }
+    if include_tmux {
+        match backend::list_panes_checked() {
+            Ok(panes) => {
+                for p in panes {
+                    if p.command.contains("agentmaster") {
+                        continue; // never broadcast into our own pane
+                    }
+                    match backend::send_keys(&p.target, msg) {
+                        Ok(()) => {
+                            println!("→ [tmux] {}", p.target);
+                            n += 1;
+                        }
+                        Err(error) => failures.push(error.to_string()),
+                    }
+                }
+            }
+            Err(error) if !error.to_string().contains("no server running") => {
+                failures.push(error.to_string());
+            }
+            Err(_) => {}
         }
     }
     if let Ok(s) = Store::open(&dir.join("agentmaster.db")) {
@@ -180,6 +312,77 @@ pub fn broadcast(msg: &str, include_tmux: bool, needs_input: bool, dir: &Path) -
         );
     }
     println!("\nbroadcast to {n} live agent(s)");
+    if !failures.is_empty() {
+        bail!("broadcast partially failed: {}", failures.join(" | "));
+    }
+    Ok(())
+}
+
+/// Send Ctrl-C without deleting a workspace/pane. This is an explicit operator
+/// action; cmux workspaces stay intact so their transcript remains inspectable.
+pub fn interrupt(reference: &str, dir: &Path) -> Result<()> {
+    if reference.starts_with("native:") {
+        let response = native_request(
+            dir,
+            NativeCommand::Interrupt {
+                target: reference.to_string(),
+            },
+        )?;
+        println!(
+            "{}",
+            response
+                .message
+                .unwrap_or_else(|| format!("interrupted → {reference}"))
+        );
+    } else if reference.starts_with("workspace:") {
+        backend::cmux_interrupt(reference)?;
+        println!("interrupted → {reference}");
+    } else {
+        backend::tmux_interrupt(reference)?;
+        println!("interrupted → {reference}");
+    }
+    if let Ok(store) = Store::open(&dir.join("agentmaster.db")) {
+        store.log(None, reference, "interrupt", "ctrl-c by operator");
+    }
+    Ok(())
+}
+
+/// Read the current state and bounded output tail of a native PTY from the TUI
+/// that owns it. Native agents do not have a portable transcript file, so this
+/// is deliberately labelled as observed terminal output rather than an inferred
+/// assistant message.
+pub fn native_peek(reference: &str, tail: usize, dir: &Path) -> Result<()> {
+    let response = native_request(
+        dir,
+        NativeCommand::Peek {
+            target: reference.to_string(),
+            tail,
+        },
+    )?;
+    let agent = response
+        .agent
+        .ok_or_else(|| anyhow::anyhow!("native control returned no agent for {reference}"))?;
+    println!(
+        "[native] {} {} {} pid {} · {}%",
+        glyph(&agent.status),
+        agent.reference,
+        agent.runtime,
+        agent
+            .pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "-".into()),
+        agent.progress
+    );
+    println!("cwd: {}", agent.cwd);
+    if let Some(goal) = agent.goal {
+        println!("goal: {goal}");
+    }
+    if !agent.last_line.is_empty() {
+        println!("last: {}", agent.last_line);
+    }
+    for line in agent.output {
+        println!("| {line}");
+    }
     Ok(())
 }
 
@@ -442,14 +645,59 @@ fn clip(s: &str, max: usize) -> String {
 /// directly, never asks the agent to report.
 pub fn send_wait(reference: &str, msg: &str, dir: &Path, timeout_secs: u64) -> Result<()> {
     use std::time::{Duration, Instant};
-    send(reference, msg, dir)?;
+    if reference.starts_with("native:") {
+        let baseline = native_request(
+            dir,
+            NativeCommand::Peek {
+                target: reference.to_string(),
+                tail: 0,
+            },
+        )?
+        .agent
+        .ok_or_else(|| anyhow::anyhow!("native control returned no agent for {reference}"))?;
+        send(reference, msg, dir)?;
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let mut tick = 0;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_secs(2));
+            tick += 1;
+            let current = native_request(
+                dir,
+                NativeCommand::Peek {
+                    target: reference.to_string(),
+                    tail: 1,
+                },
+            )?
+            .agent
+            .ok_or_else(|| anyhow::anyhow!("native agent {reference} disappeared"))?;
+            if current.lines_total > baseline.lines_total
+                && !current.last_line.is_empty()
+                && current.last_line != baseline.last_line
+            {
+                println!("\n🖥️ {}", current.last_line);
+                return Ok(());
+            }
+            eprint!(
+                "\r  …waiting for native output ({tick}s, {}s left)   ",
+                deadline.duration_since(Instant::now()).as_secs()
+            );
+        }
+        eprintln!();
+        println!("⏳ native agent still running after {timeout_secs}s — peek {reference} later");
+        return Ok(());
+    }
+
+    // Capture baseline before delivery so an unusually fast agent response cannot
+    // race past the handoff waiter.
     let baseline = match peek::resolve(reference) {
         Some(p) => peek::digest(&p, 220).last_assistant_ts,
         None => {
+            send(reference, msg, dir)?;
             println!("(no transcript linked to {reference}; cannot wait — message sent)");
             return Ok(());
         }
     };
+    send(reference, msg, dir)?;
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut tick = 0;
     while Instant::now() < deadline {
@@ -512,6 +760,9 @@ pub fn assign_with_model(
         s.trim_matches('-').to_string()
     });
     let slug = owned_slug.as_str();
+    if slug.is_empty() {
+        anyhow::bail!("workspace name resolved to empty; pass --name <slug>");
+    }
     let spec = crate::runtime::resolve_with_model(runtime, Some(task), model);
     let mut launch = vec![spec.program];
     launch.extend(spec.args);
@@ -530,6 +781,26 @@ pub fn assign_with_model(
             &launch_cmd,
         ])
         .output()?;
+    if !out.status.success() {
+        let raw = if out.stderr.is_empty() {
+            &out.stdout
+        } else {
+            &out.stderr
+        };
+        let detail = String::from_utf8_lossy(raw)
+            .split_whitespace()
+            .take(32)
+            .collect::<Vec<_>>()
+            .join(" ");
+        anyhow::bail!(
+            "cmux new-workspace failed{}",
+            if detail.is_empty() {
+                format!(" (exit {})", out.status)
+            } else {
+                format!(": {detail}")
+            }
+        );
+    }
     let first = String::from_utf8_lossy(&out.stdout)
         .lines()
         .next()
@@ -538,8 +809,8 @@ pub fn assign_with_model(
     let ws_ref = first
         .split_whitespace()
         .find(|w| w.starts_with("workspace:"))
-        .unwrap_or(&first)
-        .to_string();
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("cmux new-workspace returned no workspace ref: {first}"))?;
     if let Ok(s) = Store::open(&dir.join("agentmaster.db")) {
         s.log(None, &ws_ref, "assign", &format!("{runtime}: {task}"));
     }

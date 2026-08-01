@@ -57,8 +57,10 @@ Requires Rust 1.95+. macOS and Linux are the target environments.
 ```bash
 agentmaster doctor          # check data dir, PTY, runtimes, tmux/cmux
 agentmaster                 # launch the TUI
-agentmaster ls --json       # inspect discovered live agents headlessly
+agentmaster ls --json       # native TUI PTYs + discovered tmux/cmux agents
+agentmaster status --json   # fleet, backend reachability, runtimes, adapters, goals
 agentmaster peek <id>       # read transcript last-user/assistant/next
+agentmaster peek native:7 --tail 20  # bounded observed terminal output from a live TUI
 ```
 
 Inside the TUI, press `d` to discover again, `S` to cycle sort, `/` to filter,
@@ -78,6 +80,19 @@ agentmaster send workspace:96 run the tests
 agentmaster send dev:1.0 cargo nextest run
 agentmaster broadcast "status?" --needs-input
 agentmaster focus workspace:96
+agentmaster interrupt workspace:96  # Ctrl-C; preserves the workspace/transcript
+agentmaster send native:7 "run the focused test"
+agentmaster focus native:7           # select that PTY in the running TUI
+
+# Explicit bridges to the existing local control CLIs
+agentmaster control ggadapter status
+agentmaster control ggadapter broker sessions --cwd "$PWD" --json
+agentmaster control llmadapter lanes
+agentmaster control cmux list-workspaces
+agentmaster control hermes --help
+
+# Explicit Luna worker; model is passed through, never auto-selected
+agentmaster assign codex --model gpt-5.6-luna --name luna-audit "read-only audit"
 
 # Goals and fan-out
 agentmaster goal payments-api ship checkout :: all e2e tests green

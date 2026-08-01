@@ -17,6 +17,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use crate::backend;
+use crate::native_control::{self, NativeCommand};
 
 /// Anthropic's default prompt-cache window. Inside it, reusing the same
 /// conversation is cheap; outside, the prefix is re-read at full price.
@@ -84,7 +85,7 @@ pub fn run(request: RouteRequest<'_>, dir: &Path) -> Result<()> {
     let cwd = std::env::current_dir()
         .ok()
         .map(|path| path.display().to_string());
-    let (candidates, skipped_self) = discover();
+    let (candidates, skipped_self) = discover(dir)?;
     if skipped_self > 0 {
         println!("(skipped {skipped_self} workspace(s): this session)");
     }
@@ -199,12 +200,41 @@ fn parent_pid(pid: u32) -> Option<u32> {
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
-fn discover() -> (Vec<Candidate>, usize) {
+fn discover(dir: &Path) -> Result<(Vec<Candidate>, usize)> {
     let mut out = Vec::new();
     let transcripts = crate::peek::pid_transcripts();
     let ancestors = ancestor_pids();
     let mut skipped_self = 0;
     let now = SystemTime::now();
+
+    // Native PTYs have no global process registry: only a live AgentMaster TUI
+    // can expose them. A missing TUI is normal, so it is an empty backend rather
+    // than a routing error.
+    match native_control::request(dir, NativeCommand::List) {
+        Ok(response) if response.ok => {
+            for agent in response.agents {
+                let title = if agent.last_line.is_empty() {
+                    agent.name.clone()
+                } else {
+                    format!("{} {}", agent.name, agent.last_line)
+                };
+                out.push(Candidate {
+                    reference: agent.reference,
+                    backend: "native",
+                    title,
+                    cwd: Some(agent.cwd),
+                    busy: is_busy(&agent.status),
+                    idle_secs: None,
+                });
+            }
+        }
+        Ok(response) => anyhow::bail!(
+            "native AgentMaster control failed: {}",
+            response.message.unwrap_or_else(|| "unknown error".into())
+        ),
+        Err(error) if native_control::is_inactive_error(&error) => {}
+        Err(error) => return Err(error),
+    }
 
     if backend::cmux_available() {
         for workspace in backend::list_cmux() {
@@ -246,7 +276,7 @@ fn discover() -> (Vec<Candidate>, usize) {
             });
         }
     }
-    (out, skipped_self)
+    Ok((out, skipped_self))
 }
 
 fn is_agent_command(command: &str) -> bool {
