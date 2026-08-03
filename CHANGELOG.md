@@ -4,6 +4,19 @@ All notable changes to agentmaster are documented here. Newest first.
 
 ## [Unreleased]
 
+### Added: hash-verified prompt control
+- Added `prompts discover|list|search|show|render|send|doctor` for local prompt
+  artifacts. Discovery is deterministic, skips symlinks and build trees, records
+  canonical paths plus SHA-256 hashes, and marks plain/copy variants as duplicates.
+- `show`, `search`, `render`, and `send` re-check registered file hashes. Rendering
+  only substitutes declared `{{key}}` values; it never evaluates prompt text.
+  `send` requires an explicit target and delegates only to AgentMaster's existing
+  native/cmux/tmux transport. `status` and `doctor` surface catalog health.
+- Added `prompts links list|search|show|doctor`, backed by a bundled curated
+  registry of 45 direct prompt-library, skill-library, prompt-tool, system-prompt
+  reference, and labelled security-research URLs. The links must occur in the
+  registered Top-50 report with its pinned SHA-256; they remain references only.
+
 ### Added — one CLI view for the local agent stack
 - Added `status [--json]`, a read-only snapshot of live tmux/cmux agents,
   runtime availability, GGAdapter/LLMAdapter probes, and stored goals.
