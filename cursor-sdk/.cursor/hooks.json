@@ -1,0 +1,36 @@
+{
+  "$schema": "https://cursor.com/docs/hooks.json",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agentmaster events -n 1 >> ~/.agentmaster/logs/cursor-bridge.jsonl 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agentmaster log --source cursor --event prompt --ref \"$(pwd)\" >> ~/.agentmaster/logs/cursor-bridge.jsonl 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agentmaster log --source cursor --event stop --ref \"$(pwd)\" >> ~/.agentmaster/logs/cursor-bridge.jsonl 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}

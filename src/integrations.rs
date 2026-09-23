@@ -568,6 +568,7 @@ pub fn status(json_output: bool, dir: &Path) -> Result<()> {
     let adapters = adapter_inventory();
     let runtimes = runtime_inventory();
     let goals = goals_inventory(dir);
+    let prompt_catalog = crate::prompts::doctor_report(dir);
 
     if json_output {
         println!(
@@ -581,6 +582,7 @@ pub fn status(json_output: bool, dir: &Path) -> Result<()> {
                 },
                 "runtimes": runtimes,
                 "adapters": adapters,
+                "prompt_catalog": prompt_catalog,
                 "goals": goals
             }))?
         );
@@ -658,6 +660,17 @@ pub fn status(json_output: bool, dir: &Path) -> Result<()> {
         })
         .count();
     println!("  runtimes: {found}/{} available", runtimes.len());
+    println!(
+        "  prompts: {} ({} active, {} duplicates, {} curated links)",
+        if prompt_catalog.healthy {
+            "healthy"
+        } else {
+            "unhealthy"
+        },
+        prompt_catalog.active_entries,
+        prompt_catalog.duplicates,
+        prompt_catalog.links.source_count
+    );
     println!("  goals: {} stored", goals.len());
     Ok(())
 }
@@ -703,6 +716,14 @@ pub fn doctor(dir: &Path) {
     println!(
         "  native control: {} {detail}",
         if active { "ok" } else { "inactive" }
+    );
+    let prompts = crate::prompts::doctor_report(dir);
+    println!(
+        "  prompt catalog : {} ({} active, {} duplicates, {} curated links)",
+        if prompts.healthy { "ok" } else { "FAIL" },
+        prompts.active_entries,
+        prompts.duplicates,
+        prompts.links.source_count
     );
 }
 

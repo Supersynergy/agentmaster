@@ -14,6 +14,7 @@ mod native_control;
 mod obs;
 mod orch;
 mod peek;
+mod prompts;
 mod pty;
 mod research;
 mod route;
@@ -73,6 +74,11 @@ enum Cmd {
         /// Forward all remaining tokens unchanged, including flags for the target CLI.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Discover and safely control local prompt-library artifacts.
+    Prompts {
+        #[command(subcommand)]
+        command: PromptCommand,
     },
     /// Search ALL sessions by content (passthrough to session-restore)
     Find { query: String },
@@ -406,6 +412,99 @@ enum Cmd {
     },
 }
 
+#[derive(Subcommand)]
+enum PromptCommand {
+    /// Discover prompt-named text artifacts and atomically register their hashes.
+    Discover {
+        /// Root directory to scan (repeatable); symlinks and build trees are skipped.
+        #[arg(long = "root", required = true, value_name = "DIR")]
+        roots: Vec<PathBuf>,
+        /// Restrict discovery to files modified on this local calendar day (YYYY-MM-DD).
+        #[arg(long)]
+        modified_on: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List registered prompt artifacts. Duplicates stay hidden unless requested.
+    List {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search registered artifact metadata and verified text.
+    Search {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+        #[arg(trailing_var_arg = true, required = true)]
+        query: Vec<String>,
+    },
+    /// Show one registered artifact after its content hash is rechecked.
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Render one registered artifact. This is text substitution, never execution.
+    Render {
+        id: String,
+        #[arg(long = "var", value_name = "KEY=VALUE")]
+        variables: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send a rendered, registered artifact only to the explicitly named live agent.
+    Send {
+        id: String,
+        /// native:ID, workspace:NN, or tmux session:window.pane
+        target: String,
+        #[arg(long = "var", value_name = "KEY=VALUE")]
+        variables: Vec<String>,
+        /// Render and report without writing to the target agent.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List curated external prompt libraries and prompt tools linked to a verified source report.
+    Links {
+        #[command(subcommand)]
+        command: PromptLinkCommand,
+    },
+    /// Verify catalog schema, file paths, hashes, duplicate links, and UTF-8 safety.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PromptLinkCommand {
+    /// List the curated source URLs. They are references, never automatic installs.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search curated source titles, kinds, URLs, and summaries.
+    Search {
+        #[arg(long)]
+        json: bool,
+        #[arg(trailing_var_arg = true, required = true)]
+        query: Vec<String>,
+    },
+    /// Show one curated source URL and its local classification.
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify that every curated URL is present in the registered, hash-pinned source report.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 fn home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
@@ -436,6 +535,38 @@ fn main() -> anyhow::Result<()> {
         Cmd::Doctor { verbose, costs } => doctor(&dir, verbose, costs)?,
         Cmd::Status { json } => integrations::status(json, &dir)?,
         Cmd::Control { target, args } => integrations::control(&target, &args)?,
+        Cmd::Prompts { command } => match command {
+            PromptCommand::Discover {
+                roots,
+                modified_on,
+                json,
+            } => prompts::discover(&roots, modified_on.as_deref(), json, &dir)?,
+            PromptCommand::List { all, json } => prompts::list(all, json, &dir)?,
+            PromptCommand::Search { all, json, query } => {
+                prompts::search(&query.join(" "), all, json, &dir)?
+            }
+            PromptCommand::Show { id, json } => prompts::show(&id, json, &dir)?,
+            PromptCommand::Render {
+                id,
+                variables,
+                json,
+            } => prompts::render_command(&id, &variables, json, &dir)?,
+            PromptCommand::Send {
+                id,
+                target,
+                variables,
+                dry_run,
+            } => prompts::send(&id, &target, &variables, dry_run, &dir)?,
+            PromptCommand::Links { command } => match command {
+                PromptLinkCommand::List { json } => prompts::links_list(json, &dir)?,
+                PromptLinkCommand::Search { json, query } => {
+                    prompts::links_search(&query.join(" "), json, &dir)?
+                }
+                PromptLinkCommand::Show { id, json } => prompts::links_show(&id, json, &dir)?,
+                PromptLinkCommand::Doctor { json } => prompts::links_doctor(json, &dir)?,
+            },
+            PromptCommand::Doctor { json } => prompts::doctor(json, &dir)?,
+        },
         Cmd::Find { query } => orch::find(&query)?,
         Cmd::Dash { all, query } => orch::dash(all, query.as_deref())?,
         Cmd::Start { id, here, focus } => orch::start(&id, here, focus)?,
@@ -769,7 +900,7 @@ fn doctor(dir: &Path, verbose: bool, costs: bool) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Cmd};
+    use super::{Cli, Cmd, PromptCommand, PromptLinkCommand};
     use clap::Parser;
 
     #[test]
@@ -782,6 +913,63 @@ mod tests {
                 assert_eq!(args, ["--version"]);
             }
             _ => panic!("expected control command"),
+        }
+    }
+
+    #[test]
+    fn prompt_send_requires_target_and_preserves_variables() {
+        assert!(Cli::try_parse_from(["agentmaster", "prompts", "send", "safe-template"]).is_err());
+        let cli = Cli::try_parse_from([
+            "agentmaster",
+            "prompts",
+            "send",
+            "safe-template",
+            "native:7",
+            "--var",
+            "name=world",
+        ])
+        .expect("prompt send should require and retain an explicit target");
+        match cli.cmd {
+            Some(Cmd::Prompts {
+                command:
+                    PromptCommand::Send {
+                        id,
+                        target,
+                        variables,
+                        dry_run,
+                    },
+            }) => {
+                assert_eq!(id, "safe-template");
+                assert_eq!(target, "native:7");
+                assert_eq!(variables, ["name=world"]);
+                assert!(!dry_run);
+            }
+            _ => panic!("expected prompt send command"),
+        }
+    }
+
+    #[test]
+    fn prompt_links_search_preserves_a_multiword_query() {
+        let cli = Cli::try_parse_from([
+            "agentmaster",
+            "prompts",
+            "links",
+            "search",
+            "prompt",
+            "tool",
+        ])
+        .expect("prompt link search should parse a trailing multiword query");
+        match cli.cmd {
+            Some(Cmd::Prompts {
+                command:
+                    PromptCommand::Links {
+                        command: PromptLinkCommand::Search { json, query },
+                    },
+            }) => {
+                assert!(!json);
+                assert_eq!(query, ["prompt", "tool"]);
+            }
+            _ => panic!("expected prompt links search command"),
         }
     }
 }

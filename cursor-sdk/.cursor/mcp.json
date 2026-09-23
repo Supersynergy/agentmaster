@@ -1,0 +1,10 @@
+{
+  "$schema": "https://cursor.com/docs/mcp.json",
+  "mcpServers": {
+    "agentmaster": {
+      "command": "agentmaster-mcp",
+      "env": {},
+      "description": "agentmaster fleet supervisor — am_ls, am_peek, am_assign, am_handoff, am_skill, am_doctor. Zero token tax: reads transcripts directly, never asks agents to report."
+    }
+  }
+}

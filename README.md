@@ -33,6 +33,8 @@ blocked, done, or waiting. agentmaster removes that cost:
 - Ground-truth last-response ages from transcript mtimes where available.
 - `focus`, `send`, `broadcast`, `goal`, `peek`, `ls --json` and session-restore
   helpers for headless workflows.
+- Hash-verified local prompt artifacts: discover, inspect, render `{{variables}}`,
+  and send only through an explicit existing control target.
 
 ## Install
 
@@ -91,6 +93,18 @@ agentmaster control llmadapter lanes
 agentmaster control cmux list-workspaces
 agentmaster control hermes --help
 
+# Local prompt artifacts are data, never commands to execute
+agentmaster prompts discover --root /Users/master/Downloads --modified-on 2026-08-01
+agentmaster prompts doctor --json
+agentmaster prompts list
+agentmaster prompts search --json "red team"
+agentmaster prompts show prompt-libraries-top50-2026-07-31 --json
+agentmaster prompts render safe-template --var name=world
+agentmaster prompts send safe-template native:7 --var name=world --dry-run
+agentmaster prompts links doctor --json
+agentmaster prompts links search "prompt evaluation"
+agentmaster prompts links show promptfoo --json
+
 # Explicit Luna worker; model is passed through, never auto-selected
 agentmaster assign codex --model gpt-5.6-luna --name luna-audit "read-only audit"
 
@@ -98,6 +112,20 @@ agentmaster assign codex --model gpt-5.6-luna --name luna-audit "read-only audit
 agentmaster goal payments-api ship checkout :: all e2e tests green
 agentmaster batch tasks.md --yes
 ```
+
+`prompts discover` writes `/Users/master/.agentmaster/prompt-catalog.json` with
+canonical absolute paths and SHA-256 hashes. `search`, `show`, `render`, and
+`send` re-check the selected artifact before reading it. Rendering only replaces
+explicit `{{key}}` placeholders; it does not evaluate prompt text. Sending needs
+an explicit agent reference and reuses the existing native/cmux/tmux transport.
+Use `--dry-run` before a real delivery.
+
+`prompts links` exposes the curated external libraries and tools cited by the
+registered Top-50 source report. The bundled registry only includes reusable
+prompt/skill libraries, system-prompt references, prompt tooling, and explicitly
+labelled security research. Every URL must occur in the hash-pinned local report.
+Links are references only. AgentMaster never clones, installs, executes, or sends
+remote source material automatically.
 
 ## Lean llmadapter ensembles
 
@@ -287,6 +315,7 @@ src/peek.rs      transcript resolution + zero-token digest
 src/store.rs     SQLite audit log, goals, seen-state
 src/state.rs     output -> status/progress heuristics
 src/pty.rs       native PTY backend
+src/prompts.rs   hash-verified prompt artifact catalog and safe delivery
 ```
 
 Docs:
