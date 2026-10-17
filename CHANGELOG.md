@@ -4,6 +4,13 @@ All notable changes to agentmaster are documented here. Newest first.
 
 ## [Unreleased]
 
+### Added: strict browser verdict receipts
+- Added `browser-verdict FILE [--expected true|false]`: accepts only transport
+  success and the expected boolean assertion, with a 1 MiB bound and a SHA-256
+  receipt. Browser oracles can now reject `ok:true, verdict:false` explicitly.
+- Documented immutable assertions, source-bound measurement receipts and the
+  separation between provider usage, byte proxies and installed/runtime proof.
+
 ### Added: hash-verified prompt control
 - Added `prompts discover|list|search|show|render|send|doctor` for local prompt
   artifacts. Discovery is deterministic, skips symlinks and build trees, records
