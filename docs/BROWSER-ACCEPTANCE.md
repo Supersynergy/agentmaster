@@ -27,6 +27,14 @@ Bytes divided by four are a size proxy; they are not measured model usage,
 billing or savings. Browser operation microbenchmarks cannot establish whole
 coding-task performance.
 
+Deduplicate usage by canonical request and message IDs while preserving branch
+identity; duplicate metric nodes must not count twice. Attribute usage to the
+per-generation model metadata (`metadata.generation_model`), rather than the
+session's current model. Record first update, first answer text and oracle
+completion separately: `firstOutputMs` may include plan, tool or usage updates.
+Missing usage remains unknown. Evidence: `DEViN-CONTROL-20261017.md`, SHA-256
+`00acdaf68f29bd9100a0c66c09d8394bae71ef536c2663133464032901aeeee9`.
+
 Source, build, installed launcher, live runtime and product acceptance are
 separate evidence. This filter validates an assertion result; it does not prove
 a live browser journey, a provider task or Office product acceptance.
