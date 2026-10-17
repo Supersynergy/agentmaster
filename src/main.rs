@@ -6,6 +6,7 @@
 mod app;
 mod ats;
 mod backend;
+mod browser_verdict;
 mod cli;
 mod fleet;
 mod llmadapter;
@@ -38,6 +39,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Check a captured mk act check result; require ok:true and the expected verdict.
+    BrowserVerdict {
+        file: PathBuf,
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        expected: bool,
+    },
     /// Launch the Kanban TUI (default)
     Tui,
     /// Print recent events from the audit log (headless observability)
@@ -309,6 +316,7 @@ fn main() -> anyhow::Result<()> {
     let _guard = obs::init_tracing(&dir.join("logs"));
 
     match cli.cmd.unwrap_or(Cmd::Tui) {
+        Cmd::BrowserVerdict { file, expected } => browser_verdict::check(&file, expected)?,
         Cmd::Tui => app::run(dir)?,
         Cmd::Events { n } => {
             let s = store::Store::open(&dir.join("agentmaster.db"))?;

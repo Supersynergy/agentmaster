@@ -4,6 +4,13 @@ All notable changes to agentmaster are documented here. Newest first.
 
 ## [Unreleased]
 
+### Added: strict browser verdict receipts
+- Added `browser-verdict FILE [--expected true|false]`: accepts only transport
+  success and the expected boolean assertion, with a 1 MiB bound and a SHA-256
+  receipt. Browser oracles can now reject `ok:true, verdict:false` explicitly.
+- Documented immutable assertions, source-bound measurement receipts and the
+  separation between provider usage, byte proxies and installed/runtime proof.
+
 ### Added — lean llmadapter ensemble
 - Added opt-in `ensemble`: local lanes by default, explicit remote/paid consent,
   a requested output ceiling of at most 500 tokens, bounded process/oracle
