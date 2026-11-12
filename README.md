@@ -5,7 +5,7 @@ agentmaster lets one human see and steer many coding agents from one terminal:
 real-time status, human-readable task titles, transcript peeks, desktop alerts,
 and zero orchestration tax.
 
-![agentmaster social preview](docs/assets/social-preview.png)
+![AgentMaster](docs/assets/social-preview.png)
 
 ![Rust](https://img.shields.io/badge/Rust-1.95%2B-f46623)
 ![License](https://img.shields.io/badge/license-MIT-blue)
