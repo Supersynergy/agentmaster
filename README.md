@@ -11,6 +11,8 @@ and zero orchestration tax.
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Status](https://img.shields.io/badge/status-active-20c997)
 
+[🚀 Install](#install) · [▶️ Quick start](#quick-start) · [⌨️ Keys](#keys) · [🤖 CLI](#cli) · [🏗️ Architecture](#architecture)
+
 ## Why
 
 Most multi-agent setups spend tokens asking an LLM orchestrator what is running,
@@ -86,6 +88,9 @@ agentmaster batch tasks.md --yes
 
 ## Lean llmadapter ensembles
 
+<details>
+<summary>Read the background and detailed guidance</summary>
+
 `ensemble` is an opt-in bridge for a small llmadapter swarm. AgentMaster stays
 the controller: it gives every lane the same bounded task, saves each answer as
 a private artifact, runs your oracle against answers one by one, and stops at
@@ -159,6 +164,9 @@ constructed 4,000-line log payload from 184,497 to 852 bytes (99.5382%) after
 local projection while preserving the executable oracle inputs. This is a
 payload-capacity case study, not a provider-token, cost, quality, or end-to-end
 latency claim.
+
+
+</details>
 
 ## Keys
 
