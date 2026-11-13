@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/social-preview.png" alt="AgentMaster" width="960">
+</p>
+
 # agentmaster
 
 **TUI command center for Claude Code, Codex, tmux and cmux agent fleets.**
@@ -5,7 +9,6 @@ agentmaster lets one human see and steer many coding agents from one terminal:
 real-time status, human-readable task titles, transcript peeks, desktop alerts,
 and zero orchestration tax.
 
-![AgentMaster](docs/assets/social-preview.png)
 
 ![Rust](https://img.shields.io/badge/Rust-1.95%2B-f46623)
 ![License](https://img.shields.io/badge/license-MIT-blue)
