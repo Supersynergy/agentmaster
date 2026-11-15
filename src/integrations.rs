@@ -1,7 +1,7 @@
 //! Cross-runtime inventory and explicit CLI bridges.
 //!
 //! AgentMaster owns fleet discovery and steering. Codex, Hermes, ggcoder,
-//! GGAdapter, LLMadapter, and cmux keep ownership of their own command
+//! SyCAdapter, LLMadapter, and cmux keep ownership of their own command
 //! contracts. This module only composes read-only probes and forwards an
 //! operator-supplied command to an allow-listed binary.
 
@@ -22,12 +22,7 @@ use crate::runtime;
 use crate::store::Store;
 
 const ADAPTER_PROBES: &[(&str, &str, &[&str])] = &[
-    ("ggadapter-patches", "ggadapter", &["status"]),
-    (
-        "ggadapter-broker",
-        "ggadapter",
-        &["broker", "health", "--json"],
-    ),
+    ("sycadapter", "sycadapter", &["--help"]),
     ("llmadapter", "llmadapter", &["lanes"]),
 ];
 
@@ -40,7 +35,7 @@ pub const CONTROL_BINARIES: &[&str] = &[
     "codex",
     "hermes",
     "ggcoder",
-    "ggadapter",
+    "sycadapter",
     "llmadapter",
     "cac",
     "callagent",
@@ -81,66 +76,17 @@ fn summary_degraded(summary: &str) -> bool {
         .any(|marker| summary.contains(marker))
 }
 
-fn broker_health_summary(stdout: &[u8]) -> (String, bool) {
-    let Ok(value) = serde_json::from_slice::<Value>(stdout) else {
-        return ("broker health returned non-JSON".to_string(), true);
-    };
-    let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
-    let version = value
-        .get("ggcoderVersion")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let auth = value
-        .get("auth")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let expired = auth
+// Inspect the advertised CLI contract without starting a session or a server.
+fn sycadapter_summary(stdout: &[u8]) -> (&'static str, bool) {
+    let help = String::from_utf8_lossy(stdout);
+    if ["rpc", "apply", "/v1/models", "/v1/responses"]
         .iter()
-        .filter(|provider| {
-            provider
-                .get("expired")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        })
-        .count();
-    (
-        format!(
-            "broker={} ggcoder={} providers={} expired={expired}",
-            if ok { "ok" } else { "FAIL" },
-            version,
-            auth.len()
-        ),
-        !ok || expired > 0,
-    )
-}
-
-fn broker_sessions_summary(stdout: &[u8], cwd: &Path) -> (String, bool) {
-    let Ok(value) = serde_json::from_slice::<Value>(stdout) else {
-        return ("broker sessions returned non-JSON".to_string(), true);
-    };
-    let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
-    let sessions = value
-        .get("sessions")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let latest = sessions
-        .first()
-        .and_then(|session| session.get("mtime"))
-        .and_then(Value::as_str)
-        .unwrap_or("none");
-    let project = cwd
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(".");
-    (
-        format!(
-            "project={project} sessions={} latest={latest}",
-            sessions.len()
-        ),
-        !ok,
-    )
+        .all(|capability| help.contains(capability))
+    {
+        ("CLI advertises RPC, apply and loopback HTTP", true)
+    } else {
+        ("unrecognized SyCAdapter CLI contract", false)
+    }
 }
 
 struct Captured {
@@ -267,18 +213,19 @@ fn probe(name: &str, binary: &str, args: &[&str]) -> Value {
         .join(" ");
     match run_bounded(&path, args, Duration::from_secs(4)) {
         Ok(output) => {
-            let (summary, broker_degraded) = if name == "ggadapter-broker" {
-                broker_health_summary(&output.stdout)
+            let (summary, valid_contract) = if name == "sycadapter" {
+                let (summary, valid) = sycadapter_summary(&output.stdout);
+                (summary.to_owned(), valid)
             } else {
-                (compact_output(&output.stdout, &output.stderr), false)
+                (compact_output(&output.stdout, &output.stderr), true)
             };
             json!({
                 "name": name,
                 "command": command,
                 "path": path,
                 "available": true,
-                "ok": output.status.success(),
-                "degraded": summary_degraded(&summary) || broker_degraded,
+                "ok": output.status.success() && valid_contract,
+                "degraded": summary_degraded(&summary) || !valid_contract,
                 "exit_code": output.status.code(),
                 "summary": summary
             })
@@ -375,11 +322,10 @@ pub fn runtime_doctor(verbose: bool) {
 }
 
 fn adapter_inventory() -> Vec<Value> {
-    let mut handles = ADAPTER_PROBES
+    let handles = ADAPTER_PROBES
         .iter()
         .map(|(name, binary, args)| thread::spawn(move || probe(name, binary, args)))
         .collect::<Vec<_>>();
-    handles.push(thread::spawn(ggadapter_sessions_probe));
     handles
         .into_iter()
         .map(|handle| {
@@ -388,57 +334,6 @@ fn adapter_inventory() -> Vec<Value> {
                 .unwrap_or_else(|_| json!({"available": false}))
         })
         .collect()
-}
-
-fn ggadapter_sessions_probe() -> Value {
-    let Some(path) = executable_on_path("ggadapter") else {
-        return json!({
-            "name": "ggadapter-sessions",
-            "command": "ggadapter broker sessions",
-            "path": null,
-            "available": false,
-            "ok": false,
-            "degraded": true,
-            "exit_code": null,
-            "summary": "not found on PATH"
-        });
-    };
-    let cwd = env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
-    let cwd_text = cwd.to_string_lossy().into_owned();
-    let args = [
-        "broker",
-        "sessions",
-        "--cwd",
-        cwd_text.as_str(),
-        "--limit",
-        "5",
-        "--json",
-    ];
-    match run_bounded(&path, &args, Duration::from_secs(4)) {
-        Ok(output) => {
-            let (summary, malformed) = broker_sessions_summary(&output.stdout, &cwd);
-            json!({
-                "name": "ggadapter-sessions",
-                "command": "ggadapter broker sessions --cwd <current> --limit 5 --json",
-                "path": path,
-                "available": true,
-                "ok": output.status.success(),
-                "degraded": malformed,
-                "exit_code": output.status.code(),
-                "summary": summary
-            })
-        }
-        Err(error) => json!({
-            "name": "ggadapter-sessions",
-            "command": "ggadapter broker sessions --cwd <current> --limit 5 --json",
-            "path": path,
-            "available": true,
-            "ok": false,
-            "degraded": true,
-            "exit_code": null,
-            "summary": format!("probe failed: {error}")
-        }),
-    }
 }
 
 fn tmux_inventory() -> (Vec<Value>, Value) {
@@ -733,7 +628,7 @@ pub fn doctor(dir: &Path) {
 pub fn control(target: &str, args: &[String]) -> Result<()> {
     let target = match target {
         "history" => "chathistory",
-        "gg-adapter" => "ggadapter",
+        "syc-adapter" => "sycadapter",
         "llm-adapter" => "llmadapter",
         other => other,
     };
@@ -745,7 +640,7 @@ pub fn control(target: &str, args: &[String]) -> Result<()> {
     }
     if args.is_empty() {
         let default_args: &[&str] = match target {
-            "ggadapter" => &["status"],
+            "sycadapter" => &["--help"],
             "llmadapter" => &["doctor"],
             "cmux" => &["capabilities"],
             _ => bail!("control {target} requires an explicit subcommand/argument"),
@@ -755,6 +650,12 @@ pub fn control(target: &str, args: &[String]) -> Result<()> {
             bail!("{target} exited with {}", status.code().unwrap_or(1));
         }
         return Ok(());
+    }
+    // A foreground HTTP/RPC adapter must receive the caller's signals directly.
+    #[cfg(unix)]
+    if target == "sycadapter" {
+        use std::os::unix::process::CommandExt;
+        return Err(Command::new(target).args(args).exec().into());
     }
     let status = Command::new(target).args(args).status()?;
     if !status.success() {
@@ -784,7 +685,7 @@ mod tests {
             "codex",
             "hermes",
             "ggcoder",
-            "ggadapter",
+            "sycadapter",
             "llmadapter",
         ] {
             assert!(CONTROL_BINARIES.contains(&target), "missing {target}");
@@ -799,23 +700,10 @@ mod tests {
     }
 
     #[test]
-    fn broker_health_summary_redacts_account_details_and_surfaces_expiry() {
-        let raw = br#"{"ok":true,"ggcoderVersion":"5.30.3","auth":[{"provider":"openai","expired":true,"accountId":"secret"}]}"#;
-        let (summary, degraded) = broker_health_summary(raw);
-        assert!(degraded);
-        assert!(summary.contains("ggcoder=5.30.3"));
-        assert!(summary.contains("expired=1"));
-        assert!(!summary.contains("secret"));
-    }
-
-    #[test]
-    fn broker_session_summary_keeps_only_count_project_and_mtime() {
-        let raw = br#"{"ok":true,"sessions":[{"id":"secret-session","file":"/secret/path","mtime":"2026-08-01T12:00:00Z"}]}"#;
-        let (summary, degraded) = broker_sessions_summary(raw, Path::new("/tmp/project"));
-        assert!(!degraded);
-        assert!(summary.contains("project=project sessions=1"));
-        assert!(summary.contains("latest=2026-08-01T12:00:00Z"));
-        assert!(!summary.contains("secret-session"));
-        assert!(!summary.contains("/secret/path"));
+    fn sycadapter_probe_requires_the_advertised_interfaces() {
+        assert!(sycadapter_summary(b"rpc apply /v1/models /v1/responses").1);
+        assert!(!sycadapter_summary(b"rpc apply").1);
+        assert!(!sycadapter_summary(b"").1);
+        assert!(!CONTROL_BINARIES.contains(&"ggadapter"));
     }
 }

@@ -764,9 +764,7 @@ pub fn assign_with_model(
         anyhow::bail!("workspace name resolved to empty; pass --name <slug>");
     }
     let spec = crate::runtime::resolve_with_model(runtime, Some(task), model);
-    let mut launch = vec![spec.program];
-    launch.extend(spec.args);
-    let launch_cmd = launch.join(" ");
+    let launch_cmd = crate::swarm::shell_command(&spec);
     let workdir = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".into());
@@ -838,33 +836,24 @@ pub fn models_list(tier: Option<&str>, json: bool) -> Result<()> {
         .filter(|m| filter.is_none_or(|t| m.tier == t))
         .collect();
     if json {
-        let items: Vec<String> = rows
-            .iter()
-            .map(|m| {
-                format!(
-                    "{{\"name\":{},\"runtime\":{},\"model\":{},\"vendor\":{},\"tier\":{},\"input\":{},\"output\":{},\"context\":{},\"strengths\":[{}],\"weaknesses\":[{}],\"best_for\":[{}]}}",
-                    json_escape(m.name),
-                    json_escape(m.runtime),
-                    json_escape(m.model_flag),
-                    json_escape(m.vendor),
-                    json_escape(&m.tier.to_string()),
-                    m.input_price,
-                    m.output_price,
-                    m.context_window,
-                    m.strengths.iter().map(|s| json_escape(s)).collect::<Vec<_>>().join(","),
-                    m.weaknesses.iter().map(|s| json_escape(s)).collect::<Vec<_>>().join(","),
-                    m.best_for.iter().map(|t| json_escape(&t.to_string())).collect::<Vec<_>>().join(","),
-                )
-            })
-            .collect();
-        println!("[{}]", items.join(","));
+        let items: Vec<_> = rows.iter().map(|m| serde_json::json!({
+            "name": m.name, "runtime": m.runtime, "model": m.model_flag, "vendor": m.vendor,
+            "tier": m.tier.to_string(), "input": m.input_price, "output": m.output_price,
+            "context": m.context_window, "strengths": m.strengths, "weaknesses": m.weaknesses,
+            "best_for": m.best_for.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "price_date": crate::router::PRICING_DATE, "price_source": m.price_source, "price_basis": m.price_basis,
+        })).collect();
+        println!("{}", serde_json::to_string(&items)?);
         return Ok(());
     }
     if rows.is_empty() {
         println!("no models match tier '{tier:?}'");
         return Ok(());
     }
-    println!("MODEL REGISTRY (2026-07 pricing, USD per 1M tokens)");
+    println!(
+        "MODEL REGISTRY ({} standard API reference rates, USD per 1M tokens)",
+        crate::router::PRICING_DATE
+    );
     println!(
         "{:<20} {:<10} {:<18} {:<14} {:>7} {:>7} {:>10}",
         "NAME", "RUNTIME", "MODEL FLAG", "TIER", "IN", "OUT", "BLEND"
@@ -881,6 +870,7 @@ pub fn models_list(tier: Option<&str>, json: bool) -> Result<()> {
             m.output_price,
             m.blended_cost()
         );
+        println!("    pricing   : {} · {}", m.price_basis, m.price_source);
         println!("    strengths : {}", m.strengths.join(", "));
         println!("    weaknesses: {}", m.weaknesses.join(", "));
         println!(

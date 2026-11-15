@@ -92,8 +92,9 @@ agentmaster send native:7 "run the focused test"
 agentmaster focus native:7           # select that PTY in the running TUI
 
 # Explicit bridges to the existing local control CLIs
-agentmaster control ggadapter status
-agentmaster control ggadapter broker sessions --cwd "$PWD" --json
+agentmaster control sycadapter --help
+agentmaster control sycadapter --model gpt-6-luna  # foreground loopback HTTP server
+agentmaster control sycadapter rpc                # native SynergyCoder stdio
 agentmaster control llmadapter lanes
 agentmaster control cmux list-workspaces
 agentmaster control hermes --help
@@ -110,8 +111,8 @@ agentmaster prompts links doctor --json
 agentmaster prompts links search "prompt evaluation"
 agentmaster prompts links show promptfoo --json
 
-# Explicit Luna worker; model is passed through, never auto-selected
-agentmaster assign codex --model gpt-5.6-luna --name luna-audit "read-only audit"
+# Start a Codex worker with an explicit model
+agentmaster assign codex --model gpt-6-luna --name luna-audit "read-only audit"
 
 # Goals and fan-out
 agentmaster goal payments-api ship checkout :: all e2e tests green

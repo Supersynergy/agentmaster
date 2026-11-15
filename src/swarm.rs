@@ -667,7 +667,7 @@ impl PrivateCapture {
     }
 }
 
-fn shell_command(spec: &crate::runtime::RuntimeSpec) -> String {
+pub(crate) fn shell_command(spec: &crate::runtime::RuntimeSpec) -> String {
     std::iter::once(&spec.program)
         .chain(spec.args.iter())
         .map(|word| shell_word(word))
@@ -1164,6 +1164,8 @@ mod tests {
         runtime: "/usr/bin/false",
         model_flag: "unused",
         vendor: "test",
+        price_source: "",
+        price_basis: "",
         tier: Tier::OpenWeight,
         input_price: 0.0,
         output_price: 0.0,
@@ -1178,6 +1180,8 @@ mod tests {
         runtime: "/usr/bin/yes",
         model_flag: "unused",
         vendor: "test",
+        price_source: "",
+        price_basis: "",
         tier: Tier::OpenWeight,
         input_price: 0.0,
         output_price: 0.0,

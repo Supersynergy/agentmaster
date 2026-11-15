@@ -1,7 +1,7 @@
 //! Model registry + task classifier + auto-router.
 //!
 //! The single seam where "which model for this task?" becomes a machine
-//! decision, not a human guess. Static table of 2026-07 model pricing +
+//! decision, not a human guess. Dated table of provider API pricing +
 //! strengths/weaknesses, a keyword-based task classifier, and pick functions
 //! that return the cheapest passing model for a task type — or a diverse
 //! swarm of N models for oracle-gated convergence.
@@ -69,6 +69,8 @@ pub struct ModelSpec {
     pub model_flag: &'static str,
     pub vendor: &'static str,
     pub tier: Tier,
+    pub price_source: &'static str,
+    pub price_basis: &'static str,
     pub input_price: f64,
     pub output_price: f64,
     pub context_window: usize,
@@ -86,103 +88,76 @@ impl ModelSpec {
     }
 }
 
-/// The 2026-07 model registry. Prices are USD per 1M tokens (input/output),
-/// sourced from the token-cfo pricing table (2026-07-23). Adding a model =
-/// one row. The router never reads from a remote API — this table is the
-/// single source of truth for cost-ladder decisions.
+/// Published rates for uncached text, in USD per million tokens.
+/// Tariffs are planning inputs. A local CLI subscription can bill differently.
+pub const PRICING_DATE: &str = "2026-11-15";
 pub static REGISTRY: &[ModelSpec] = &[
-    // --- Frontier (closed) --------------------------------------------------
     ModelSpec {
-        name: "claude-fable-5",
-        runtime: "claude",
-        model_flag: "claude-fable-5",
-        vendor: "Anthropic",
-        tier: Tier::Frontier,
-        input_price: 15.0,
-        output_price: 75.0,
-        context_window: 200_000,
-        strengths: &[
-            "deep reasoning",
-            "agentic loops",
-            "code generation",
-            "long-context synthesis",
-        ],
-        weaknesses: &["expensive", "slow for trivial tasks"],
-        best_for: &[
-            TaskType::CodeGeneration,
-            TaskType::Planning,
-            TaskType::LongContext,
-            TaskType::CodeReview,
-        ],
-    },
-    ModelSpec {
-        name: "gpt-5.6",
+        name: "gpt-6-astra",
         runtime: "codex",
-        model_flag: "gpt-5.6",
+        model_flag: "gpt-6-astra",
         vendor: "OpenAI",
         tier: Tier::Frontier,
+        price_source: "https://developers.openai.com/api/docs/pricing",
+        price_basis: "Standard, short context (up to 272K input tokens)",
         input_price: 10.0,
-        output_price: 40.0,
-        context_window: 400_000,
-        strengths: &[
-            "code generation",
-            "tool use",
-            "fast frontier",
-            "wide knowledge",
+        output_price: 50.0,
+        context_window: 1_050_000,
+        strengths: &["multi-step reasoning"],
+        weaknesses: &["higher latency"],
+        best_for: &[
+            TaskType::Planning,
+            TaskType::CodeReview,
+            TaskType::LongContext,
         ],
-        weaknesses: &["expensive", "less agentic than Claude"],
+    },
+    ModelSpec {
+        name: "gpt-6.1-sol",
+        runtime: "codex",
+        model_flag: "gpt-6.1-sol",
+        vendor: "OpenAI",
+        tier: Tier::Frontier,
+        price_source: "https://developers.openai.com/api/docs/pricing",
+        price_basis: "Standard, short context (up to 272K input tokens)",
+        input_price: 2.0,
+        output_price: 10.0,
+        context_window: 1_050_000,
+        strengths: &["software engineering"],
+        weaknesses: &["higher rate than Luna"],
         best_for: &[
             TaskType::CodeGeneration,
-            TaskType::Research,
+            TaskType::CodeReview,
             TaskType::Planning,
         ],
     },
     ModelSpec {
-        name: "gemini-3.1-pro",
-        runtime: "gemini",
-        model_flag: "gemini-3.1-pro",
-        vendor: "Google",
-        tier: Tier::Frontier,
-        input_price: 7.0,
-        output_price: 21.0,
-        context_window: 2_000_000,
-        strengths: &["longest context (2M)", "multimodal", "cheap frontier"],
-        weaknesses: &["less agentic", "tool use weaker than Claude"],
-        best_for: &[
-            TaskType::LongContext,
-            TaskType::Research,
-            TaskType::Creative,
-        ],
-    },
-    // --- Mid-tier -----------------------------------------------------------
-    ModelSpec {
-        name: "claude-sonnet-4.6",
-        runtime: "claude",
-        model_flag: "claude-sonnet-4.6",
-        vendor: "Anthropic",
-        tier: Tier::Mid,
-        input_price: 3.0,
-        output_price: 15.0,
-        context_window: 200_000,
-        strengths: &["agentic", "code review", "balanced cost/quality"],
-        weaknesses: &["weaker than Fable on deep reasoning"],
-        best_for: &[
-            TaskType::CodeReview,
-            TaskType::CodeGeneration,
-            TaskType::Verification,
-        ],
-    },
-    ModelSpec {
-        name: "gpt-5.6-mini",
+        name: "gpt-6.1-terra",
         runtime: "codex",
-        model_flag: "gpt-5.6-mini",
+        model_flag: "gpt-6.1-terra",
         vendor: "OpenAI",
         tier: Tier::Mid,
-        input_price: 0.40,
-        output_price: 1.60,
-        context_window: 200_000,
-        strengths: &["very cheap mid-tier", "fast", "good for shell projection"],
-        weaknesses: &["weaker on complex code"],
+        price_source: "https://developers.openai.com/api/docs/pricing",
+        price_basis: "Standard, short context (up to 272K input tokens)",
+        input_price: 1.0,
+        output_price: 5.0,
+        context_window: 1_050_000,
+        strengths: &["visual reasoning and scoped edits"],
+        weaknesses: &["complex planning may need a larger model"],
+        best_for: &[TaskType::CodeGeneration, TaskType::Verification],
+    },
+    ModelSpec {
+        name: "gpt-6-luna",
+        runtime: "codex",
+        model_flag: "gpt-6-luna",
+        vendor: "OpenAI",
+        tier: Tier::Mid,
+        price_source: "https://developers.openai.com/api/docs/pricing",
+        price_basis: "Standard, short context (up to 272K input tokens)",
+        input_price: 0.1,
+        output_price: 0.5,
+        context_window: 1_050_000,
+        strengths: &["focused high-volume tasks"],
+        weaknesses: &["limited suitability for complex planning"],
         best_for: &[
             TaskType::ShellProjection,
             TaskType::Verification,
@@ -190,51 +165,155 @@ pub static REGISTRY: &[ModelSpec] = &[
         ],
     },
     ModelSpec {
-        name: "gemini-3.1-flash",
-        runtime: "gemini",
-        model_flag: "gemini-3.1-flash",
-        vendor: "Google",
-        tier: Tier::Mid,
-        input_price: 0.35,
-        output_price: 1.50,
+        name: "claude-fable-5-2",
+        runtime: "claude",
+        model_flag: "claude-fable-5-2",
+        vendor: "Anthropic",
+        tier: Tier::Frontier,
+        price_source: "https://platform.claude.com/docs/en/about-claude/pricing",
+        price_basis: "Base tokens, standard inference",
+        input_price: 8.0,
+        output_price: 40.0,
         context_window: 1_000_000,
-        strengths: &["cheapest mid-tier", "1M context", "fast"],
-        weaknesses: &["weaker agentic", "less reliable for code gen"],
+        strengths: &["long-horizon reasoning"],
+        weaknesses: &["higher cost"],
+        best_for: &[TaskType::Planning, TaskType::LongContext],
+    },
+    ModelSpec {
+        name: "claude-opus-5-5",
+        runtime: "claude",
+        model_flag: "claude-opus-5-5",
+        vendor: "Anthropic",
+        tier: Tier::Frontier,
+        price_source: "https://platform.claude.com/docs/en/about-claude/pricing",
+        price_basis: "Base tokens, standard inference",
+        input_price: 4.0,
+        output_price: 20.0,
+        context_window: 1_000_000,
+        strengths: &["long-running agentic coding"],
+        weaknesses: &["higher cost"],
         best_for: &[
-            TaskType::Research,
-            TaskType::LongContext,
-            TaskType::ShellProjection,
+            TaskType::Planning,
+            TaskType::CodeGeneration,
+            TaskType::CodeReview,
         ],
     },
-    // --- Open-weight (cheapest lanes) ---------------------------------------
+    ModelSpec {
+        name: "claude-sonnet-5-5",
+        runtime: "claude",
+        model_flag: "claude-sonnet-5-5",
+        vendor: "Anthropic",
+        tier: Tier::Mid,
+        price_source: "https://platform.claude.com/docs/en/about-claude/pricing",
+        price_basis: "Base tokens, standard inference",
+        input_price: 2.0,
+        output_price: 10.0,
+        context_window: 1_000_000,
+        strengths: &["coding and review"],
+        weaknesses: &["higher rate than Haiku"],
+        best_for: &[
+            TaskType::CodeGeneration,
+            TaskType::CodeReview,
+            TaskType::Creative,
+        ],
+    },
+    ModelSpec {
+        name: "claude-haiku-5-5",
+        runtime: "claude",
+        model_flag: "claude-haiku-5-5",
+        vendor: "Anthropic",
+        tier: Tier::Mid,
+        price_source: "https://platform.claude.com/docs/en/about-claude/pricing",
+        price_basis: "Base tokens, standard inference, up to 100K input tokens",
+        input_price: 0.1,
+        output_price: 0.5,
+        context_window: 1_000_000,
+        strengths: &["fast extraction and classification"],
+        weaknesses: &["higher rates above 100K input tokens"],
+        best_for: &[TaskType::General, TaskType::Verification],
+    },
+    ModelSpec {
+        name: "gemini-4-carbon",
+        runtime: "gemini",
+        model_flag: "gemini-4-carbon",
+        vendor: "Google",
+        tier: Tier::Frontier,
+        price_source: "https://ai.google.dev/gemini-api/docs/pricing",
+        price_basis: "Standard paid tier through 2026-11-30",
+        input_price: 2.0,
+        output_price: 10.0,
+        context_window: 1_000_000,
+        strengths: &["multimodal research and reasoning"],
+        weaknesses: &["promotional pricing"],
+        best_for: &[
+            TaskType::Research,
+            TaskType::Planning,
+            TaskType::LongContext,
+            TaskType::Creative,
+        ],
+    },
+    ModelSpec {
+        name: "gemini-4-argon",
+        runtime: "gemini",
+        model_flag: "gemini-4-argon",
+        vendor: "Google",
+        tier: Tier::Frontier,
+        price_source: "https://ai.google.dev/gemini-api/docs/pricing",
+        price_basis: "Standard paid tier through 2026-11-30",
+        input_price: 2.0,
+        output_price: 10.0,
+        context_window: 1_000_000,
+        strengths: &["efficient multimodal reasoning"],
+        weaknesses: &["promotional pricing"],
+        best_for: &[
+            TaskType::Research,
+            TaskType::CodeGeneration,
+            TaskType::LongContext,
+        ],
+    },
+    ModelSpec {
+        name: "gemini-4-hydrogen",
+        runtime: "gemini",
+        model_flag: "gemini-4-hydrogen",
+        vendor: "Google",
+        tier: Tier::Mid,
+        price_source: "https://ai.google.dev/gemini-api/docs/pricing",
+        price_basis: "Standard paid tier",
+        input_price: 1.5,
+        output_price: 7.5,
+        context_window: 1_000_000,
+        strengths: &["interactive multimodal tasks"],
+        weaknesses: &["tool use can incur additional costs"],
+        best_for: &[TaskType::Research, TaskType::LongContext, TaskType::General],
+    },
     ModelSpec {
         name: "glm-5.2",
         runtime: "hermes",
         model_flag: "glm-5.2",
-        vendor: "Zhipu",
+        vendor: "Z.ai",
         tier: Tier::OpenWeight,
-        input_price: 0.30,
-        output_price: 1.10,
-        context_window: 128_000,
-        strengths: &["cheap", "good code generation", "open-weight"],
-        weaknesses: &["weaker agentic", "smaller context"],
-        best_for: &[
-            TaskType::CodeGeneration,
-            TaskType::ShellProjection,
-            TaskType::General,
-        ],
+        price_source: "https://docs.z.ai/guides/overview/pricing",
+        price_basis: "Standard, uncached input",
+        input_price: 1.4,
+        output_price: 4.4,
+        context_window: 1_000_000,
+        strengths: &["long-horizon coding"],
+        weaknesses: &["runtime provider must expose this model"],
+        best_for: &[TaskType::CodeGeneration, TaskType::Planning],
     },
     ModelSpec {
-        name: "deepseek-v4.5",
+        name: "deepseek-flash",
         runtime: "hermes",
-        model_flag: "deepseek-v4.5",
+        model_flag: "deepseek-flash",
         vendor: "DeepSeek",
         tier: Tier::OpenWeight,
-        input_price: 0.28,
-        output_price: 1.10,
-        context_window: 128_000,
-        strengths: &["cheapest strong coder", "open-weight", "good reasoning"],
-        weaknesses: &["weaker agentic", "smaller context"],
+        price_source: "https://api-docs.deepseek.com/quick_start/pricing/",
+        price_basis: "Peak, cache miss",
+        input_price: 0.3,
+        output_price: 1.2,
+        context_window: 1_000_000,
+        strengths: &["coding and fast reasoning"],
+        weaknesses: &["price varies by time of day"],
         best_for: &[
             TaskType::CodeGeneration,
             TaskType::CodeReview,
@@ -242,67 +321,56 @@ pub static REGISTRY: &[ModelSpec] = &[
         ],
     },
     ModelSpec {
-        name: "kimi-k3",
+        name: "kimi-k3.1-pro",
         runtime: "hermes",
-        model_flag: "kimi-k3",
+        model_flag: "kimi-k3.1-pro",
         vendor: "Moonshot",
         tier: Tier::OpenWeight,
-        input_price: 0.20,
-        output_price: 0.80,
-        context_window: 256_000,
-        strengths: &[
-            "cheapest lane",
-            "long context (256k)",
-            "good for shell projection",
-        ],
-        weaknesses: &["weakest reasoning", "not for complex code gen"],
+        price_source: "https://platform.kimi.ai/docs/pricing/chat",
+        price_basis: "Standard Kimi API base tokens",
+        input_price: 2.0,
+        output_price: 10.0,
+        context_window: 1_048_576,
+        strengths: &["long-horizon coding"],
+        weaknesses: &["cache writes priced separately"],
         best_for: &[
-            TaskType::ShellProjection,
-            TaskType::General,
-            TaskType::Verification,
+            TaskType::Planning,
+            TaskType::CodeGeneration,
+            TaskType::LongContext,
         ],
     },
     ModelSpec {
         name: "kimi-worker",
         runtime: "kimi-worker",
-        model_flag: "kimi-k3",
+        model_flag: "kimi-code/k3",
         vendor: "Moonshot",
         tier: Tier::OpenWeight,
-        input_price: 0.20,
-        output_price: 0.80,
-        context_window: 256_000,
-        strengths: &[
-            "lean Kimi child (empty skills dir, exit-75 retry, KIMI_SHARE_DIR isolation)",
-            "cheapest passing lane for shell projection",
-            "measured 16% of Claude team gross input",
-        ],
-        weaknesses: &[
-            "weakest reasoning",
-            "not for complex code gen",
-            "requires agent-token-saver install",
-        ],
+        price_source: "https://platform.kimi.ai/docs/pricing/chat",
+        price_basis: "Kimi K3 API reference rate; Kimi Code subscription billed separately",
+        input_price: 3.0,
+        output_price: 15.0,
+        context_window: 1_048_576,
+        strengths: &["metered Kimi worker"],
+        weaknesses: &["requires a configured Kimi Code K3 alias"],
         best_for: &[
-            TaskType::ShellProjection,
             TaskType::Verification,
+            TaskType::ShellProjection,
             TaskType::General,
         ],
     },
     ModelSpec {
-        name: "qwen-3-coder",
+        name: "qwen3-coder-plus",
         runtime: "ggcoder",
-        model_flag: "qwen-3-coder",
+        model_flag: "qwen3-coder-plus",
         vendor: "Alibaba",
-        tier: Tier::OpenWeight,
-        input_price: 0.25,
-        output_price: 0.90,
-        context_window: 256_000,
-        strengths: &[
-            "strong code generation",
-            "open-weight",
-            "long context (256k)",
-            "tool use",
-        ],
-        weaknesses: &["weaker agentic than Claude", "less ecosystem than DeepSeek"],
+        tier: Tier::Mid,
+        price_source: "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+        price_basis: "Singapore international deployment, up to 32K input tokens",
+        input_price: 1.0,
+        output_price: 5.0,
+        context_window: 1_000_000,
+        strengths: &["coding and tool use"],
+        weaknesses: &["higher rates for longer inputs"],
         best_for: &[
             TaskType::CodeGeneration,
             TaskType::CodeReview,
@@ -586,16 +654,13 @@ mod tests {
     #[test]
     fn pick_returns_cheapest_passing() {
         let m = pick(TaskType::ShellProjection);
-        // Kimi K3 is the cheapest model that lists ShellProjection in best_for.
-        assert_eq!(m.name, "kimi-k3");
+        assert_eq!(m.name, "gpt-6-luna");
     }
 
     #[test]
     fn pick_code_generation_prefers_cheap() {
         let m = pick(TaskType::CodeGeneration);
-        // Qwen-3-Coder is the cheapest model strong at code generation
-        // (blend $0.41/M vs DeepSeek V4.5 $0.49/M).
-        assert_eq!(m.name, "qwen-3-coder");
+        assert_eq!(m.name, "deepseek-flash");
     }
 
     #[test]
@@ -617,7 +682,7 @@ mod tests {
         let swarm = pick_swarm(TaskType::ShellProjection, 3);
         assert!(!swarm.is_empty());
         // First entry is always the cheapest passing model.
-        assert_eq!(swarm[0].name, "kimi-k3");
+        assert_eq!(swarm[0].name, "gpt-6-luna");
     }
 
     #[test]
@@ -628,7 +693,7 @@ mod tests {
 
     #[test]
     fn pick_swarm_10_fills_all_slots() {
-        // A 10-entity jury requests 10 and gets 10 (REGISTRY has 11 models,
+        // A 10-entity jury requests 10 and gets 10 (REGISTRY has at least 10 models,
         // so 10 is within bounds). The key invariant: the swarm does NOT
         // cap at 4 distinct runtimes — it fills all 10 requested slots.
         let swarm = pick_swarm(TaskType::CodeGeneration, 10);
@@ -670,8 +735,7 @@ mod tests {
                 .partial_cmp(&b.blended_cost())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        // Kimi K3 is the cheapest, Claude Fable 5 is the most expensive.
-        assert_eq!(all.first().unwrap().name, "kimi-k3");
-        assert_eq!(all.last().unwrap().name, "claude-fable-5");
+        assert_eq!(all.first().unwrap().name, "gpt-6-luna");
+        assert_eq!(all.last().unwrap().name, "gpt-6-astra");
     }
 }

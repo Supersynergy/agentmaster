@@ -304,8 +304,8 @@ fn cmux_workspace_from_json(map: &serde_json::Map<String, serde_json::Value>) ->
         match key.as_str() {
             "git" if ws.git.is_none() => ws.git = Some(value),
             "phase" if ws.phase.is_none() => ws.phase = Some(value),
-            "claude" | "codex" | "hermes" | "ggcoder" | "ggadapter" | "gemini" | "cline"
-            | "opencode" | "amp" => {
+            "claude" | "codex" | "hermes" | "ggcoder" | "ggadapter" | "sycadapter" | "gemini"
+            | "cline" | "opencode" | "amp" => {
                 if ws.runtime.is_none() {
                     ws.runtime = Some(key.clone());
                 }
@@ -360,6 +360,7 @@ pub fn parse_cmux_top(s: &str) -> Vec<CmuxWorkspace> {
                 "hermes",
                 "ggcoder",
                 "ggadapter",
+                "sycadapter",
                 "gemini",
                 "cline",
                 "opencode",
@@ -520,20 +521,20 @@ mod tests {
     }
 
     #[test]
-    fn parses_hermes_and_ggadapter_runtime_tags() {
+    fn parses_hermes_and_sycadapter_runtime_tags() {
         let s = r#"
   0.0%  1 B  1  ├── workspace workspace:200 "hermes worker"
   0.0%  1 B  1  │   ├── tag hermes "working"
   0.0%  1 B  1  │   ├── tag hermes_code "Running" pid=2001
-  0.0%  1 B  1  ├── workspace workspace:201 "GGAdapter worker"
-  0.0%  1 B  1  │   ├── tag ggadapter "Needs input"
-  0.0%  1 B  1  │   ├── tag ggadapter_code "Needs input" pid=2002
+  0.0%  1 B  1  ├── workspace workspace:201 "SyCAdapter worker"
+  0.0%  1 B  1  │   ├── tag sycadapter "Needs input"
+  0.0%  1 B  1  │   ├── tag sycadapter_code "Needs input" pid=2002
 "#;
         let workspaces = parse_cmux_top(s);
         assert_eq!(workspaces.len(), 2);
         assert_eq!(workspaces[0].runtime.as_deref(), Some("hermes"));
         assert_eq!(workspaces[0].pid, Some(2001));
-        assert_eq!(workspaces[1].runtime.as_deref(), Some("ggadapter"));
+        assert_eq!(workspaces[1].runtime.as_deref(), Some("sycadapter"));
         assert_eq!(workspaces[1].status, "Needs input");
     }
 }

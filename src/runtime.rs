@@ -117,9 +117,12 @@ pub fn resolve_with_model(runtime: &str, task: Option<&str>, model: Option<&str>
             spec.args
                 .splice(0..0, ["--model".to_string(), model.to_string()]);
         }
-        // The lean worker's registry entry is fixed to `kimi-k3`; its wrapper
-        // accepts alternate aliases only via KIMI_WORKER_MODEL, not argv.
-        "kimi-worker" => {}
+        // kimi-worker consumes its model alias from the environment, not argv.
+        "kimi-worker" => {
+            spec.args
+                .splice(0..0, [format!("KIMI_WORKER_MODEL={model}"), spec.program]);
+            spec.program = "env".into();
+        }
         _ => {}
     }
     spec
@@ -242,8 +245,12 @@ mod tests {
     fn model_flag_precedes_the_prompt_for_supported_runtimes() {
         let spec = resolve_with_model("codex", Some("fix tests"), Some("gpt-5.6"));
         assert_eq!(spec.args, ["--model", "gpt-5.6", "fix tests"]);
-        let worker = resolve_with_model("kimi-worker", Some("fix tests"), Some("kimi-k3"));
-        assert_eq!(worker.args, ["fix tests"]);
+        let worker = resolve_with_model("kimi-worker", Some("fix tests"), Some("kimi-code/k3"));
+        assert_eq!(worker.program, "env");
+        assert_eq!(
+            worker.args,
+            ["KIMI_WORKER_MODEL=kimi-code/k3", "kimi-worker", "fix tests"]
+        );
     }
 
     #[test]

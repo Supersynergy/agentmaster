@@ -4,6 +4,9 @@ All notable changes to agentmaster are documented here. Newest first.
 
 ## [Unreleased]
 
+- Switched adapter inventory and control to SyCAdapter. The inventory checks its CLI capabilities without opening a session.
+- Updated model IDs and published API rates on 2026-11-15. The model list includes the pricing date, source and tariff basis.
+
 - Added local chat archive and APU forwarding through `control history` and `control apu`.
 
 ### Added: strict browser verdict receipts

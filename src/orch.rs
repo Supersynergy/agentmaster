@@ -215,9 +215,7 @@ pub fn batch(tasks: &[Task], default_model: Option<&str>, yes: bool) -> Result<u
         let model = t.model.as_deref().or(default_model);
         let runtime_name = t.runtime.as_deref().unwrap_or("claude");
         let spec = crate::runtime::resolve_with_model(runtime_name, Some(&t.prompt), model);
-        let mut launch = vec![spec.program];
-        launch.extend(spec.args);
-        let launch_cmd = launch.join(" ");
+        let launch_cmd = crate::swarm::shell_command(&spec);
         if !yes {
             println!(
                 "[dry] {:02} {}  runtime={}  cwd={}  model={}",

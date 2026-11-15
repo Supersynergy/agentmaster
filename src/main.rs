@@ -74,7 +74,7 @@ enum Cmd {
         json: bool,
     },
     /// Forward an explicit command to a known local control surface.
-    /// Examples: `control ggadapter status`, `control llmadapter lanes`,
+    /// Examples: `control sycadapter --help`, `control llmadapter lanes`,
     /// `control cmux list-workspaces`, `control hermes --help`.
     Control {
         target: String,
@@ -123,130 +123,14 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Steer one live agent: send a line to a `workspace:NN` or tmux `sess:win.pane`.
-    /// `--goal <name>` also pins a goal on that agent name (same as `goal` subcommand,
-    /// but combined so you can steer + pin in one shot).
-    Send {
-        /// agent ref: native `native:ID`, cmux `workspace:NN`, or tmux `session:window.pane`
-        target: String,
-        /// the message (remaining words are joined)
-        #[arg(trailing_var_arg = true, required = true)]
-        message: Vec<String>,
-        #[arg(long)]
-        goal: Option<String>,
-        #[arg(long)]
-        dod: Option<String>,
-        /// wait for the agent's next assistant response (timeout in seconds)
-        #[arg(long, default_value_t = 0)]
-        wait: u64,
-    },
-    /// Deliver Ctrl-C without closing a native PTY, cmux workspace, or tmux pane.
-    Interrupt { target: String },
-    /// Broadcast a line to every live agent (native/cmux always; tmux with --tmux)
-    Broadcast {
-        #[arg(trailing_var_arg = true, required = true)]
-        message: Vec<String>,
-        #[arg(long)]
-        tmux: bool,
-        /// only status-aware agents currently waiting on input
-        #[arg(long)]
-        needs_input: bool,
-    },
-    /// Pin a goal on an agent name; the TUI rehydrates it. Use `::` to add a
-    /// definition-of-done:  goal <name> ship it :: all tests pass
-    /// Optional omnigoal lifecycle flags turn this into an oracle-gated goal:
-    ///   goal <name> ship it :: tests pass --oracle "cargo test -q" --budget 20000
-    Goal {
-        name: String,
-        #[arg(trailing_var_arg = true, required = true)]
-        goal: Vec<String>,
-        /// machine-checkable oracle: a shell command that exits 0 iff the goal is done
-        #[arg(long)]
-        oracle: Option<String>,
-        /// token budget cap for this goal (0 = unlimited)
-        #[arg(long, default_value_t = 0)]
-        budget: u64,
-        /// ISO deadline (e.g. 2026-12-31T23:59:59+01:00)
-        #[arg(long)]
-        deadline: Option<String>,
-    },
-    /// Async fan-out: spawn one fresh cmux workspace seeded with the task and
-    /// return immediately. Fire-and-forget like CAO's `assign` primitive — the
-    /// worker is expected to work independently. Log the callback-ref so the
-    /// supervisor can `peek` it later.
-    Assign {
-        /// runtime to launch: claude, codex, hermes, ggcoder, aider, opencode,
-        /// gemini, cline, shell
-        runtime: String,
-        /// the task (remaining words are joined)
-        #[arg(trailing_var_arg = true, required = true)]
-        task: Vec<String>,
-        /// explicit workspace name (default: slug from task text)
-        #[arg(long)]
-        name: Option<String>,
-        /// explicit runtime model, e.g. `gpt-5.6-luna` (never auto-selected)
-        #[arg(long)]
-        model: Option<String>,
-    },
-    /// Route a task to an agent that is already warm instead of cold-starting
-    /// one. `assign` always spawns fresh, which throws away the repo context the
-    /// agent already read and the provider's prompt cache for that conversation.
-    /// Ranks live agents by directory affinity, topic overlap and how recently
-    /// they spoke; `--send` delivers to the winner.
-    Route {
-        /// the task (remaining words are joined)
-        #[arg(trailing_var_arg = true, required = true)]
-        task: Vec<String>,
-        /// Deliver to the top candidate instead of printing the send command
-        #[arg(long)]
-        send: bool,
-        /// Cold-start this runtime when nothing is warm enough. Implies --send,
-        /// so one command always takes the cheapest available path
-        #[arg(long)]
-        or_assign: Option<String>,
-        /// Also consider agents that look busy (sending interrupts them)
-        #[arg(long)]
-        include_busy: bool,
-        /// Below this score a cold start is the better bet
-        #[arg(long, default_value_t = route::default_min_score())]
-        min_score: i32,
-        #[arg(long)]
-        json: bool,
-    },
-    /// List every stored goal + its progress
-    Goals {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Omnigoal: run the goal's oracle, identify the bottleneck, record a try.
-    /// Exit 0 if the oracle passes (goal done), exit 1 if it fails, exit 2 if
-    /// the 3-try cap is hit (goal auto-abandoned).
-    GoalCheck { name: String },
-    /// Omnigoal: mark a goal done with a closing summary. The summary is
-    /// persisted to the goal row + the event stream, so the next session can
-    /// rehydrate the outcome without replaying the transcript.
-    GoalClose {
-        name: String,
-        #[arg(long)]
-        summary: Option<String>,
-        #[arg(long)]
-        abandon: bool,
-    },
-    /// Omnigoal: register a subagent against this goal with a bounded capsule +
-    /// skill. Ponytail: we only log the event — the capsule file lives on disk
-    /// and is referenced by path, never inlined into the goal row.
-    GoalSpawn {
-        name: String,
-        #[arg(long)]
-        capsule: Option<String>,
-        #[arg(long)]
-        skill: Option<String>,
-    },
-    /// Jump to an agent: select its native PTY in the TUI or switch cmux/tmux
-    Focus {
-        /// agent ref: cmux `workspace:NN` or tmux `session:window.pane`
-        target: String,
-    },
+    #[command(flatten)]
+    Steering(SteeringCommand),
+    #[command(flatten)]
+    Routing(RoutingCommand),
+}
+
+#[derive(Subcommand)]
+enum RoutingCommand {
     /// List all models in the registry with pricing, tier, strengths/weaknesses.
     /// --tier filters to open_weight|mid_tier|frontier_closed. --json for
     /// machine-readable output (for agent-token-saver integration).
@@ -416,6 +300,134 @@ enum Cmd {
         /// the query (remaining words are joined)
         #[arg(trailing_var_arg = true, required = true)]
         query: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SteeringCommand {
+    /// Steer one live agent: send a line to a `workspace:NN` or tmux `sess:win.pane`.
+    /// `--goal <name>` also pins a goal on that agent name (same as `goal` subcommand,
+    /// but combined so you can steer + pin in one shot).
+    Send {
+        /// agent ref: native `native:ID`, cmux `workspace:NN`, or tmux `session:window.pane`
+        target: String,
+        /// the message (remaining words are joined)
+        #[arg(trailing_var_arg = true, required = true)]
+        message: Vec<String>,
+        #[arg(long)]
+        goal: Option<String>,
+        #[arg(long)]
+        dod: Option<String>,
+        /// wait for the agent's next assistant response (timeout in seconds)
+        #[arg(long, default_value_t = 0)]
+        wait: u64,
+    },
+    /// Deliver Ctrl-C without closing a native PTY, cmux workspace, or tmux pane.
+    Interrupt { target: String },
+    /// Broadcast a line to every live agent (native/cmux always; tmux with --tmux)
+    Broadcast {
+        #[arg(trailing_var_arg = true, required = true)]
+        message: Vec<String>,
+        #[arg(long)]
+        tmux: bool,
+        /// only status-aware agents currently waiting on input
+        #[arg(long)]
+        needs_input: bool,
+    },
+    /// Pin a goal on an agent name; the TUI rehydrates it. Use `::` to add a
+    /// definition-of-done:  goal <name> ship it :: all tests pass
+    /// Optional omnigoal lifecycle flags turn this into an oracle-gated goal:
+    ///   goal <name> ship it :: tests pass --oracle "cargo test -q" --budget 20000
+    Goal {
+        name: String,
+        #[arg(trailing_var_arg = true, required = true)]
+        goal: Vec<String>,
+        /// machine-checkable oracle: a shell command that exits 0 iff the goal is done
+        #[arg(long)]
+        oracle: Option<String>,
+        /// token budget cap for this goal (0 = unlimited)
+        #[arg(long, default_value_t = 0)]
+        budget: u64,
+        /// ISO deadline (e.g. 2026-12-31T23:59:59+01:00)
+        #[arg(long)]
+        deadline: Option<String>,
+    },
+    /// Async fan-out: spawn one fresh cmux workspace seeded with the task and
+    /// return immediately. Fire-and-forget like CAO's `assign` primitive — the
+    /// worker is expected to work independently. Log the callback-ref so the
+    /// supervisor can `peek` it later.
+    Assign {
+        /// runtime to launch: claude, codex, hermes, ggcoder, aider, opencode,
+        /// gemini, cline, shell
+        runtime: String,
+        /// the task (remaining words are joined)
+        #[arg(trailing_var_arg = true, required = true)]
+        task: Vec<String>,
+        /// explicit workspace name (default: slug from task text)
+        #[arg(long)]
+        name: Option<String>,
+        /// explicit runtime model, e.g. `gpt-6-luna`
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Route a task to an agent that is already warm instead of cold-starting
+    /// one. `assign` always spawns fresh, which throws away the repo context the
+    /// agent already read and the provider's prompt cache for that conversation.
+    /// Ranks live agents by directory affinity, topic overlap and how recently
+    /// they spoke; `--send` delivers to the winner.
+    Route {
+        /// the task (remaining words are joined)
+        #[arg(trailing_var_arg = true, required = true)]
+        task: Vec<String>,
+        /// Deliver to the top candidate instead of printing the send command
+        #[arg(long)]
+        send: bool,
+        /// Cold-start this runtime when nothing is warm enough. Implies --send,
+        /// so one command always takes the cheapest available path
+        #[arg(long)]
+        or_assign: Option<String>,
+        /// Also consider agents that look busy (sending interrupts them)
+        #[arg(long)]
+        include_busy: bool,
+        /// Below this score a cold start is the better bet
+        #[arg(long, default_value_t = route::default_min_score())]
+        min_score: i32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List every stored goal + its progress
+    Goals {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Omnigoal: run the goal's oracle, identify the bottleneck, record a try.
+    /// Exit 0 if the oracle passes (goal done), exit 1 if it fails, exit 2 if
+    /// the 3-try cap is hit (goal auto-abandoned).
+    GoalCheck { name: String },
+    /// Omnigoal: mark a goal done with a closing summary. The summary is
+    /// persisted to the goal row + the event stream, so the next session can
+    /// rehydrate the outcome without replaying the transcript.
+    GoalClose {
+        name: String,
+        #[arg(long)]
+        summary: Option<String>,
+        #[arg(long)]
+        abandon: bool,
+    },
+    /// Omnigoal: register a subagent against this goal with a bounded capsule +
+    /// skill. Ponytail: we only log the event — the capsule file lives on disk
+    /// and is referenced by path, never inlined into the goal row.
+    GoalSpawn {
+        name: String,
+        #[arg(long)]
+        capsule: Option<String>,
+        #[arg(long)]
+        skill: Option<String>,
+    },
+    /// Jump to an agent: select its native PTY in the TUI or switch cmux/tmux
+    Focus {
+        /// agent ref: cmux `workspace:NN` or tmux `session:window.pane`
+        target: String,
     },
 }
 
@@ -611,13 +623,13 @@ fn main() -> anyhow::Result<()> {
             orch::batch(&tasks, model.as_deref(), yes)?;
         }
         Cmd::Ls { json } => cli::list(json, &dir)?,
-        Cmd::Send {
+        Cmd::Steering(SteeringCommand::Send {
             target,
             message,
             goal,
             dod,
             wait,
-        } => {
+        }) => {
             let msg = message.join(" ");
             if wait > 0 {
                 cli::send_wait(&target, &msg, &dir, wait)?;
@@ -629,13 +641,13 @@ fn main() -> anyhow::Result<()> {
                 cli::goal_set(&name, &msg, dod_str.as_deref(), &dir)?;
             }
         }
-        Cmd::Interrupt { target } => cli::interrupt(&target, &dir)?,
-        Cmd::Assign {
+        Cmd::Steering(SteeringCommand::Interrupt { target }) => cli::interrupt(&target, &dir)?,
+        Cmd::Steering(SteeringCommand::Assign {
             runtime,
             task,
             name,
             model,
-        } => {
+        }) => {
             let t = task.join(" ");
             if let Some(model) = model.as_deref() {
                 cli::assign_with_model(&runtime, Some(model), &t, name.as_deref(), &dir)?;
@@ -643,18 +655,18 @@ fn main() -> anyhow::Result<()> {
                 cli::assign(&runtime, &t, name.as_deref(), &dir)?;
             }
         }
-        Cmd::Broadcast {
+        Cmd::Steering(SteeringCommand::Broadcast {
             message,
             tmux,
             needs_input,
-        } => cli::broadcast(&message.join(" "), tmux, needs_input, &dir)?,
-        Cmd::Goal {
+        }) => cli::broadcast(&message.join(" "), tmux, needs_input, &dir)?,
+        Cmd::Steering(SteeringCommand::Goal {
             name,
             goal,
             oracle,
             budget,
             deadline,
-        } => {
+        }) => {
             let joined = goal.join(" ");
             let (g, dod) = match joined.split_once("::") {
                 Some((g, d)) if !d.trim().is_empty() => (g.trim(), Some(d.trim())),
@@ -674,14 +686,14 @@ fn main() -> anyhow::Result<()> {
                 cli::goal_set(&name, g, dod, &dir)?
             }
         }
-        Cmd::Route {
+        Cmd::Steering(SteeringCommand::Route {
             task,
             send,
             or_assign,
             include_busy,
             min_score,
             json,
-        } => {
+        }) => {
             let task = task.join(" ");
             route::run(
                 route::RouteRequest {
@@ -695,29 +707,31 @@ fn main() -> anyhow::Result<()> {
                 &dir,
             )?;
         }
-        Cmd::Goals { json } => cli::goals_list(json, &dir)?,
-        Cmd::GoalCheck { name } => cli::goal_check(&name, &dir)?,
-        Cmd::GoalClose {
+        Cmd::Steering(SteeringCommand::Goals { json }) => cli::goals_list(json, &dir)?,
+        Cmd::Steering(SteeringCommand::GoalCheck { name }) => cli::goal_check(&name, &dir)?,
+        Cmd::Steering(SteeringCommand::GoalClose {
             name,
             summary,
             abandon,
-        } => cli::goal_close(&name, summary.as_deref(), abandon, &dir)?,
-        Cmd::GoalSpawn {
+        }) => cli::goal_close(&name, summary.as_deref(), abandon, &dir)?,
+        Cmd::Steering(SteeringCommand::GoalSpawn {
             name,
             capsule,
             skill,
-        } => cli::goal_spawn(&name, capsule.as_deref(), skill.as_deref(), &dir)?,
-        Cmd::Focus { target } => cli::focus(&target, &dir)?,
-        Cmd::Models { tier, json } => cli::models_list(tier.as_deref(), json)?,
-        Cmd::Auto {
+        }) => cli::goal_spawn(&name, capsule.as_deref(), skill.as_deref(), &dir)?,
+        Cmd::Steering(SteeringCommand::Focus { target }) => cli::focus(&target, &dir)?,
+        Cmd::Routing(RoutingCommand::Models { tier, json }) => {
+            cli::models_list(tier.as_deref(), json)?
+        }
+        Cmd::Routing(RoutingCommand::Auto {
             task,
             name,
             dry_run,
-        } => {
+        }) => {
             let t = task.join(" ");
             cli::auto_spawn(&t, name.as_deref(), dry_run, &dir)?
         }
-        Cmd::Swarm {
+        Cmd::Routing(RoutingCommand::Swarm {
             name,
             n,
             fanout,
@@ -732,7 +746,7 @@ fn main() -> anyhow::Result<()> {
             research,
             task,
             dry_run,
-        } => {
+        }) => {
             let t = task.join(" ");
             cli::swarm_spawn(
                 cli::SwarmRequest {
@@ -754,7 +768,7 @@ fn main() -> anyhow::Result<()> {
                 &dir,
             )?;
         }
-        Cmd::Ensemble {
+        Cmd::Routing(RoutingCommand::Ensemble {
             name,
             oracle,
             lanes,
@@ -773,7 +787,7 @@ fn main() -> anyhow::Result<()> {
             evidence_bytes,
             skill_route,
             task,
-        } => {
+        }) => {
             let task = task.join(" ");
             llmadapter::run(
                 llmadapter::EnsembleRequest {
@@ -799,7 +813,7 @@ fn main() -> anyhow::Result<()> {
                 &dir,
             )?;
         }
-        Cmd::Research {
+        Cmd::Routing(RoutingCommand::Research {
             name,
             mode,
             bytes,
@@ -811,7 +825,7 @@ fn main() -> anyhow::Result<()> {
             deadline_secs,
             dry_run,
             query,
-        } => {
+        }) => {
             let query = query.join(" ");
             research::run(
                 research::ResearchRequest {
