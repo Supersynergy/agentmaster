@@ -4,6 +4,8 @@ All notable changes to agentmaster are documented here. Newest first.
 
 ## [Unreleased]
 
+- Added `agentmaster ask --model gpt-6-luna "question"` for one-shot answers via SyCAdapter.
+
 - Switched adapter inventory and control to SyCAdapter. The inventory checks its CLI capabilities without opening a session.
 - Updated model IDs and published API rates on 2026-11-15. The model list includes the pricing date, source and tariff basis.
 

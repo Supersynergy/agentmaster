@@ -92,6 +92,7 @@ agentmaster send native:7 "run the focused test"
 agentmaster focus native:7           # select that PTY in the running TUI
 
 # Explicit bridges to the existing local control CLIs
+agentmaster ask --model gpt-6-luna "What is 17 times 23?"
 agentmaster control sycadapter --help
 agentmaster control sycadapter --model gpt-6-luna  # foreground loopback HTTP server
 agentmaster control sycadapter rpc                # native SynergyCoder stdio
@@ -132,6 +133,11 @@ prompt/skill libraries, system-prompt references, prompt tooling, and explicitly
 labelled security research. Every URL must occur in the hash-pinned local report.
 Links are references only. AgentMaster never clones, installs, executes, or sends
 remote source material automatically.
+
+`ask` uses the installed SyCAdapter and the active SynergyCoder ChatGPT login.
+It defaults to `gpt-6-luna`, prints the completed answer on stdout, and exits
+with an error on stderr if the provider fails or the stream ends early.
+Each call starts and closes its own loopback adapter.
 
 ## Lean llmadapter ensembles
 

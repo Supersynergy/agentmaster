@@ -131,6 +131,12 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum RoutingCommand {
+    /// Ask one question through SyCAdapter and print the completed answer.
+    Ask {
+        #[arg(long, default_value = "gpt-6-luna")]
+        model: String,
+        question: String,
+    },
     /// List all models in the registry with pricing, tier, strengths/weaknesses.
     /// --tier filters to open_weight|mid_tier|frontier_closed. --json for
     /// machine-readable output (for agent-token-saver integration).
@@ -720,6 +726,20 @@ fn main() -> anyhow::Result<()> {
             skill,
         }) => cli::goal_spawn(&name, capsule.as_deref(), skill.as_deref(), &dir)?,
         Cmd::Steering(SteeringCommand::Focus { target }) => cli::focus(&target, &dir)?,
+        Cmd::Routing(RoutingCommand::Ask { model, question }) => {
+            use anyhow::Context;
+            use std::os::unix::process::CommandExt;
+            let error = std::process::Command::new("bun")
+                .args([
+                    "-e",
+                    include_str!("../scripts/syc_ask.ts"),
+                    "--",
+                    &model,
+                    &question,
+                ])
+                .exec();
+            return Err(error).context("cannot start Bun for SyCAdapter");
+        }
         Cmd::Routing(RoutingCommand::Models { tier, json }) => {
             cli::models_list(tier.as_deref(), json)?
         }
