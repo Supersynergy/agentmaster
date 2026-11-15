@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/social-preview.png" alt="AgentMaster" width="960">
+</p>
+
 # agentmaster
 
 **TUI command center for Claude Code, Codex, tmux and cmux agent fleets.**
@@ -5,11 +9,12 @@ agentmaster lets one human see and steer many coding agents from one terminal:
 real-time status, human-readable task titles, transcript peeks, desktop alerts,
 and zero orchestration tax.
 
-![agentmaster social preview](docs/assets/social-preview.png)
 
 ![Rust](https://img.shields.io/badge/Rust-1.95%2B-f46623)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Status](https://img.shields.io/badge/status-active-20c997)
+
+[🚀 Install](#install) · [▶️ Quick start](#quick-start) · [⌨️ Keys](#keys) · [🤖 CLI](#cli) · [🏗️ Architecture](#architecture)
 
 ## Why
 
@@ -128,6 +133,9 @@ Links are references only. AgentMaster never clones, installs, executes, or send
 remote source material automatically.
 
 ## Lean llmadapter ensembles
+
+<details>
+<summary>Read the background and detailed guidance</summary>
 
 `ensemble` is an opt-in bridge for a small llmadapter swarm. AgentMaster stays
 the controller: it gives every lane the same bounded task, saves each answer as
@@ -280,6 +288,9 @@ constructed 4,000-line log payload from 184,497 to 852 bytes (99.5382%) after
 local projection while preserving the executable oracle inputs. This is a
 payload-capacity case study, not a provider-token, cost, quality, or end-to-end
 latency claim.
+
+
+</details>
 
 ## Keys
 
