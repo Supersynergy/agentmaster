@@ -4,6 +4,8 @@ All notable changes to agentmaster are documented here. Newest first.
 
 ## [Unreleased]
 
+- `auto --review DOSSIER` runs one tool-free review. `auto --edit FILE --task-file SPEC -- ORACLE [ARG...]` runs one scoped edit and its acceptance command.
+
 - Added `agentmaster ask --model gpt-6-luna "question"` for one-shot answers via SyCAdapter.
 
 - Switched adapter inventory and control to SyCAdapter. The inventory checks its CLI capabilities without opening a session.

@@ -152,8 +152,16 @@ enum RoutingCommand {
     /// Prints the classified type + picked model + runtime, then spawns.
     /// `--dry-run` shows the pick without spawning.
     Auto {
+        /// Review a complete dossier once through SyCAdapter (exit 1 for a rejected change).
+        #[arg(long, conflicts_with_all = ["edit", "task_file", "task", "name"])]
+        review: Option<PathBuf>,
+        /// Apply a single-file change via codex-one-edit; pass oracle argv after --.
+        #[arg(long, requires_all = ["task_file", "task"], conflicts_with = "name")]
+        edit: Option<PathBuf>,
+        #[arg(long, requires = "edit")]
+        task_file: Option<PathBuf>,
         /// the task (remaining words are joined)
-        #[arg(trailing_var_arg = true, required = true)]
+        #[arg(trailing_var_arg = true, required_unless_present = "review")]
         task: Vec<String>,
         #[arg(long)]
         name: Option<String>,
@@ -744,12 +752,60 @@ fn main() -> anyhow::Result<()> {
             cli::models_list(tier.as_deref(), json)?
         }
         Cmd::Routing(RoutingCommand::Auto {
+            review,
+            edit,
+            task_file,
             task,
             name,
             dry_run,
         }) => {
-            let t = task.join(" ");
-            cli::auto_spawn(&t, name.as_deref(), dry_run, &dir)?
+            use anyhow::Context;
+            use std::os::unix::process::CommandExt;
+            use std::process::Command;
+            if let Some(path) = review {
+                let meta = std::fs::metadata(&path)?;
+                anyhow::ensure!(
+                    meta.is_file() && (1..=131072).contains(&meta.len()),
+                    "expected a non-empty review dossier of at most 128 KiB"
+                );
+                if dry_run {
+                    println!("one review via SyCAdapter (read-only)");
+                } else {
+                    return Err(Command::new("bun")
+                        .args([
+                            "-e",
+                            include_str!("../scripts/syc_ask.ts"),
+                            "--",
+                            "gpt-6-astra",
+                            "",
+                            "review-stdin",
+                        ])
+                        .stdin(std::fs::File::open(path)?)
+                        .exec())
+                    .context("cannot start the review client");
+                }
+            } else if let (Some(file), Some(spec)) = (edit, task_file) {
+                if dry_run {
+                    println!("one edit via codex-one-edit, followed by the supplied oracle");
+                } else {
+                    return Err(Command::new("bun")
+                        .args([
+                            "-e",
+                            include_str!("../scripts/syc_ask.ts"),
+                            "--",
+                            "gpt-6-astra",
+                            "",
+                            "edit-file",
+                        ])
+                        .arg(file)
+                        .arg(spec)
+                        .args(task)
+                        .exec())
+                    .context("cannot start the bounded edit client");
+                }
+            } else {
+                cli::auto_spawn(&task.join(" "), name.as_deref(), dry_run, &dir)?;
+            }
         }
         Cmd::Routing(RoutingCommand::Swarm {
             name,
@@ -944,6 +1000,37 @@ fn doctor(dir: &Path, verbose: bool, costs: bool) -> anyhow::Result<()> {
 mod tests {
     use super::{Cli, Cmd, PromptCommand, PromptLinkCommand};
     use clap::Parser;
+
+    #[test]
+    fn bounded_auto_contracts_are_exclusive_and_keep_oracle_argv() {
+        use super::RoutingCommand;
+        for bad in [
+            vec!["auto"],
+            vec!["auto", "--edit", "a", "--task-file", "spec"],
+            vec!["auto", "--review", "r", "write"],
+            vec!["auto", "--edit", "a", "true"],
+        ] {
+            assert!(Cli::try_parse_from(std::iter::once("agentmaster").chain(bad)).is_err());
+        }
+        let cli = Cli::try_parse_from([
+            "am",
+            "auto",
+            "--edit",
+            "src/a",
+            "--task-file",
+            "task file",
+            "--",
+            "test",
+            "a b",
+            "--flag",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.cmd, Some(Cmd::Routing(RoutingCommand::Auto{task,..})) if task==["test","a b","--flag"])
+        );
+        assert!(Cli::try_parse_from(["am", "auto", "--review", "dossier"]).is_ok());
+        assert!(Cli::try_parse_from(["am", "auto", "general", "task"]).is_ok());
+    }
 
     #[test]
     fn control_passes_target_cli_flags_through() {

@@ -1,7 +1,8 @@
 // Embedded in the Rust CLI. SyCAdapter already runs on Bun.
 import { once } from "node:events";
 import { request, type IncomingMessage } from "node:http";
-import { readFile } from "node:fs/promises";
+import { readFile, lstat, realpath } from "node:fs/promises";
+import { resolve, relative, isAbsolute, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
 
@@ -13,10 +14,10 @@ interface OutputItem {
 
 interface ResponseEvent {
   type: string;
-  response?: { status: string; output?: OutputItem[] };
+  response?: { status: string; usage?: Record<string, unknown>; output?: OutputItem[] };
 }
 
-export async function answerFromStream(input: Readable): Promise<string> {
+export async function answerFromStream(input: Readable, receipt?: (usage?: Record<string, unknown>) => void): Promise<string> {
   const lines = createInterface({ input, crlfDelay: Infinity });
   let data: string[] = [];
   try {
@@ -41,6 +42,7 @@ export async function answerFromStream(input: Readable): Promise<string> {
         .map(part => part.type === "output_text" ? part.text : part.type === "refusal" ? part.refusal : "")
         .join("");
       if (!text.trim()) throw new Error("Completed response contained no answer");
+      receipt?.(event.response.usage);
       return text;
     }
     throw new Error("SyCAdapter stream ended before response.completed");
@@ -49,7 +51,7 @@ export async function answerFromStream(input: Readable): Promise<string> {
   }
 }
 
-async function ask(model: string, question: string): Promise<string> {
+async function ask(model: string, question: string, mode: "ask" | "review" | "edit" = "ask", receipt?: (usage?: Record<string, unknown>) => void): Promise<string> {
   if (!model?.trim() || !question?.trim()) throw new Error("Provide a model and a non-empty question");
   const cancel = new AbortController();
   const interrupt = () => cancel.abort(new Error("Request interrupted"));
@@ -76,7 +78,8 @@ async function ask(model: string, question: string): Promise<string> {
     const token = (await readFile(ready.keyFile, "utf8")).trim();
     if (!/^[a-f0-9]{64}$/.test(token)) throw new Error("Invalid SyCAdapter key");
     const body = JSON.stringify({
-      model, stream: true, store: false, instructions: "Answer the user's question.",
+      model, stream: true, store: false, instructions: mode === "edit" ? "Propose a change to the supplied file. The host applies it and runs the oracle. Return only JSON {file_path,edits:[{old_text,new_text}]} with unique exact preimages." : mode === "review" ? 'Review the supplied candidate against its contract. Return only JSON with verdict "pass" or "fail" and a concise reason identifying concrete behavior.' : "Answer the user's question.",
+      ...(mode !== "ask" ? { reasoning: { effort: "medium" } } : {}),
       input: [{ role: "user", content: [{ type: "input_text", text: question }] }],
     });
     const response = await new Promise<IncomingMessage>((resolve, reject) => {
@@ -91,7 +94,14 @@ async function ask(model: string, question: string): Promise<string> {
         const auth = [401, 403, 503].includes(response.statusCode ?? 0) ? " (check SynergyCoder login and model access)" : "";
         throw new Error("SyCAdapter HTTP " + response.statusCode + auth);
       }
-      return await answerFromStream(response);
+      let usage: Record<string, unknown> | undefined;
+      const text = await answerFromStream(response, value => { usage = value; });
+      receipt?.(usage);
+      if (mode !== "review") return text;
+      const result = JSON.parse(text);
+      if (!["pass", "fail"].includes(result?.verdict) || typeof result.reason !== "string" || !result.reason.trim())
+        throw new Error("Invalid review verdict");
+      return JSON.stringify({ verdict: result.verdict, reason: result.reason, usage });
     } finally {
       response.destroy();
     }
@@ -107,12 +117,39 @@ async function ask(model: string, question: string): Promise<string> {
   }
 }
 
+async function singleEdit(model: string, file: string, taskFile: string, oracle: string[]) {
+  if (!file || !taskFile || !oracle.length) throw new Error("Missing file, task or oracle");
+  const cwd = await realpath(process.cwd()), target = resolve(cwd, file), rel = relative(cwd, target);
+  if (!rel || rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel) || await realpath(target) !== target)
+    throw new Error("Expected a workspace file without symlinks");
+  const st = await lstat(target);
+  if (!st.isFile() || st.nlink !== 1 || st.size > 128 * 1024) throw new Error("Expected a bounded, single-link file");
+  const bytes = await readFile(target), source = bytes.toString("utf8");
+  if (bytes.length > 128 * 1024 || source.includes("\0") || !bytes.equals(Buffer.from(source))) throw new Error("Expected bounded UTF-8 source");
+  const task = (await readFile(taskFile, "utf8")).trim();
+  if (!task) throw new Error("Empty task file");
+  const editor = Bun.which("codex-one-edit");
+  if (!editor) throw new Error("codex-one-edit is required for exact application and rollback");
+  const { applyProposal } = await import(editor);
+  if (typeof applyProposal !== "function") throw new Error("Installed editor lacks applyProposal");
+  let usage: Record<string, unknown> | undefined;
+  const answer = await ask(model, "Edit only " + file + ". " + task + "\nCurrent complete file:\n" + source, "edit", value => { usage = value; });
+  applyProposal(file, source, JSON.parse(answer), oracle, cwd);
+  console.log(JSON.stringify({ passed: true, file, usage }));
+}
+
 if (import.meta.main) {
+  const [model, question, mode, file, taskFile, ...oracle] = process.argv.slice(1);
+  const review = mode === "review-stdin";
   try {
-    const [model, question] = process.argv.slice(1);
-    console.log(await ask(model, question));
+    if (mode === "edit-file") { await singleEdit(model, file, taskFile, oracle); }
+    else {
+    const answer = await ask(model, review ? await Bun.stdin.text() : question, review ? "review" : "ask");
+    console.log(answer);
+    if (review && JSON.parse(answer).verdict === "fail") process.exitCode = 1;
+    }
   } catch (err) {
-    console.error("agentmaster ask:", err instanceof Error ? err.message : "request failed");
-    process.exitCode = 1;
+    console.error(mode ? "agentmaster auto:" : "agentmaster ask:", err instanceof Error ? err.message : "request failed");
+    process.exitCode = review ? 2 : 1;
   }
 }
