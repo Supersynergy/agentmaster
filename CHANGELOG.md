@@ -13,6 +13,10 @@ All notable changes to agentmaster are documented here. Newest first.
 
 - Added local chat archive and APU forwarding through `control history` and `control apu`.
 
+### Added: Devin, SuperGGcoder and Synergycoder control
+- `control devin`, `control sgg` and `control syc` forward explicit CLI
+  arguments, including ACP and session-resume commands, without a shell.
+
 ### Added: strict browser verdict receipts
 - Added `browser-verdict FILE [--expected true|false]`: accepts only transport
   success and the expected boolean assertion, with a 1 MiB bound and a SHA-256
