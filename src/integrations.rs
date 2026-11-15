@@ -44,6 +44,8 @@ pub const CONTROL_BINARIES: &[&str] = &[
     "llmadapter",
     "cac",
     "callagent",
+    "chathistory",
+    "apu",
 ];
 
 fn executable_on_path(name: &str) -> Option<String> {
@@ -730,6 +732,7 @@ pub fn doctor(dir: &Path) {
 /// Forward an explicit command to one allow-listed local control surface.
 pub fn control(target: &str, args: &[String]) -> Result<()> {
     let target = match target {
+        "history" => "chathistory",
         "gg-adapter" => "ggadapter",
         "llm-adapter" => "llmadapter",
         other => other,
@@ -776,6 +779,8 @@ mod tests {
     fn control_allowlist_contains_the_cross_runtime_surfaces() {
         for target in [
             "cmux",
+            "chathistory",
+            "apu",
             "codex",
             "hermes",
             "ggcoder",

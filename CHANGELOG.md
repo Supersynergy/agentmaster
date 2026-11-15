@@ -4,6 +4,8 @@ All notable changes to agentmaster are documented here. Newest first.
 
 ## [Unreleased]
 
+- Added local chat archive and APU forwarding through `control history` and `control apu`.
+
 ### Added: strict browser verdict receipts
 - Added `browser-verdict FILE [--expected true|false]`: accepts only transport
   success and the expected boolean assertion, with a 1 MiB bound and a SHA-256
